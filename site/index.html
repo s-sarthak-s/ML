@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inside the Machine · an LLM systems course</title>
+<link rel="stylesheet" href="assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/vendor/katex/katex.min.js"></script>
+<script src="assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="assets/manifest.js"></script>
+<style>
+  .hero-grid{display:grid;grid-template-columns:1.25fr 1fr;gap:40px;align-items:center;max-width:1100px;margin:0 auto}
+  @media (max-width:1100px){.hero-grid{grid-template-columns:1fr}}
+  .hero-fig{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:18px}
+  .continue{display:inline-flex;align-items:center;gap:10px;margin-top:6px;text-decoration:none;font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;background:var(--ink);color:var(--paper);padding:11px 16px;border-radius:10px}
+  .continue:hover{background:var(--ink-soft);color:var(--paper)}
+  .stack{max-width:1100px;margin:46px auto 0;display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--line);border-radius:14px;background:var(--card);overflow:hidden}
+  .stack div{padding:16px 18px;border-right:1px solid var(--line-soft)}
+  .stack div:last-child{border-right:0}
+  .stack .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--green-deep);font-weight:600}
+  .stack p{margin:4px 0 0;font-size:14px;color:var(--ink-soft)}
+  @media (max-width:800px){.stack{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body data-page="index">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content" style="padding-top:64px">
+
+<section class="hero-grid">
+  <div>
+    <p class="eyebrow">An LLM systems course · runs offline</p>
+    <h1 class="title">Inside the <span class="it">machine</span></h1>
+    <p class="lede">You already use models and agents. This course covers the layer underneath: the math one symbol at a time, then transformers, memory and bandwidth, quantization, fine-tuning, retrieval, agents, and evaluation. Each idea comes with a picture you can poke at.</p>
+    <a class="continue" id="continue" href="modules/00-start.html">Start with module 00 →</a>
+  </div>
+  <div class="hero-fig"><svg id="hero-svg" viewBox="0 0 460 360" role="img" aria-label="Diagram of a token flowing through a transformer"></svg></div>
+</section>
+
+<div class="stack">
+  <div><div class="k">Formula cards</div><p>Hover any coloured symbol to see what it means, and read the plain-English version underneath.</p></div>
+  <div><div class="k">Widgets</div><p>Sliders and live plots for every important idea: KV caches, LoRA ranks, BM25, sampling.</p></div>
+  <div><div class="k">Quizzes</div><p>Short checks that make you compute or predict, not just recall. Saved in your browser.</p></div>
+  <div><div class="k">Labs</div><p>Each module ends with something to build, and an exit criterion you can measure.</p></div>
+</div>
+
+<div id="map"></div>
+
+<p class="small muted" style="max-width:1100px;margin:60px auto 0">Progress and quiz answers are stored in this browser's localStorage. Nothing leaves your machine.</p>
+</main>
+</div>
+<script src="assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, palette } = C;
+  const M = window.COURSE;
+  const map = document.getElementById("map");
+  M.parts.forEach(p => {
+    map.appendChild(el("div", { class: "part-head" }, [el("span", { class: "pn", text: "Part " + p.id }), el("h2", { text: p.name }), el("p", { text: p.blurb })]));
+    const grid = el("div", { class: "roadmap" });
+    M.modules.filter(m => m.part === p.id).forEach(m => {
+      grid.appendChild(el("a", { class: "mod-card", href: "modules/" + m.file, "data-n": m.n }, [
+        el("span", { class: "n", text: "Module " + m.n }),
+        el("h3", { text: m.title }),
+        el("p", { text: m.short }),
+        el("div", { class: "topics" }, m.topics.map(t => el("span", { text: t })))
+      ]));
+    });
+    map.appendChild(grid);
+  });
+  // continue button → first unfinished module
+  const done = new Set(C.store.get("done", []));
+  const next = M.modules.find(m => !done.has(m.n));
+  const btn = document.getElementById("continue");
+  if (done.size && next) { btn.href = "modules/" + next.file; btn.textContent = `Continue: ${next.n} · ${next.title} →`; }
+  if (!next) { btn.href = "modules/22-labs.html"; btn.textContent = "All modules done · go build →"; }
+
+  // hero diagram: tokens -> embeddings -> blocks -> logits -> sample
+  const s = document.getElementById("hero-svg");
+  const defs = svg("defs"); defs.appendChild(svg("marker", { id: "harr", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.muted }))); s.appendChild(defs);
+  const toks = ["The", " cat", " sat", " on"];
+  toks.forEach((t, i) => {
+    const x = 40 + i * 70;
+    s.appendChild(svg("rect", { x, y: 300, width: 60, height: 28, rx: 6, fill: "#fff", stroke: palette.line }));
+    s.appendChild(svg("text", { x: x + 30, y: 319, "text-anchor": "middle", "font-size": 12.5, class: "mono", fill: palette.ink, text: t }));
+    for (let k = 0; k < 6; k++) s.appendChild(svg("rect", { x: x + 6 + k * 8.5, y: 262, width: 7, height: 22, rx: 1.5, fill: C.diverge(Math.sin(i * 3 + k * 1.7)), opacity: 0.9 }));
+    s.appendChild(svg("line", { x1: x + 30, y1: 298, x2: x + 30, y2: 288, stroke: palette.muted, "marker-end": "url(#harr)" }));
+  });
+  s.appendChild(svg("text", { x: 330, y: 319, "font-size": 11, fill: palette.muted, text: "tokens" }));
+  s.appendChild(svg("text", { x: 330, y: 278, "font-size": 11, fill: palette.muted, text: "embeddings" }));
+  ["Transformer block 1", "Transformer block 2", "⋮", "Transformer block L"].forEach((t, i) => {
+    const y = 200 - i * 40;
+    if (t === "⋮") { s.appendChild(svg("text", { x: 145, y: y + 18, "text-anchor": "middle", "font-size": 16, fill: palette.muted, text: t })); return; }
+    s.appendChild(svg("rect", { x: 30, y, width: 290, height: 30, rx: 8, fill: i === 0 ? "rgba(26,122,82,.08)" : "#fff", stroke: palette.line }));
+    s.appendChild(svg("text", { x: 46, y: y + 19, "font-size": 12, fill: palette.ink, text: t }));
+    s.appendChild(svg("text", { x: 306, y: y + 19, "text-anchor": "end", "font-size": 10.5, class: "mono", fill: palette.muted, text: "attn → mlp" }));
+  });
+  s.appendChild(svg("line", { x1: 175, y1: 258, x2: 175, y2: 234, stroke: palette.muted, "marker-end": "url(#harr)" }));
+  s.appendChild(svg("line", { x1: 175, y1: 80, x2: 175, y2: 62, stroke: palette.muted, "marker-end": "url(#harr)" }));
+  const probs = [0.52, 0.21, 0.12, 0.08, 0.04];
+  const words = [" the", " a", " my", " its", " top"];
+  probs.forEach((p, i) => {
+    s.appendChild(svg("rect", { x: 30 + i * 58, y: 54 - p * 70, width: 40, height: p * 70, rx: 2, fill: i === 0 ? palette.green : "rgba(26,122,82,.35)" }));
+    s.appendChild(svg("text", { x: 50 + i * 58, y: 16 + 52 - p * 70 - 20, "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.muted, text: Math.round(p * 100) + "%" }));
+  });
+  words.forEach((w, i) => s.appendChild(svg("text", { x: 50 + i * 58, y: 66, "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.ink, text: w })));
+  s.appendChild(svg("text", { x: 330, y: 40, "font-size": 11, fill: palette.muted, text: "next-token" }));
+  s.appendChild(svg("text", { x: 330, y: 54, "font-size": 11, fill: palette.muted, text: "probabilities" }));
+  // KV cache side panel
+  s.appendChild(svg("rect", { x: 345, y: 110, width: 100, height: 120, rx: 8, fill: "rgba(154,123,34,.08)", stroke: "rgba(154,123,34,.45)", "stroke-dasharray": "4 3" }));
+  s.appendChild(svg("text", { x: 395, y: 132, "text-anchor": "middle", "font-size": 11.5, fill: palette.gold, "font-weight": 600, text: "KV cache" }));
+  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) s.appendChild(svg("rect", { x: 362 + c * 17, y: 145 + r * 18, width: 14, height: 14, rx: 2, fill: "rgba(154,123,34," + (0.15 + 0.15 * c) + ")" }));
+  s.appendChild(svg("text", { x: 395, y: 236 + 14, "text-anchor": "middle", "font-size": 10, fill: palette.muted, text: "grows per token" }));
+})();
+</script>
+</body>
+</html>

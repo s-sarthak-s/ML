@@ -1,0 +1,1215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Tokens &amp; embeddings — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+.tokrow{display:flex;flex-wrap:wrap;gap:4px 3px;font-family:var(--mono);font-size:12.5px;line-height:1.25;align-items:center}
+.tk{display:inline-block;padding:2px 5px;border-radius:4px;border:1px solid rgba(28,27,25,.14);white-space:pre;color:var(--ink);background:var(--paper-2)}
+.tk .sp{color:var(--faint)}
+.tk.new{border-color:var(--brick);box-shadow:0 0 0 1px var(--brick)}
+.tk.unk{border:1px dashed var(--brick);color:var(--brick);background:#fff}
+.tokrow .wgap{display:inline-block;width:9px}
+.split{display:grid;grid-template-columns:minmax(220px,1fr) minmax(0,2.1fr);gap:14px;margin-top:12px}
+.split.r{grid-template-columns:minmax(0,2fr) minmax(220px,1fr)}
+@media (max-width:760px){.split,.split.r{grid-template-columns:1fr}}
+.panel{border:1px solid var(--line-soft);border-radius:10px;background:var(--paper);padding:10px 12px}
+.panel .ph{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0 0 8px;display:flex;justify-content:space-between;gap:8px}
+.mbox{max-height:300px;overflow:auto}
+table.t.mtab{margin:0;box-shadow:none;font-size:12.5px}
+table.t.mtab td,table.t.mtab th{padding:5px 8px}
+.tplgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:760px){.tplgrid{grid-template-columns:1fr}}
+.tpl-h{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+pre.tpl{margin:0;font-family:var(--mono);font-size:12.5px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--paper);border:1px solid var(--line-soft);border-radius:10px;padding:12px 14px;color:var(--ink)}
+pre.tpl .st{background:rgba(47,93,138,.14);color:#2f5d8a;border-radius:4px;padding:1px 3px}
+pre.tpl .nl{color:var(--faint)}
+pre.tpl .gen{background:rgba(26,122,82,.12);border-radius:4px;padding:1px 2px}
+pre.tpl .ids{display:block;margin-top:8px;font-size:11px;color:var(--muted);line-height:1.5}
+.statusline{font-family:var(--mono);font-size:12px;color:var(--muted);margin:10px 0 0}
+</style>
+</head>
+<body data-module="05">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 05 · How models work</p>
+<h1 class="title">Tokens &amp; embeddings: how text becomes <span class="it">numbers</span></h1>
+<p class="lede">A model never sees your text. A tokenizer first chops it into integer IDs from a fixed list, and an embedding table turns each ID into a vector. Llama 3's list has 128,256 entries and each vector has 4,096 numbers. That one table holds about 525 million parameters. This module covers how the list is learned, what it costs, and the odd behaviour it causes downstream.</p>
+<div class="meta"><span class="tag">~2 hours</span><span class="tag n">prereqs: 01, 03</span><span class="tag g">hands-on: tiktoken, transformers</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Train a byte-pair-encoding tokenizer by hand and by code, and explain why encoding replays merges in the order they were learned.</li>
+    <li>Say why byte-level BPE never produces an unknown token, and what the pre-tokenizer regex is for.</li>
+    <li>Compute embedding and LM-head parameter counts from \(V\) and \(d\), and judge when vocabulary size matters for a model's budget.</li>
+    <li>Predict tokenizer-driven failures: digit splits, leading spaces, letter counting, non-English cost, glitch tokens, and chat-template mismatches.</li>
+    <li>Explain embeddings as a lookup table, read cosine similarity and analogies critically, and connect the unembedding to next-token probabilities.</li>
+    <li>Estimate the token count and price of an API workload before you run it.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="why">Why tokens at all</h2>
+
+<p>A transformer is a function from a sequence of integers to a probability distribution over the next integer. Something has to turn text into those integers and turn the model's output integers back into text. That something is the <strong>tokenizer</strong>, and it's trained separately from the model, usually before the model, on a sample of the same data.</p>
+
+<p>The pipeline for one forward pass:</p>
+<ol>
+  <li><strong>Tokenize:</strong> <code>"The cat sat"</code> → <code>[791, 8415, 7731]</code> (IDs are tokenizer-specific; these are illustrative).</li>
+  <li><strong>Embed:</strong> look up one row of a \(V \times d\) table per ID, giving a \(3 \times d\) matrix.</li>
+  <li><strong>Transform:</strong> the transformer layers mix information across positions (Module 06).</li>
+  <li><strong>Unembed:</strong> project the last position's vector to \(V\) scores, one per vocabulary entry, and softmax them (Module 03).</li>
+  <li><strong>Sample and detokenize:</strong> pick an ID, append it, map it back to bytes.</li>
+</ol>
+
+<p>The design question is what one integer should stand for. There are three obvious answers, and the figure shows why the industry settled on the middle one.</p>
+
+<figure class="fig wide"><div id="fig-tradeoff"></div>
+<figcaption>The same 34-character sentence under three schemes. Characters never hit an unknown symbol but produce long sequences. Words produce short sequences but need an open-ended vocabulary and still meet words they've never seen. Subwords sit in between: frequent words stay whole, rare ones split into known pieces. The subword split shown is illustrative; every tokenizer splits differently.</figcaption></figure>
+
+<div class="formula" data-name="Sequence length from compression">
+  <div class="tex">$$\htmlClass{t1}{L} = \frac{\htmlClass{t2}{\text{bytes}(X)}}{\htmlClass{t3}{R}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(L\)</dt><dd>number of tokens the model has to process for text \(X\)</dd></div>
+    <div data-t="t2"><dt>\(\text{bytes}(X)\)</dt><dd>length of the text in UTF-8 bytes (1 per ASCII character, 2–4 for most other scripts)</dd></div>
+    <div data-t="t3"><dt>\(R\)</dt><dd>the tokenizer's average <b>compression</b>, bytes per token. Around 4 for English under GPT-4-era tokenizers, about 1 for a pure byte tokenizer</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A better tokenizer packs more text into each token, so the same document becomes a shorter sequence.</p>
+  <p class="why"><b>Why it matters</b>Per-token compute scales with \(L\), attention scales with \(L^2\), and both the context window and API prices are measured in tokens. A byte-level model would need about 4× the sequence length for English, so roughly 4× the compute for the dense layers and up to 16× for attention.</p>
+</div>
+
+<details class="think"><summary>Think first: why not just use characters and let the model figure it out?</summary>
+<div>It works, and byte-level models exist (ByT5, Xue et al., 2022). The cost is sequence length. Each token passes through every layer, so 4× more tokens is roughly 4× more FLOPs per document, and a 128K-token context would hold a quarter as much text. Subword tokenization is a compression step that buys a shorter sequence with a bigger vocabulary. It doesn't change what the model can represent, only how much text fits into one forward pass.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="bpe">Byte-pair encoding, step by step</h2>
+
+<p>Almost every LLM since GPT-2 uses some form of <strong>byte-pair encoding</strong> (BPE). It started as a data-compression trick (Gage, 1994) and was adapted to NLP by Sennrich, Haddow &amp; Birch (2016) for machine translation. The training algorithm fits in a paragraph:</p>
+<ol>
+  <li><strong>Pre-tokenize</strong> the corpus into chunks (roughly words) and count how often each chunk occurs.</li>
+  <li>Write every chunk as a sequence of <strong>base symbols</strong>: characters in the textbook version, bytes in real tokenizers.</li>
+  <li>Count every <strong>adjacent pair</strong> of symbols, weighted by how often its chunk occurs.</li>
+  <li><strong>Merge</strong> the most frequent pair everywhere into a new symbol, and append that rule to the merge list.</li>
+  <li>Repeat steps 3–4 until the vocabulary reaches the target size, say 50,000 or 128,000.</li>
+</ol>
+
+<div class="formula" data-name="One BPE merge">
+  <div class="tex">$$(\htmlClass{t1}{a^*}, \htmlClass{t1}{b^*}) = \arg\max_{(a,b)} \sum_{\htmlClass{t2}{w}} \htmlClass{t3}{f(w)} \cdot \htmlClass{t4}{n_w(a,b)}, \qquad \htmlClass{t5}{|V_k|} = \htmlClass{t6}{|V_0|} + k$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\((a^*, b^*)\)</dt><dd>the pair of existing symbols chosen for this merge; it becomes the new symbol \(a^*b^*\)</dd></div>
+    <div data-t="t2"><dt>\(w\)</dt><dd>a distinct pre-token (chunk) in the corpus, in its current segmentation</dd></div>
+    <div data-t="t3"><dt>\(f(w)\)</dt><dd>how many times that chunk occurs in the corpus</dd></div>
+    <div data-t="t4"><dt>\(n_w(a,b)\)</dt><dd>how many times \(a\) is immediately followed by \(b\) inside \(w\)</dd></div>
+    <div data-t="t5"><dt>\(|V_k|\)</dt><dd>vocabulary size after \(k\) merges</dd></div>
+    <div data-t="t6"><dt>\(|V_0|\)</dt><dd>base vocabulary: distinct characters here, exactly 256 for byte-level BPE</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Find the two neighbours that occur together most often across the whole corpus, glue them into one symbol, and repeat. Each merge adds exactly one vocabulary entry.</p>
+  <p class="why"><b>Why it matters</b>The vocabulary size is a hyperparameter you choose by deciding how many merges to run. The merge list, in order, <em>is</em> the tokenizer.</p>
+</div>
+
+<figure class="fig wide"><div id="fig-bpe"></div>
+<figcaption>The first four merges on the textbook corpus from Sennrich et al. (2016): <em>low</em> ×5, <em>lower</em> ×2, <em>newest</em> ×6, <em>widest</em> ×3. <em>e+s</em> and <em>s+t</em> tie at 9; ties go to the pair seen first. After four merges the vocabulary has grown from 10 to 14 symbols and the corpus has shrunk from 79 tokens to 47. The brick-outlined chips are the ones created at that step.</figcaption></figure>
+
+<p>Encoding new text uses the same list. Pre-tokenize, split each chunk into base symbols, then apply the learned merges <strong>in the order they were learned</strong>. The word <em>lowest</em> never appeared in training, but after the merges above it becomes <code>low</code> + <code>est</code>. Both pieces are known, so the model can make use of what it learned about each of them.</p>
+
+<div id="w-bpe"></div>
+
+<div class="def"><b>Definition · tokenizer files</b>
+<p>A trained BPE tokenizer is two things: a <strong>vocabulary</strong> mapping each symbol string to an integer ID, and an ordered <strong>merge list</strong>. In Hugging Face's <code>tokenizer.json</code> they are the <code>model.vocab</code> and <code>model.merges</code> fields. tiktoken stores only the vocabulary with ranks, because a token's rank doubles as its merge priority. Either way, a tokenizer is a data file, not a neural network. It is deterministic and has no gradients.</p>
+</div>
+
+<div class="pitfall"><b>Pitfall · BPE is not longest-match</b>
+<p>It's tempting to think the tokenizer grabs the longest vocabulary entry that matches. BPE doesn't. It replays merges by rank, and that can produce a different split than greedy longest-match would. WordPiece (BERT) does use greedy longest-match at inference time. If you re-implement a tokenizer for a production system, such as a token counter in another language, test it against the reference library on a large sample. Off-by-a-few counts are the usual symptom.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="bytes">Byte-level BPE and pre-tokenization</h2>
+
+<p>A character-level base vocabulary has a hole. Unicode has about 150,000 characters, and a corpus sample won't contain all of them. Any character missing from training becomes <code>[UNK]</code>, which destroys information. GPT-2 (Radford et al., 2019) closed the hole by running BPE over <strong>UTF-8 bytes</strong> instead of characters. There are exactly 256 possible bytes, so the base vocabulary is complete by construction. Any string, in any language and with any emoji or binary junk, can be encoded. In the worst case it's one token per byte.</p>
+
+<figure class="fig"><div id="fig-bytes"></div>
+<figcaption>"café 猫" is 6 characters but 9 UTF-8 bytes: <em>é</em> takes 2 and <em>猫</em> takes 3. Byte-level BPE starts from these 9 byte tokens and merges upward. GPT-2's tokenizer files show each byte as a printable stand-in character, so a leading space appears as <code>Ġ</code> and a newline as <code>Ċ</code>. That's why you see <code>Ġthe</code> in vocab dumps. The mapping is cosmetic; underneath, the tokens are bytes.</figcaption></figure>
+
+<h3>The pre-tokenizer regex</h3>
+<p>Run BPE on raw text and it will happily learn merges like <code>dog.</code>, <code>dog!</code> and <code>dog?</code> as separate tokens. Radford et al. noticed exactly this waste. The fix is to <strong>split text into chunks with a regex first</strong>, and only merge <em>within</em> a chunk. Letters, digits, punctuation and whitespace end up in different chunks, so merges never cross those boundaries.</p>
+
+<div class="code" data-lang="python" data-title="pre-tokenizer patterns (used with the third-party regex module)"><pre><code>
+# GPT-2 (r50k_base). Space attaches to the FRONT of the next word: " cat", " 2024", " !"
+GPT2 = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+# GPT-4 (cl100k_base), also used by Llama 3. Key change: digits chunked in runs of at most 3
+CL100K = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+</code></pre></div>
+
+<p>Two design choices hide in those patterns. First, the optional leading space (<code> ?\p{L}+</code>) means a word token carries the space in front of it, so <code>" cat"</code> and <code>"cat"</code> are different tokens. Second, <code>\s+(?!\S)</code> leaves the <em>last</em> space of a run for the next word, so indentation splits into a whitespace chunk plus <code>" return"</code>.</p>
+
+<div id="w-pretok"></div>
+
+<div class="flag"><b>Streaming caveat</b>
+<p>Because tokens are bytes, a single token can end halfway through a multi-byte character. One token might hold <code>E7 8C</code> and the next <code>AB</code>, which together make 猫. If you stream output by decoding each token on its own, you'll print <code>�</code> replacement characters. Streaming detokenizers buffer bytes until they form valid UTF-8. Hugging Face's <code>TextStreamer</code> and vLLM's incremental detokenizer handle this, and hand-rolled ones often don't.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="unigram">SentencePiece, Unigram and WordPiece</h2>
+
+<p><strong>SentencePiece</strong> (Kudo &amp; Richardson, 2018) is a library, not an algorithm. It treats input as a raw character stream, replaces spaces with the visible marker <code>▁</code> (U+2581), and needs no language-specific pre-tokenizer, which matters for Chinese, Japanese and Thai, where spaces don't separate words. It implements two algorithms: BPE, and <strong>Unigram</strong>. With <code>byte_fallback</code> enabled, characters missing from the vocabulary decompose into byte tokens like <code>&lt;0xE7&gt;</code> instead of <code>&lt;unk&gt;</code>. Llama 1 and 2 worked this way.</p>
+
+<p>Unigram (Kudo, 2018) runs BPE in reverse. It starts from a large candidate vocabulary, gives every piece a probability, and repeatedly prunes the pieces whose removal hurts the corpus likelihood least. At encoding time it picks the most probable segmentation:</p>
+
+<div class="formula" data-name="Unigram segmentation">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{x}^*} = \arg\max_{\mathbf{x} \in \htmlClass{t2}{S(X)}} \; \prod_{i=1}^{|\mathbf{x}|} \htmlClass{t3}{p(x_i)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{x}^*\)</dt><dd>the chosen segmentation: a sequence of vocabulary pieces that spells \(X\)</dd></div>
+    <div data-t="t2"><dt>\(S(X)\)</dt><dd>every way of splitting the string \(X\) into pieces that are in the vocabulary</dd></div>
+    <div data-t="t3"><dt>\(p(x_i)\)</dt><dd>learned probability of piece \(x_i\), fitted with EM on the training corpus</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Among all the ways to chop the word up, take the one whose pieces are jointly most likely, treating each piece as independent. The Viterbi algorithm finds it in linear time.</p>
+  <p class="why"><b>Why it matters</b>Because Unigram has probabilities, it can <em>sample</em> alternative segmentations during training ("subword regularization"). The model then sees <code>un|believ|able</code> and <code>unbeliev|able</code> for the same word, which makes it less brittle about splits. BPE-dropout (Provilkov et al., 2020) gets a similar effect for BPE.</p>
+</div>
+
+<p><strong>WordPiece</strong> (Schuster &amp; Nakajima, 2012; used by BERT) is a BPE cousin. It merges the pair with the highest \(\frac{\text{count}(ab)}{\text{count}(a)\,\text{count}(b)}\) instead of the raw count, marks word-internal pieces with <code>##</code>, and encodes by greedy longest-match. You'll meet it in embedding and reranker models (Module 11) more than in generative LLMs.</p>
+
+<table class="t">
+  <thead><tr><th>Model family</th><th>Algorithm</th><th class="num">Vocab size</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>BERT</td><td>WordPiece</td><td class="num">30,522</td><td>Lower-cased English in the base "uncased" model; <code>[UNK]</code> exists</td></tr>
+    <tr><td>T5</td><td>SentencePiece Unigram</td><td class="num">32,000</td><td>Plus 100 sentinel tokens for span corruption</td></tr>
+    <tr><td>GPT-2 / GPT-3</td><td>byte-level BPE</td><td class="num">50,257</td><td>50,000 merges + 256 bytes + <code>&lt;|endoftext|&gt;</code></td></tr>
+    <tr><td>Llama 1/2, Mistral 7B</td><td>SentencePiece BPE</td><td class="num">32,000</td><td>Byte fallback; every digit is its own token</td></tr>
+    <tr><td>GPT-4 (cl100k_base)</td><td>byte-level BPE</td><td class="num">~100K</td><td>Digits in chunks of ≤3; whitespace-run tokens for code</td></tr>
+    <tr><td>Llama 3</td><td>byte-level BPE (tiktoken)</td><td class="num">128,256</td><td>100K from tiktoken + 28K added for non-English; 256 reserved special tokens</td></tr>
+    <tr><td>Qwen 2 / 2.5</td><td>byte-level BPE</td><td class="num">~151K</td><td>Embedding padded to 151,936 rows for hardware alignment</td></tr>
+    <tr><td>GPT-4o (o200k_base)</td><td>byte-level BPE</td><td class="num">~200K</td><td>Bigger vocabulary aimed at non-English efficiency</td></tr>
+    <tr><td>Gemma</td><td>SentencePiece</td><td class="num">256K</td><td>Very large vocabulary; embeddings are a big share of the small models</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="vocab">Vocabulary size is a trade-off</h2>
+
+<p>Every vocabulary entry needs a row in the embedding table and, unless the weights are tied, a column in the output projection. Both are \(V \times d\) matrices.</p>
+
+<div class="formula" data-name="Embedding parameters">
+  <div class="tex">$$\htmlClass{t1}{N_{\text{emb}}} = \htmlClass{t2}{V}\cdot\htmlClass{t3}{d} \;+\; \htmlClass{t4}{u}\cdot \htmlClass{t2}{V}\cdot\htmlClass{t3}{d}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(N_{\text{emb}}\)</dt><dd>parameters spent on mapping tokens in and out of the model</dd></div>
+    <div data-t="t2"><dt>\(V\)</dt><dd>vocabulary size (Llama 3: 128,256)</dd></div>
+    <div data-t="t3"><dt>\(d\)</dt><dd>model width, also called hidden size or \(d_{\text{model}}\) (Llama-3-8B: 4,096)</dd></div>
+    <div data-t="t4"><dt>\(u\)</dt><dd>1 if the output projection (LM head) is a separate matrix, 0 if it's tied to the embedding</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>One \(d\)-dimensional vector per token on the way in, and one more per token on the way out unless the two are shared.</p>
+  <p class="why"><b>Why it matters</b>Llama-3-8B: \(128{,}256 \times 4{,}096 \approx 525\text{M}\) per matrix. It's untied, so that's 1.05B of its 8.03B parameters, about 13%. Llama-3.2-1B uses the same vocabulary at \(d = 2{,}048\): 263M, tied, about 21% of the whole model. At 70B the same vocabulary is about 3%.</p>
+</div>
+
+<div class="grid2">
+  <div class="card"><div class="k">What a bigger V buys</div><h4>Shorter sequences</h4><p>More merges means common strings become single tokens, so the same text costs fewer tokens and the context window holds more. Meta reported up to 15% fewer tokens for Llama 3's 128K vocabulary than for Llama 2's 32K. Most of the gain shows up in non-English text and code, the parts a small vocabulary fragments worst.</p></div>
+  <div class="card bad"><div class="k">What a bigger V costs</div><h4>Parameters, logits, rare rows</h4><p>The tables grow linearly in \(V\). Every decode step computes \(V\) logits, which takes \(2dV\) FLOPs (about 1 GFLOP per token for Llama-3-8B, against roughly 16 GFLOP for the full forward pass). And the rarest tokens get few gradient updates, so their embeddings stay poorly trained.</p></div>
+</div>
+
+<div class="formula" data-name="Logit memory in training">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{logits}}} = \htmlClass{t2}{B}\cdot\htmlClass{t3}{T}\cdot\htmlClass{t4}{V}\cdot\htmlClass{t5}{s}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{logits}}\)</dt><dd>bytes needed to materialize the full logit tensor for one training step</dd></div>
+    <div data-t="t2"><dt>\(B\)</dt><dd>sequences in the micro-batch</dd></div>
+    <div data-t="t3"><dt>\(T\)</dt><dd>tokens per sequence</dd></div>
+    <div data-t="t4"><dt>\(V\)</dt><dd>vocabulary size</dd></div>
+    <div data-t="t5"><dt>\(s\)</dt><dd>bytes per value (4 if the loss is computed in fp32, which is common)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Training scores every vocabulary entry at every position, and that tensor can be bigger than the model.</p>
+  <p class="why"><b>Why it matters</b>8 sequences × 8,192 tokens × 128,256 × 4 bytes ≈ 33.6 GB, more than the bf16 weights of an 8B model. This is why fine-tuning large-vocabulary models runs out of memory at the loss, and why fused or chunked cross-entropy kernels exist (Liger Kernel; Cut Cross-Entropy, Wijmans et al., 2024). They compute the loss without ever storing the full tensor.</p>
+</div>
+
+<div id="w-vocab"></div>
+
+<div class="mle"><b>MLE angle · adding tokens</b>
+<p>Adding special tokens for fine-tuning (<code>tok.add_special_tokens(...)</code>) means growing both tables with <code>model.resize_token_embeddings(len(tok))</code>. The new rows start untrained. Recent versions of transformers initialize them near the mean of the existing rows, which is far better than random, but they still need enough training examples to become useful. If you train with LoRA, the new rows only learn if the embedding and LM head are trainable (for example via PEFT's <code>modules_to_save</code>).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="quirks">Tokenizer quirks that leak into behaviour</h2>
+
+<p>The model only ever sees token IDs. Any property of the text that the tokenizer hides, the model has to infer indirectly, from statistics across billions of examples. Many famous LLM failures come from this.</p>
+
+<figure class="fig wide"><div id="fig-quirks"></div>
+<figcaption>Quirks you can predict from the tokenizer alone. Digit chunking follows directly from the regexes in the previous section. The <em>strawberry</em> split is roughly what GPT-4-era tokenizers produce. The script row shows UTF-8 bytes, the raw material BPE starts from. Exact token boundaries depend on the tokenizer, so check yours with the code in the hands-on section.</figcaption></figure>
+
+<h3>Numbers are split inconsistently</h3>
+<p>GPT-2 learned merges for whatever digit strings happened to be frequent, so <code>1999</code> might be one token and <code>1997</code> two. Arithmetic then has to work across arbitrary chunk boundaries. Later tokenizers impose structure: Llama 1/2 split every digit, and cl100k/Llama 3 chunk left to right in groups of at most three. Left-to-right chunking misaligns place value (<code>12345</code> → <code>123|45</code>, while <code>1234</code> → <code>123|4</code>). Singh &amp; Strouse (2024) found that forcing right-to-left grouping, for example by inserting commas, improved arithmetic accuracy in frontier models.</p>
+
+<h3>Leading spaces and case make different tokens</h3>
+<p><code>"cat"</code>, <code>" cat"</code>, <code>" Cat"</code> and <code>"CAT"</code> have four unrelated IDs. The model has to learn separately that they mean the same thing. A subtler consequence: a prompt that ends in a trailing space, like <code>"The capital of France is "</code>, forces the space into its own token. During training the space almost always arrived glued to the next word (<code>" Paris"</code>), so the model is now in an unusual state and completions get worse. Some libraries implement <em>token healing</em> to back off the last token and let the model regenerate it.</p>
+
+<h3>Non-English text costs more</h3>
+<p>A tokenizer trained mostly on English learns merges for English. Other scripts start with more bytes per character (2 for Cyrillic or Greek, 3 for Devanagari or Chinese) and get fewer merges. Petrov et al. (2023) measured the same content costing several times more tokens in some languages than in English, more than 10× in the worst cases. That multiplier hits price, latency and how much fits in context. It's one reason vocabularies grew from 32K to 128K–256K.</p>
+
+<h3>Code whitespace</h3>
+<p>Indentation is mostly spaces. GPT-2's vocabulary had few tokens for runs of spaces, so deeply indented code was expensive. Codex's tokenizer (p50k) added a couple of dozen whitespace-run tokens, and cl100k goes further. If you're picking a model for a code-heavy workload, compare token counts on your own repository. The differences between tokenizers are real.</p>
+
+<h3>Glitch tokens</h3>
+<p>Rumbelow &amp; Watkins (2023) found tokens such as <code>" SolidGoldMagikarp"</code> in the GPT-2/GPT-3 vocabulary, a Reddit username that was common in the tokenizer's training data but nearly absent from the model's. Its embedding row barely moved from initialization. Asked to repeat the string, models would evade, say a different word, or produce something bizarre. Land &amp; Bartolo (2024) later showed how to detect such under-trained tokens automatically from the embedding matrix. The lesson is general: train the tokenizer on the same distribution as the model.</p>
+
+<h3>Why LLMs struggle to count letters</h3>
+<p>"How many r's in <em>strawberry</em>?" looks trivial, but the model sees something like three IDs: <code>str</code>, <code>aw</code>, <code>berry</code>. The letters inside each token aren't visible. The model knows the spelling of <code>berry</code> only if training text happened to spell it out somewhere. Spelling, reversing, rhyming and character-level edits all have the same weakness. Asking the model to first write the word with spaces or one letter per line usually fixes it, because every letter then becomes its own token.</p>
+
+<details class="think"><summary>Think first: you change only the tokenizer and keep the same 8B architecture. What changes?</summary>
+<div>You'd have to retrain the whole model, because every embedding row is tied to a specific ID. With a bigger vocabulary, the embedding and LM head grow (\(2 \times \Delta V \times 4096\) parameters if untied), each document becomes fewer tokens, so the same compute budget sees more text, and the logit computation per step gets heavier. Which effect wins depends on the data mix. Multilingual and code data benefit most.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="special">Special tokens and chat templates</h2>
+
+<p>Some vocabulary entries are never produced by BPE. They're reserved IDs with control meanings, added by hand:</p>
+<ul>
+  <li><strong>BOS / EOS:</strong> beginning and end of a document. Llama 3 uses <code>&lt;|begin_of_text|&gt;</code> (128000) and <code>&lt;|end_of_text|&gt;</code> (128001).</li>
+  <li><strong>Role markers:</strong> <code>&lt;|start_header_id|&gt;</code> and <code>&lt;|end_header_id|&gt;</code> around the role name, and <code>&lt;|eot_id|&gt;</code> (128009) to end a turn.</li>
+  <li><strong>Padding, tool calls, images, fill-in-the-middle:</strong> each gets its own reserved IDs, depending on the model.</li>
+</ul>
+<p>Whether a special-token <em>string</em> inside user text becomes the special <em>token</em> is a security question. If it does, someone can type <code>&lt;|eot_id|&gt;</code> into a chat box and forge a turn boundary, a prompt-injection vector. tiktoken refuses by default and raises an error unless you pass <code>allowed_special</code>. Hugging Face tokenizers do the opposite: by default they <em>do</em> match special-token strings in the input, so a serving stack must either sanitize user text or tokenize it with <code>split_special_tokens=True</code>. A <strong>chat template</strong> is the recipe that renders a list of messages into one string of ordinary and special tokens. It ships as a Jinja template in <code>tokenizer_config.json</code>.</p>
+
+<figure class="fig wide"><div class="tplgrid">
+  <div><div class="tpl-h">Llama 3 instruct format</div>
+<pre class="tpl"><span class="st">&lt;|begin_of_text|&gt;</span><span class="st">&lt;|start_header_id|&gt;</span>system<span class="st">&lt;|end_header_id|&gt;</span><span class="nl">↵↵</span>
+You are a terse assistant.<span class="st">&lt;|eot_id|&gt;</span><span class="st">&lt;|start_header_id|&gt;</span>user<span class="st">&lt;|end_header_id|&gt;</span><span class="nl">↵↵</span>
+What is 17 * 23?<span class="st">&lt;|eot_id|&gt;</span><span class="st">&lt;|start_header_id|&gt;</span>assistant<span class="st">&lt;|end_header_id|&gt;</span><span class="nl">↵↵</span>
+<span class="gen">391<span class="st">&lt;|eot_id|&gt;</span></span><span class="ids">128000 begin_of_text · 128006 start_header_id · 128007 end_header_id · 128009 eot_id. Green = what the model generates; everything before it is the prompt, ending with the "generation prompt" (the assistant header).</span></pre></div>
+  <div><div class="tpl-h">ChatML (Qwen and many others)</div>
+<pre class="tpl"><span class="st">&lt;|im_start|&gt;</span>system<span class="nl">↵</span>
+You are a terse assistant.<span class="st">&lt;|im_end|&gt;</span><span class="nl">↵</span>
+<span class="st">&lt;|im_start|&gt;</span>user<span class="nl">↵</span>
+What is 17 * 23?<span class="st">&lt;|im_end|&gt;</span><span class="nl">↵</span>
+<span class="st">&lt;|im_start|&gt;</span>assistant<span class="nl">↵</span>
+<span class="gen">391<span class="st">&lt;|im_end|&gt;</span></span><span class="ids">Same conversation, different special tokens, different newline rules. A model trained on one format has never seen the other's control tokens in this role.</span></pre></div>
+</div>
+<figcaption>The same three messages rendered by two chat templates. Blue chips are single special tokens, ↵ marks newlines. Llama 3.1's official template also injects "Cutting Knowledge Date" and "Today Date" lines into the system turn, a detail that is easy to miss when hand-writing prompts.</figcaption></figure>
+
+<h3>Why template mismatch breaks fine-tunes</h3>
+<p>An instruct model has learned a very specific pattern: after <code>assistant&lt;|end_header_id|&gt;\n\n</code> comes an answer, and after the answer comes <code>&lt;|eot_id|&gt;</code>. Change any part of that between training and serving, and you're asking the model to continue a sequence it has never seen. Typical symptoms:</p>
+<ul>
+  <li><strong>It never stops.</strong> You fine-tuned without <code>&lt;|eot_id|&gt;</code> in the labels, or the server's stop tokens don't include it. The model writes an answer, then invents the next user turn. Llama 3 Instruct's original generation config stopped only on <code>&lt;|end_of_text|&gt;</code> and was later updated to include <code>&lt;|eot_id|&gt;</code>. Until then, many deployments showed exactly this bug.</li>
+  <li><strong>It answers in the wrong voice or format.</strong> You trained on <code>### Instruction:</code>-style prompts and serve through the official template, or the reverse. The adapter learned to respond to tokens it never sees in production.</li>
+  <li><strong>Garbage or NaNs on special tokens.</strong> Community reports found that some base checkpoints (Llama-3-8B base among them) ship special-token rows that were never trained. Fine-tuning the base model with the instruct template then starts from junk embeddings for exactly the tokens that structure every example.</li>
+</ul>
+
+<div class="pitfall"><b>Pitfall · padding with EOS</b>
+<p>Llama 3 has no pad token, and a common fix is <code>tok.pad_token = tok.eos_token</code>. Many data collators set the label to −100 (ignored) wherever <code>input_ids == pad_token_id</code>, and that also masks the <em>real</em> EOS at the end of each example. The model is never trained to stop. Use a distinct pad token, such as one of the reserved <code>&lt;|reserved_special_token_*|&gt;</code> entries, or a collator that masks by attention mask instead of by ID.</p>
+</div>
+
+<div class="mle"><b>MLE angle · one source of truth</b>
+<p>Render prompts with <code>tok.apply_chat_template(...)</code> at training time, at eval time and in the serving stack. Never hand-concatenate special tokens. Before any fine-tune, decode one fully processed training example back to text and read it, checking BOS count, role headers, newlines, the EOS at the end, and which tokens have labels. Five minutes here saves a wasted training run.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="lookup">Embeddings are a lookup table</h2>
+
+<p>The embedding layer is a matrix \(E \in \mathbb{R}^{V\times d}\) with one row per token. "Embedding token 2" means "read row 2". It's written as a matrix product because that makes the math and the gradients clean, but no framework actually multiplies by a one-hot vector.</p>
+
+<div class="formula" data-name="Embedding lookup">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{e}} = \htmlClass{t2}{\text{onehot}(x)}\;\htmlClass{t3}{E} = \htmlClass{t3}{E}[\htmlClass{t4}{x}]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{e}\)</dt><dd>the token's embedding, a vector in \(\mathbb{R}^{d}\) that enters the first transformer layer</dd></div>
+    <div data-t="t2"><dt>\(\text{onehot}(x)\)</dt><dd>a length-\(V\) row vector of zeros with a single 1 at position \(x\)</dd></div>
+    <div data-t="t3"><dt>\(E\)</dt><dd>the embedding matrix, \(V \times d\), learned by gradient descent like any other weight</dd></div>
+    <div data-t="t4"><dt>\(x\)</dt><dd>the integer token ID from the tokenizer</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Multiplying by a one-hot vector selects one row. So an embedding layer is an indexed read, and <code>nn.Embedding</code> is literally <code>E[ids]</code>.</p>
+  <p class="why"><b>Why it matters</b>The gradient of the loss with respect to \(E\) is zero everywhere except the rows of tokens that appeared in the batch. Rare tokens get rare updates. That is the mechanism behind glitch tokens, and the reason new tokens need real training data.</p>
+</div>
+
+<figure class="fig"><div id="fig-lookup"></div>
+<figcaption>A toy vocabulary of 8 tokens with \(d = 5\). The one-hot vector for ID 2 (<code>␣cat</code>) times \(E\) picks out row 2. In Llama-3-8B the same picture has 128,256 rows of 4,096 numbers, about 1 GB in bf16, and a forward pass reads only the rows of the tokens in the prompt.</figcaption></figure>
+
+<p>A few practical details. Embeddings are typically initialized from a small normal distribution (GPT-2 used \(\sigma = 0.02\)). Some models rescale them: the original Transformer and Gemma multiply by \(\sqrt{d}\) so the embeddings match the scale of the residual stream. Rows for byte tokens that real text almost never uses, such as bytes that can't occur in valid UTF-8, stay close to their initial values for the whole of training.</p>
+
+<!-- ================================================================== -->
+<h2 id="geometry">Embedding geometry</h2>
+
+<p>Training pushes tokens that appear in similar contexts toward similar vectors, because similar vectors produce similar predictions downstream. The standard way to compare two embeddings is the angle between them.</p>
+
+<div class="formula" data-name="Cosine similarity">
+  <div class="tex">$$\htmlClass{t1}{\cos(\mathbf{u},\mathbf{v})} = \frac{\htmlClass{t2}{\mathbf{u}\cdot\mathbf{v}}}{\htmlClass{t3}{\lVert\mathbf{u}\rVert\,\lVert\mathbf{v}\rVert}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\cos(\mathbf{u},\mathbf{v})\)</dt><dd>similarity from −1 (opposite) through 0 (unrelated, orthogonal) to 1 (same direction)</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{u}\cdot\mathbf{v}\)</dt><dd>dot product: sum of elementwise products (Module 01)</dd></div>
+    <div data-t="t3"><dt>\(\lVert\mathbf{u}\rVert\,\lVert\mathbf{v}\rVert\)</dt><dd>product of the lengths, which divides out magnitude so only direction counts</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Two vectors are similar if they point the same way, regardless of how long they are.</p>
+</div>
+
+<p>The famous demonstration comes from word2vec (Mikolov et al., 2013): directions in embedding space can encode relations, so <em>king − man + woman</em> lands near <em>queen</em>.</p>
+
+<div class="formula" data-name="Analogy by vector arithmetic">
+  <div class="tex">$$\htmlClass{t1}{w^*} = \arg\max_{w \,\notin\, \{a,b,c\}} \; \cos\!\big(\htmlClass{t2}{\mathbf{e}_w},\; \htmlClass{t3}{\mathbf{e}_a - \mathbf{e}_b + \mathbf{e}_c}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(w^*\)</dt><dd>the predicted answer word, e.g. queen</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{e}_w\)</dt><dd>embedding of each candidate word in the vocabulary</dd></div>
+    <div data-t="t3"><dt>\(\mathbf{e}_a - \mathbf{e}_b + \mathbf{e}_c\)</dt><dd>the query point: start at \(a\) (king), remove \(b\) (man), add \(c\) (woman)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Take the offset from man to king ("royalty"), apply it to woman, and see which real word is closest to where you land.</p>
+  <p class="why"><b>Why it matters</b>Look at the \(w \notin \{a,b,c\}\). The standard evaluation excludes the input words, because otherwise the nearest vector is very often \(a\) or \(c\) itself. Nissim et al. (2020) argue that this exclusion makes analogies look much stronger than they are.</p>
+</div>
+
+<div id="w-space"></div>
+
+<div class="flag"><b>Caveat · toys versus real spaces</b>
+<p>The widget is hand-built in 2 dimensions so the arithmetic works exactly. Real input embeddings have thousands of dimensions (4,096 in Llama-3-8B), their cosine similarities are lower and noisier, and analogies hold for a few relation types (capitals, gender, verb tense) and fail for many others. Also, an LLM's <em>input</em> embedding of a token is context-free: <code>" bank"</code> has one row whether the text is about rivers or money. The meaningful, contextual representations are the hidden states after a few transformer layers. Retrieval embedding models (Module 11) are trained specifically so that cosine similarity between whole texts means something.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="unembed">The unembedding and weight tying</h2>
+
+<p>At the top of the model, the final hidden state \(\mathbf{h}\) for the last position has to become a score for every vocabulary entry. That's one more matrix multiply, the <strong>LM head</strong> or <strong>unembedding</strong>.</p>
+
+<div class="formula" data-name="Logits from the LM head">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{z}} = \htmlClass{t2}{\mathbf{h}}\,\htmlClass{t3}{W_U}, \qquad \htmlClass{t4}{p(x_{t+1}=j)} = \frac{e^{\htmlClass{t1}{z_j}}}{\sum_{k=1}^{V} e^{\htmlClass{t1}{z_k}}}, \qquad \text{tied: } \htmlClass{t3}{W_U} = \htmlClass{t5}{E^{\top}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{z}\)</dt><dd>logits: one raw score per vocabulary entry, a length-\(V\) vector</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{h}\)</dt><dd>final hidden state at position \(t\), length \(d\), after the last norm layer</dd></div>
+    <div data-t="t3"><dt>\(W_U\)</dt><dd>unembedding matrix, \(d \times V\). Column \(j\) is "what a hidden state that predicts token \(j\) looks like"</dd></div>
+    <div data-t="t4"><dt>\(p(x_{t+1}=j)\)</dt><dd>softmax probability that the next token is \(j\) (Module 03)</dd></div>
+    <div data-t="t5"><dt>\(E^{\top}\)</dt><dd>the transposed input embedding, reused when weights are tied</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Score every token by taking the dot product of its output vector with the hidden state, then softmax the scores into probabilities. With tying, the vector used to read a token in is the same vector used to score it on the way out.</p>
+  <p class="why"><b>Why it matters</b>Tying (Press &amp; Wolf, 2017; Inan et al., 2017) saves \(V \cdot d\) parameters, which is a big deal for small models: GPT-2, Gemma, Llama-3.2-1B/3B and the small Qwen2.5 models tie. Large models usually untie, because the extra matrix is a small fraction of their budget and separate input and output roles seem to help a little.</p>
+</div>
+
+<figure class="fig"><div id="fig-lmhead"></div>
+<figcaption>The last hidden state for the prompt "The cat sat on the" (toy numbers) is multiplied by \(W_U\) to give one logit per vocabulary entry, and softmax turns logits into probabilities. With tied weights, \(W_U\) is literally \(E^{\top}\): no new parameters.</figcaption></figure>
+
+<h3>What's missing: word order</h3>
+<p>Look at what the embedding layer produces for "dog bites man" and "man bites dog": the same three vectors in a different order. Nothing in an embedding row says <em>where</em> the token sits. Attention, the next step, compares every position with every other, and on its own it is blind to order. Shuffle the inputs and the outputs shuffle the same way. Something has to inject position. GPT-2 added a second learned table of position vectors (1,024 × 768). Modern models rotate queries and keys by position-dependent angles inside attention (RoPE). Module 06 builds both.</p>
+
+<!-- ================================================================== -->
+<h2 id="cost">Cost and context are counted in tokens</h2>
+
+<p>Context windows, rate limits, latency and API bills are all quoted in tokens. Output tokens usually cost several times more than input tokens, because each one needs its own sequential decode step, while the input is processed in parallel during prefill (Module 08).</p>
+
+<div class="formula" data-name="API cost per call">
+  <div class="tex">$$\htmlClass{t1}{\text{cost}} = \htmlClass{t2}{T_{\text{in}}}\cdot\htmlClass{t3}{p_{\text{in}}} + \htmlClass{t4}{T_{\text{out}}}\cdot\htmlClass{t5}{p_{\text{out}}}, \qquad \htmlClass{t2}{T_{\text{in}}} \approx \frac{\htmlClass{t6}{\text{chars}}}{4}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>cost</dt><dd>price of one request</dd></div>
+    <div data-t="t2"><dt>\(T_{\text{in}}\)</dt><dd>input tokens: system prompt + history + retrieved context + the question</dd></div>
+    <div data-t="t3"><dt>\(p_{\text{in}}\)</dt><dd>price per input token (quoted per million; cached input is often discounted)</dd></div>
+    <div data-t="t4"><dt>\(T_{\text{out}}\)</dt><dd>output tokens, including hidden reasoning tokens on reasoning models, which are billed as output</dd></div>
+    <div data-t="t5"><dt>\(p_{\text{out}}\)</dt><dd>price per output token</dd></div>
+    <div data-t="t6"><dt>chars</dt><dd>character count. The ÷4 is a rule of thumb for English prose only</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>You pay for what you send and what you get back, at two different rates. About 4 characters, or ¾ of a word, per token is the standard English estimate.</p>
+  <p class="why"><b>Why it matters</b>Agents resend the whole conversation on every step, so \(T_{\text{in}}\) grows with each turn and usually dominates the bill (Module 12). For example, a 2,000-token prompt at $3 per million input tokens costs $0.006 per call, which is $60 a day at 10,000 calls before a single output token.</p>
+</div>
+
+<div id="w-cost"></div>
+
+<div class="pitfall"><b>Pitfall · the ÷4 rule</b>
+<p>It's a planning estimate, not a measurement. Code, JSON, numbers, URLs and non-English text all tokenize worse than prose, and different vendors' tokenizers can disagree noticeably on the same text. For anything that affects a budget or a context limit, count with the model's own tokenizer, or read the <code>usage</code> field the API returns.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Poke at real tokenizers with tiktoken</h3>
+<div class="code" data-lang="python" data-title="tiktoken_tour.py"><pre><code>
+import tiktoken
+
+enc = tiktoken.get_encoding("o200k_base")       # GPT-4o family; try "cl100k_base" too
+text = "Tokenizers are unbelievably useful."
+ids = enc.encode(text)
+print(len(ids), ids)
+print([enc.decode_single_token_bytes(t) for t in ids])   # raw bytes of each token
+assert enc.decode(ids) == text
+print("vocab size:", enc.n_vocab)
+
+# leading space and case produce unrelated ids
+for s in ["cat", " cat", " Cat", "CAT"]:
+    print(repr(s), enc.encode(s))
+
+# digits are pre-tokenized in chunks of at most 3, left to right
+print([enc.decode([t]) for t in enc.encode("12345 2024")])   # expect ['123', '45', ' ', '202', '4']
+
+# special tokens are refused in ordinary text unless explicitly allowed
+try:
+    enc.encode("&lt;|endoftext|&gt;")
+except ValueError as e:
+    print("refused:", str(e)[:60])
+print(enc.encode("&lt;|endoftext|&gt;", allowed_special={"&lt;|endoftext|&gt;"}))
+
+# compression: bytes per token on your own text
+sample = open("README.md", encoding="utf-8").read()
+print("bytes/token:", len(sample.encode("utf-8")) / len(enc.encode(sample, disallowed_special=())))
+</code></pre></div>
+
+<h3>2. Hugging Face tokenizers and chat templates</h3>
+<div class="code" data-lang="python" data-title="hf_tokenizer.py"><pre><code>
+from transformers import AutoTokenizer
+
+# gated repo: accept the licence on the Hub and run `huggingface-cli login` first
+tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+
+enc = tok("Tokenizers are unbelievably useful.")
+print(enc["input_ids"])                              # starts with 128000 = &lt;|begin_of_text|&gt;
+print(tok.convert_ids_to_tokens(enc["input_ids"]))   # 'Ġ' marks a leading space
+print(tok.decode(enc["input_ids"], skip_special_tokens=True))
+
+messages = [
+    {"role": "system", "content": "You are a terse assistant."},
+    {"role": "user", "content": "What is 17 * 23?"},
+]
+text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+print(text)        # ends with '&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;\n\n'
+
+out = tok.apply_chat_template(messages, add_generation_prompt=True,
+                              return_dict=True, return_tensors="pt")
+ids = out["input_ids"]
+
+# Pitfall: tok(text) adds a SECOND &lt;|begin_of_text|&gt; because the template already has one
+bad = tok(text, return_tensors="pt").input_ids
+good = tok(text, add_special_tokens=False, return_tensors="pt").input_ids
+print((bad[0] == tok.bos_token_id).sum().item(), "BOS tokens vs", (good[0] == tok.bos_token_id).sum().item())
+assert good.tolist() == ids.tolist()
+</code></pre></div>
+
+<h3>3. A minimal byte-level BPE trainer</h3>
+<p>This is the algorithm from the widget, on bytes, with a simplified GPT-2 pre-tokenizer (the standard <code>re</code> module has no <code>\p{L}</code>, so it uses ASCII classes). Train it on a few megabytes of text, then check that it round-trips and that its compression rises as you add merges.</p>
+<div class="code" data-lang="python" data-title="bpe.py"><pre><code>
+import re
+from collections import Counter
+
+# GPT-2-style pre-tokenizer, ASCII-only approximation for the stdlib `re` module
+PAT = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+""")
+
+def pair_counts(words):
+    counts = Counter()
+    for word, freq in words.items():
+        for pair in zip(word, word[1:]):
+            counts[pair] += freq
+    return counts
+
+def merge(word, pair, new_id):
+    out, i = [], 0
+    while i &lt; len(word):
+        if i &lt; len(word) - 1 and (word[i], word[i + 1]) == pair:
+            out.append(new_id)
+            i += 2
+        else:
+            out.append(word[i])
+            i += 1
+    return tuple(out)
+
+def train(text, vocab_size):
+    words = Counter(tuple(chunk.encode("utf-8")) for chunk in PAT.findall(text))
+    vocab = {i: bytes([i]) for i in range(256)}      # 256 base tokens: no UNK, ever
+    merges = {}                                      # (id_a, id_b) -&gt; new id; insertion order = rank
+    for new_id in range(256, vocab_size):
+        counts = pair_counts(words)
+        if not counts:
+            break
+        pair = max(counts, key=counts.get)           # most frequent adjacent pair
+        merges[pair] = new_id
+        vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
+        words = Counter({merge(w, pair, new_id): f for w, f in words.items()})
+    return merges, vocab
+
+def encode(text, merges):
+    ids = []
+    for chunk in PAT.findall(text):
+        word = tuple(chunk.encode("utf-8"))
+        while len(word) &gt;= 2:
+            # apply the earliest-learned merge present in this chunk
+            pair = min(zip(word, word[1:]), key=lambda p: merges.get(p, float("inf")))
+            if pair not in merges:
+                break
+            word = merge(word, pair, merges[pair])
+        ids.extend(word)
+    return ids
+
+def decode(ids, vocab):
+    return b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+
+if __name__ == "__main__":
+    text = open("corpus.txt", encoding="utf-8").read()
+    merges, vocab = train(text, vocab_size=1000)
+    sample = "Tokenizers are unbelievably useful, café 猫!"
+    ids = encode(sample, merges)
+    assert decode(ids, vocab) == sample
+    print(len(sample.encode("utf-8")), "bytes -&gt;", len(ids), "tokens")
+    print([vocab[i] for i in ids])
+</code></pre></div>
+
+<h3>4. Look inside an embedding matrix</h3>
+<div class="code" data-lang="python" data-title="embeddings.py"><pre><code>
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "meta-llama/Llama-3.2-1B"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16)
+
+E = model.get_input_embeddings().weight          # (128256, 2048)
+W = model.get_output_embeddings().weight         # nn.Linear stores (out=V, in=d)
+print(E.shape, W.shape, "tied:", E.data_ptr() == W.data_ptr())
+
+En = F.normalize(E.float(), dim=-1)
+def neighbours(word, k=8):
+    ids = tok.encode(word, add_special_tokens=False)
+    assert len(ids) == 1, f"{word!r} is {len(ids)} tokens"
+    sims = En @ En[ids[0]]
+    return [(tok.decode([i]), round(s, 3)) for s, i in zip(*[t.tolist() for t in sims.topk(k)])]
+
+print(neighbours(" king"))
+print(neighbours(" Paris"))
+
+# under-trained rows: unusually small norms are glitch-token candidates
+norms = E.float().norm(dim=-1)
+print([tok.decode([i]) for i in norms.argsort()[:20].tolist()])
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when (1) your <code>bpe.py</code> round-trips arbitrary UTF-8, including emoji, and you can plot bytes/token against vocab size for 300, 1,000 and 5,000 merges on the same corpus; (2) you have a table of token counts for one English paragraph, one code file and one non-English paragraph under <code>cl100k_base</code>, <code>o200k_base</code> and the Llama 3 tokenizer; and (3) you've decoded one fully templated, tokenized fine-tuning example and confirmed that there is exactly one BOS and that the final <code>&lt;|eot_id|&gt;</code> has a label.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="05-main" data-title="Check yourself · Tokens &amp; embeddings">
+  <div class="q" data-answer="1"><p>Llama-3-8B has \(V = 128{,}256\), \(d = 4{,}096\) and an untied LM head. Roughly how many parameters do the embedding and LM head hold together?</p>
+    <ol><li>~525M</li><li>~1.05B</li><li>~4.2B</li><li>~33M</li></ol>
+    <div class="explain">128,256 × 4,096 ≈ 525M per matrix, and untied means there are two of them: ≈ 1.05B, about 13% of the 8.03B total. 525M would be right for a tied model.</div></div>
+  <div class="q" data-answer="3"><p>A user sends an emoji that never appeared in the tokenizer's training data. What does a byte-level BPE tokenizer do?</p>
+    <ol><li>Emits <code>[UNK]</code></li><li>Raises an error</li><li>Silently drops the character</li><li>Encodes its UTF-8 bytes, merged where learned merges apply, so nothing is unknown</li></ol>
+    <div class="explain">The base vocabulary contains all 256 byte values, so any string can be expressed. The worst case is one token per byte (4 for most emoji). The model may know little about that byte sequence, but no information is lost.</div></div>
+  <div class="q" data-answer="2"><p>Corpus word counts: <em>hug</em> ×10, <em>pug</em> ×5, <em>pun</em> ×12, <em>bun</em> ×4, <em>hugs</em> ×5, split into characters. Which pair does BPE merge first?</p>
+    <ol><li>p + u</li><li>u + n</li><li>u + g</li><li>h + u</li></ol>
+    <div class="explain">Weighted pair counts: u+g = 10 (hug) + 5 (pug) + 5 (hugs) = 20; p+u = 5 + 12 = 17; u+n = 12 + 4 = 16; h+u = 10 + 5 = 15. Highest wins: u+g.</div></div>
+  <div class="q" data-answer="0"><p>You render a conversation with <code>apply_chat_template(..., tokenize=False)</code>, then call <code>tok(text)</code>. The Llama 3 input now starts with two <code>&lt;|begin_of_text|&gt;</code> tokens. Why?</p>
+    <ol><li>The template already contains BOS and <code>tok()</code> adds another by default; pass <code>add_special_tokens=False</code></li><li>The chat template is corrupted</li><li>Llama 3 expects two BOS tokens for chat</li><li>The slow tokenizer was loaded instead of the fast one</li></ol>
+    <div class="explain">Templates write special tokens into the string themselves. Tokenizing that string with default settings prepends BOS again. It's quiet and common, and it shifts the model slightly off-distribution.</div></div>
+  <div class="q" data-answer="3"><p>Each call sends an 8,000-character English prompt and gets 500 output tokens back. Prices: $3 per million input tokens, $15 per million output tokens. At 10,000 calls a day, roughly what's the daily bill?</p>
+    <ol><li>$13.50</li><li>$60</li><li>$1,350</li><li>$135</li></ol>
+    <div class="explain">8,000 chars ÷ 4 ≈ 2,000 input tokens → $0.006. 500 output tokens × $15/M → $0.0075. Per call $0.0135, × 10,000 = $135. $60 is the input half alone; $13.50 is off by 10×.</div></div>
+  <div class="q" data-answer="1"><p>Why do LLMs often miscount the r's in "strawberry"?</p>
+    <ol><li>Transformers cannot represent numbers</li><li>The model receives a few multi-letter token IDs, not letters, so it has to recall each token's spelling indirectly</li><li>The training data mostly spells it with two r's</li><li>Sampling temperature is too high</li></ol>
+    <div class="explain">Something like <code>str|aw|berry</code> reaches the model as three integers. Nothing in those IDs spells out the characters. Asking it to spell the word letter by letter first makes each letter its own token, and the count then becomes easy.</div></div>
+  <div class="q" data-answer="2"><p>Prompt A ends with <code>"The capital of France is"</code>, prompt B with <code>"The capital of France is "</code> (trailing space). B gives noticeably worse completions. What's the most likely reason?</p>
+    <ol><li>Trailing whitespace is stripped, so B is truncated</li><li>The space is mapped to an unknown token</li><li>In training the space almost always came attached to the next word (<code>" Paris"</code>), so a lone space token followed by <code>"Paris"</code> is a rare, off-distribution pattern</li><li>The space triggers the end-of-text token</li></ol>
+    <div class="explain">GPT-style pre-tokenizers attach spaces to the front of words. A bare trailing space forces an unusual token boundary; the model would have preferred to produce <code>" Paris"</code> as one token. Token healing exists to undo exactly this.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, bars, widget, fmtNum, fmtSI, rng, palette, clamp, heat, diverge } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const TINTS = ["rgba(26,122,82,.17)", "rgba(47,93,138,.17)", "rgba(154,123,34,.22)", "rgba(122,63,110,.16)", "rgba(43,122,120,.18)", "rgba(176,67,46,.15)"];
+  const hash = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+  const tint = s => TINTS[hash(s) % TINTS.length];
+  const show = s => s.replace(/ /g, "␣").replace(/\n/g, "↵").replace(/\t/g, "⇥");
+  const cpLen = s => Array.from(s).length;
+  const visW = s => Array.from(s).reduce((a, ch) => a + (ch.codePointAt(0) >= 0x1100 ? 1.75 : 1), 0);
+  const utf8 = s => Array.from(new TextEncoder().encode(s));
+  // GPT-2's byte -> printable unicode table (bytes_to_unicode in the original encoder.py)
+  const B2U = (() => {
+    const bs = [];
+    for (let i = 33; i <= 126; i++) bs.push(i);
+    for (let i = 161; i <= 172; i++) bs.push(i);
+    for (let i = 174; i <= 255; i++) bs.push(i);
+    const cs = bs.slice(); let n = 0;
+    for (let b = 0; b < 256; b++) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n); n++; }
+    const m = {}; bs.forEach((b, i) => { m[b] = String.fromCharCode(cs[i]); }); return m;
+  })();
+  const gpt2Form = s => utf8(s).map(b => B2U[b]).join("");
+  const hex = b => b.toString(16).toUpperCase().padStart(2, "0");
+
+  /** Draw a row of token chips into an SVG. Returns the end position. */
+  function chips(s, x, y, toks, o = {}) {
+    const fs = o.fs || 12, cw = 7.3 * fs / 12, h = o.h || 21, gap = o.gap == null ? 3 : o.gap, maxW = o.maxW || 1e9;
+    let cx = x, cy = y;
+    toks.forEach((t, i) => {
+      const label = o.raw ? t : show(t);
+      const w = Math.max(visW(label), 1) * cw + 11;
+      if (cx + w > x + maxW && cx > x) { cx = x; cy += h + gap + 2; }
+      const fill = o.fill ? o.fill(t, i) : tint(t);
+      const stroke = o.stroke ? o.stroke(t, i) : "rgba(28,27,25,.2)";
+      s.appendChild(svg("rect", { x: cx, y: cy, width: w, height: h, rx: 4, fill, stroke, "stroke-width": o.sw ? o.sw(t, i) : 1 }));
+      s.appendChild(svg("text", { x: cx + w / 2, y: cy + h / 2 + fs * 0.36, "text-anchor": "middle", "font-size": fs, class: "mono", fill: palette.ink, text: label }));
+      cx += w + gap;
+    });
+    return { x: cx, y: cy + h };
+  }
+  const T = (s, x, y, text, o = {}) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, text }, o)));
+
+  /** Chip element for HTML token rows: spaces shown as faint ␣. */
+  function chipEl(t, cls, bg, title) {
+    const n = el("span", { class: "tk" + (cls ? " " + cls : ""), style: { background: bg }, title });
+    let buf = "";
+    const flush = () => { if (buf) { n.appendChild(document.createTextNode(buf)); buf = ""; } };
+    for (const ch of t) {
+      if (ch === " " || ch === "\n" || ch === "\t") { flush(); n.appendChild(el("span", { class: "sp", text: show(ch) })); }
+      else buf += ch;
+    }
+    flush();
+    return n;
+  }
+
+  /* ---------------------------------------------------------- BPE engine (shared by figure + widget) */
+  const PATS = {
+    gpt2: /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu,
+    cl100k: /'(?:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/giu,
+    ws: /\S+/gu
+  };
+  const pretok = (text, mode) => text.match(PATS[mode]) || [];
+  function applyMerge(sym, a, b, ab) {
+    const out = [];
+    for (let i = 0; i < sym.length; i++) {
+      if (i + 1 < sym.length && sym[i] === a && sym[i + 1] === b) { out.push(ab); i++; }
+      else out.push(sym[i]);
+    }
+    return out;
+  }
+  function BPE(text, mode) {
+    const occ = pretok(text, mode);
+    const words = new Map();
+    occ.forEach(w => { const e = words.get(w); if (e) e.f++; else words.set(w, { f: 1, sym: Array.from(w) }); });
+    const base = new Set(); occ.forEach(w => { for (const ch of w) base.add(ch); });
+    const merges = [];
+    function step() {
+      const counts = new Map();
+      for (const { f, sym } of words.values()) for (let i = 0; i + 1 < sym.length; i++) {
+        const k = sym[i] + "\u0000" + sym[i + 1];
+        counts.set(k, (counts.get(k) || 0) + f);
+      }
+      let best = null, bc = 0;
+      for (const [k, c] of counts) if (c > bc) { best = k; bc = c; }   // ties: first seen wins
+      if (!best) return null;
+      const [a, b] = best.split("\u0000"), ab = a + b;
+      for (const e of words.values()) e.sym = applyMerge(e.sym, a, b, ab);
+      const m = { a, b, ab, count: bc };
+      merges.push(m);
+      return m;
+    }
+    const tokens = () => occ.reduce((n, w) => n + words.get(w).sym.length, 0);
+    const chars = () => occ.reduce((n, w) => n + cpLen(w), 0);
+    const vocabSize = () => new Set([...base, ...merges.map(m => m.ab)]).size;
+    return { occ, words, base, merges, step, tokens, chars, vocabSize };
+  }
+  function encodeWith(merges, text, mode) {
+    return pretok(text, mode).map(w => { let sym = Array.from(w); merges.forEach(m => { sym = applyMerge(sym, m.a, m.b, m.ab); }); return sym; });
+  }
+  const TOY = "low low low low low lower lower newest newest newest newest newest newest widest widest widest";
+
+  /* ---------------------------------------------------------- fig: chars vs words vs subwords */
+  (function () {
+    const host = document.getElementById("fig-tradeoff");
+    const s = svg("svg", { viewBox: "0 0 880 320" }); host.appendChild(s);
+    const sentence = "tokenizers are unbelievably useful";
+    const cols = [
+      { t: "Characters", sub: "one token per character (or byte)", toks: Array.from(sentence), len: 34, vocab: "~100s (or 256 bytes)", vl: Math.log10(256), oov: "never", oovv: 0, c: [palette.brick, palette.green, palette.green] },
+      { t: "Words", sub: "one token per whitespace-separated word", toks: ["tokenizers", "are", "unbelievably", "useful"], len: 4, vocab: "millions, open-ended", vl: 6.4, oov: "often → [UNK]", oovv: 1, c: [palette.green, palette.brick, palette.brick] },
+      { t: "Subwords (BPE)", sub: "frequent strings whole, rare ones split", toks: ["token", "izers", " are", " unbeliev", "ably", " useful"], len: 6, vocab: "32K – 256K, chosen", vl: 5.1, oov: "never (bytes as fallback)", oovv: 0, c: [palette.green, palette.gold, palette.green] }
+    ];
+    cols.forEach((c, i) => {
+      const x0 = 18 + i * 292, W = 268;
+      s.appendChild(svg("rect", { x: x0 - 8, y: 6, width: W + 16, height: 306, rx: 10, fill: i === 2 ? "rgba(26,122,82,.05)" : "#fbfaf7", stroke: i === 2 ? "rgba(26,122,82,.4)" : palette.line }));
+      T(s, x0, 30, c.t, { "font-size": 15, "font-weight": 600 });
+      T(s, x0, 47, c.sub, { "font-size": 11, fill: palette.muted });
+      chips(s, x0, 60, c.toks, { maxW: W, fill: (t, j) => i === 0 ? (t === " " ? "#fff" : "#efede6") : TINTS[j % 2 ? 1 : 0] });
+      const meters = [
+        ["tokens for this sentence", c.len / 34, String(c.len), c.c[0]],
+        ["vocabulary size", c.vl / 7, c.vocab, c.c[1]],
+        ["unknown-word risk", Math.max(c.oovv, 0.02), c.oov, c.c[2]]
+      ];
+      meters.forEach(([lab, frac, val, col], k) => {
+        const y = 178 + k * 44;
+        T(s, x0, y, lab.toUpperCase(), { "font-size": 10, fill: palette.muted, class: "mono", "letter-spacing": ".06em" });
+        s.appendChild(svg("rect", { x: x0, y: y + 7, width: W, height: 9, rx: 4, fill: "#ecebe4" }));
+        s.appendChild(svg("rect", { x: x0, y: y + 7, width: Math.max(4, W * frac), height: 9, rx: 4, fill: col, opacity: 0.8 }));
+        T(s, x0, y + 31, val, { "font-size": 12, class: "mono", fill: col });
+      });
+    });
+  })();
+
+  /* ---------------------------------------------------------- fig: BPE merges, step by step */
+  (function () {
+    const host = document.getElementById("fig-bpe");
+    const steps = 4, rowH = 50, top = 40;
+    const s = svg("svg", { viewBox: `0 0 880 ${top + (steps + 1) * rowH + 8}` }); host.appendChild(s);
+    const st = BPE(TOY, "ws");
+    const hdr = [["step", 18], ["merge learned (pair count)", 62], ["corpus segmentation: word × frequency", 250], ["vocab", 800], ["tokens", 862]];
+    hdr.forEach(([t, x], i) => T(s, x, 22, t.toUpperCase(), { "font-size": 10, class: "mono", fill: palette.muted, "text-anchor": i >= 3 ? "end" : "start", "letter-spacing": ".06em" }));
+    s.appendChild(svg("line", { x1: 10, x2: 870, y1: 30, y2: 30, stroke: palette.line }));
+    for (let k = 0; k <= steps; k++) {
+      const m = k ? st.step() : null;
+      const y = top + k * rowH;
+      if (k) s.appendChild(svg("line", { x1: 10, x2: 870, y1: y - 6, y2: y - 6, stroke: palette.line, "stroke-dasharray": "2 3" }));
+      T(s, 26, y + 20, String(k), { "font-size": 13, class: "mono", "text-anchor": "middle", "font-weight": 600 });
+      T(s, 62, y + 20, m ? `${m.a} + ${m.b} → ${m.ab}  (${m.count})` : "start: characters", { "font-size": 12.5, class: "mono", fill: m ? palette.brick : palette.muted });
+      let x = 250;
+      for (const [w, e] of st.words) {
+        const end = chips(s, x, y + 5, e.sym, {
+          fill: t => cpLen(t) === 1 ? "#efede6" : tint(t),
+          stroke: t => m && t === m.ab ? palette.brick : "rgba(28,27,25,.2)",
+          sw: t => m && t === m.ab ? 1.8 : 1, gap: 2
+        });
+        T(s, end.x + 3, y + 20, "×" + e.f, { "font-size": 11, class: "mono", fill: palette.muted });
+        x = end.x + 30;
+      }
+      T(s, 800, y + 20, String(st.vocabSize()), { "font-size": 13, class: "mono", "text-anchor": "end" });
+      T(s, 862, y + 20, String(st.tokens()), { "font-size": 13, class: "mono", "text-anchor": "end", fill: k ? palette.green : palette.ink });
+    }
+  })();
+
+  /* ---------------------------------------------------------- widget: BPE trainer */
+  (function () {
+    const w = widget("w-bpe", { title: "Train a BPE tokenizer, one merge at a time", kicker: "Interactive", note: "Base symbols here are characters rather than bytes so the chips stay readable; real byte-level BPE starts from the 256 byte values described in the next section. Ties go to the pair seen first. Editing the corpus retrains from scratch. Choose the textbook preset and press <em>Merge once</em> four times to reproduce the figure above." });
+    const PRESETS = {
+      prose: { mode: "gpt2", text: "Tokenizers turn text into tokens. A tokenizer learns its merges from a training corpus: the most frequent pair of tokens becomes a new token, and then the counting starts again. Frequent words end up as single tokens, while rare words are split into smaller pieces the tokenizer has already seen. Retraining the tokenizer on a different corpus gives different merges, different tokens, and different token counts for the same text." },
+      toy: { mode: "ws", text: TOY },
+      code: { mode: "gpt2", text: "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n\ndef mul(a, b):\n    return a * b\n\ndef div(a, b):\n    return a / b\n" },
+      nums: { mode: "gpt2", text: "In 2021 we sold 1000 units, in 2022 we sold 1250 units, in 2023 we sold 1999 units and in 2024 we sold 12345 units. Revenue was 2021: 10000, 2022: 12500, 2023: 19990, 2024: 123450." }
+    };
+    const ta = el("textarea", { class: "in", rows: 5, spellcheck: "false" });
+    const presetSel = select(w.controls, { label: "Corpus preset", options: [{ value: "prose", label: "English paragraph" }, { value: "toy", label: "Textbook: low / lower / newest / widest" }, { value: "code", label: "Python code" }, { value: "nums", label: "Numbers" }], value: "prose", onChange: v => { ta.value = PRESETS[v].text; modeSel.value = PRESETS[v].mode; reset(); } });
+    const modeSel = select(w.controls, { label: "Pre-tokenizer", options: [{ value: "gpt2", label: "GPT-2 regex (space joins next word)" }, { value: "ws", label: "Split on spaces, drop them (textbook)" }], value: "gpt2", onChange: () => reset() });
+    const test = el("input", { type: "text", value: "lowest tokenizing retrained", spellcheck: "false" });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Encode unseen text" })), test]));
+    w.controls.appendChild(el("div", { class: "ctl", style: { gridColumn: "1 / -1" } }, [el("label", null, el("span", { text: "Training corpus (editable)" })), ta]));
+    const btns = el("div", { class: "btnrow", style: { gridColumn: "1 / -1", margin: "0" } });
+    btns.appendChild(el("button", { class: "btn primary", text: "Merge once", onclick: () => run(1) }));
+    btns.appendChild(el("button", { class: "btn", text: "Merge 10", onclick: () => run(10) }));
+    btns.appendChild(el("button", { class: "btn", text: "Reset", onclick: () => reset() }));
+    w.controls.appendChild(btns);
+
+    const set = stats(w.body, [
+      { key: "vocab", label: "Vocabulary size" }, { key: "merges", label: "Merges learned" },
+      { key: "tokens", label: "Corpus tokens" }, { key: "ratio", label: "Compression" }
+    ]);
+    const status = el("p", { class: "statusline" }); w.body.appendChild(status);
+    const grid = el("div", { class: "split" }); w.body.appendChild(grid);
+    const mPanel = el("div", { class: "panel" }, el("div", { class: "ph" }, [el("span", { text: "Merge list (rank order)" })]));
+    const mBox = el("div", { class: "mbox" }); mPanel.appendChild(mBox);
+    const cPanel = el("div", { class: "panel" });
+    const cHead = el("div", { class: "ph" }); cPanel.appendChild(cHead);
+    const cRow = el("div", { class: "tokrow mbox" }); cPanel.appendChild(cRow);
+    grid.appendChild(mPanel); grid.appendChild(cPanel);
+    const tPanel = el("div", { class: "panel", style: { marginTop: "12px" } }, el("div", { class: "ph" }, [el("span", { text: "Unseen text, encoded by replaying the merges in order" }), el("span", { text: "dashed = not in base vocabulary" })]));
+    const tRow = el("div", { class: "tokrow" }); tPanel.appendChild(tRow);
+    w.body.appendChild(tPanel);
+
+    let st, last = null, exhausted = false;
+    function reset() { st = BPE(ta.value, modeSel.value); last = null; exhausted = false; render(); }
+    function run(n) {
+      for (let i = 0; i < n; i++) { const m = st.step(); if (!m) { exhausted = true; break; } last = m; }
+      render();
+    }
+    const bgFor = t => cpLen(t) === 1 ? "#efede6" : tint(t);
+    function render() {
+      const chars = st.chars(), toks = st.tokens();
+      set("vocab", String(st.vocabSize()), null, `${st.base.size} base symbols + ${st.merges.length} merges`);
+      set("merges", String(st.merges.length), null, last ? `last pair seen ${last.count}×` : "none yet");
+      set("tokens", toks.toLocaleString("en-US"), toks < chars ? "good" : null, `from ${chars.toLocaleString("en-US")} characters`);
+      set("ratio", (chars / Math.max(toks, 1)).toFixed(2) + " chars/tok", null, "higher = shorter sequences");
+      status.textContent = exhausted ? "No adjacent pairs left: every pre-token is now a single token. More merges can't help; the vocabulary has memorized this corpus." :
+        last ? `Last merge: "${show(last.a)}" + "${show(last.b)}" → "${show(last.ab)}", seen ${last.count} times.` : "Press Merge once. The most frequent adjacent pair across the corpus becomes a new token.";
+      // merges table
+      mBox.innerHTML = "";
+      if (!st.merges.length) mBox.appendChild(el("p", { class: "small muted", style: { margin: "4px 0" }, text: "Empty. The tokenizer is just the base symbols." }));
+      else {
+        const tb = el("tbody");
+        st.merges.forEach((m, i) => tb.appendChild(el("tr", null, [
+          el("td", { class: "num", text: String(i + 1) }),
+          el("td", { class: "mono", text: `${show(m.a)} + ${show(m.b)}` }),
+          el("td", null, chipEl(m.ab, m === last ? "new" : "", bgFor(m.ab))),
+          el("td", { class: "num", text: String(m.count) })
+        ])));
+        mBox.appendChild(el("table", { class: "t mtab" }, [el("thead", null, el("tr", null, ["#", "pair", "new token", "count"].map((h, i) => el("th", { class: i === 0 || i === 3 ? "num" : "", text: h })))), tb]));
+        mBox.scrollTop = mBox.scrollHeight;
+      }
+      // corpus chips
+      const CAP = 700;
+      cHead.innerHTML = "";
+      cHead.appendChild(el("span", { text: "Corpus, re-tokenized" }));
+      cHead.appendChild(el("span", { text: toks > CAP ? `first ${CAP} of ${toks} tokens` : `${toks} tokens` }));
+      cRow.innerHTML = "";
+      let shown = 0;
+      for (const w0 of st.occ) {
+        if (shown >= CAP) break;
+        const sym = st.words.get(w0).sym;
+        sym.forEach(t => { if (shown++ < CAP) cRow.appendChild(chipEl(t, last && t === last.ab ? "new" : "", bgFor(t))); });
+        if (modeSel.value === "ws") cRow.appendChild(el("span", { class: "wgap" }));
+      }
+      renderTest();
+    }
+    function renderTest() {
+      tRow.innerHTML = "";
+      let n = 0;
+      encodeWith(st.merges, test.value, modeSel.value).forEach(sym => {
+        sym.forEach(t => {
+          n++;
+          const unk = cpLen(t) === 1 && !st.base.has(t) && t.trim() !== "";
+          tRow.appendChild(chipEl(t, unk ? "unk" : "", unk ? "#fff" : bgFor(t), unk ? "never seen in training: [UNK] for a character vocabulary; bytes for byte-level BPE" : null));
+        });
+        if (modeSel.value === "ws") tRow.appendChild(el("span", { class: "wgap" }));
+      });
+      tRow.appendChild(el("span", { class: "small muted", style: { marginLeft: "8px", fontFamily: "var(--sans)" }, text: `${n} tokens for ${cpLen(test.value)} characters` }));
+    }
+    let timer = null;
+    ta.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(reset, 250); });
+    test.addEventListener("input", () => renderTest());
+    ta.value = PRESETS.prose.text;
+    presetSel.value = "prose";
+    reset();
+  })();
+
+  /* ---------------------------------------------------------- fig: UTF-8 bytes */
+  (function () {
+    const host = document.getElementById("fig-bytes");
+    const text = "café 猫";
+    const chars = Array.from(text);
+    const nB = utf8(text).length, cw = 58, x0 = 150, W = x0 + nB * cw + 20;
+    const s = svg("svg", { viewBox: `0 0 ${W} 250` }); host.appendChild(s);
+    const rows = [["characters", 34], ["UTF-8 bytes (hex)", 88], ["base token id", 134], ["GPT-2 file form", 180]];
+    rows.forEach(([l, y]) => T(s, x0 - 14, y + 5, l, { "text-anchor": "end", "font-size": 11.5, fill: palette.muted, class: "mono" }));
+    let bi = 0;
+    chars.forEach((ch, ci) => {
+      const bs = utf8(ch), x = x0 + bi * cw, wd = bs.length * cw - 6;
+      const multi = bs.length > 1;
+      s.appendChild(svg("rect", { x: x + 3, y: 16, width: wd, height: 34, rx: 6, fill: multi ? "rgba(154,123,34,.16)" : "#fbfaf7", stroke: multi ? "rgba(154,123,34,.6)" : palette.line }));
+      T(s, x + 3 + wd / 2, 39, ch === " " ? "␣" : ch, { "text-anchor": "middle", "font-size": 17, class: ch === " " ? "mono" : "", fill: ch === " " ? palette.faint : palette.ink });
+      bs.forEach((b, k) => {
+        const bx = x + k * cw + 3;
+        s.appendChild(svg("path", { d: `M${x + 3 + wd / 2},50 L${bx + (cw - 6) / 2},70`, stroke: palette.faint, "stroke-width": 1, fill: "none" }));
+        s.appendChild(svg("rect", { x: bx, y: 72, width: cw - 6, height: 30, rx: 5, fill: "rgba(47,93,138,.12)", stroke: "rgba(47,93,138,.45)" }));
+        T(s, bx + (cw - 6) / 2, 92, hex(b), { "text-anchor": "middle", "font-size": 13, class: "mono", fill: palette.blue });
+        T(s, bx + (cw - 6) / 2, 139, String(b), { "text-anchor": "middle", "font-size": 12.5, class: "mono" });
+        s.appendChild(svg("rect", { x: bx, y: 164, width: cw - 6, height: 30, rx: 5, fill: "#efede6", stroke: palette.line }));
+        T(s, bx + (cw - 6) / 2, 184, B2U[b], { "text-anchor": "middle", "font-size": 14, class: "mono" });
+      });
+      bi += bs.length;
+    });
+    T(s, x0, 222, `${chars.length} characters → ${nB} bytes → ${nB} base tokens before any merges.`, { "font-size": 12.5 });
+    T(s, x0, 240, "All 256 byte values are in the vocabulary, so no input is ever unknown.", { "font-size": 12.5, fill: palette.green });
+  })();
+
+  /* ---------------------------------------------------------- widget: pre-tokenizer & bytes */
+  (function () {
+    const w = widget("w-pretok", { title: "Pre-tokenizer and bytes", kicker: "Interactive", note: "These are JavaScript ports of the GPT-2 and cl100k patterns (cl100k's possessive quantifiers dropped, which almost never changes the result). This shows only the pre-tokenization chunks that BPE merges within, not the final tokens. Hover a chip to see its bytes." });
+    const ta = el("textarea", { class: "in", rows: 3, spellcheck: "false" });
+    ta.value = "I'm testing   spaces!\n    return x+1  # 12345 tokens in 2024, café 猫";
+    let mode = "gpt2", view = "text";
+    w.controls.appendChild(el("div", { class: "ctl", style: { gridColumn: "1 / -1" } }, [el("label", null, el("span", { text: "Text" })), ta]));
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Pattern" })));
+    seg(c1, { options: [{ value: "gpt2", label: "GPT-2" }, { value: "cl100k", label: "GPT-4 / Llama 3" }], value: mode, onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Show chunks as" })));
+    seg(c2, { options: [{ value: "text", label: "text" }, { value: "g2", label: "GPT-2 byte form" }, { value: "hex", label: "hex bytes" }], value: view, onChange: v => { view = v; draw(); } });
+    w.controls.appendChild(c2);
+    const panel = el("div", { class: "panel" });
+    const row = el("div", { class: "tokrow" }); panel.appendChild(row);
+    w.body.appendChild(panel);
+    const set = stats(w.body, [{ key: "chars", label: "Characters" }, { key: "bytes", label: "UTF-8 bytes" }, { key: "chunks", label: "Pre-tokens" }, { key: "worst", label: "Byte tokens if no merges" }]);
+    function draw() {
+      const ch = pretok(ta.value, mode);
+      row.innerHTML = "";
+      ch.forEach(c => {
+        const bs = utf8(c);
+        const label = view === "text" ? c : view === "g2" ? gpt2Form(c) : bs.map(hex).join(" ");
+        const n = view === "text" ? chipEl(c, "", tint(c), bs.map(hex).join(" ")) : el("span", { class: "tk", style: { background: tint(c) }, title: c.replace(/\n/g, "\\n"), text: label });
+        row.appendChild(n);
+      });
+      const nb = utf8(ta.value).length, nc = cpLen(ta.value);
+      set("chars", String(nc), null, "Unicode code points");
+      set("bytes", String(nb), nb > nc ? "warn" : null, nb > nc ? `${(nb / Math.max(nc, 1)).toFixed(2)} bytes per character` : "all ASCII");
+      set("chunks", String(ch.length), null, "merges never cross these");
+      set("worst", String(nb), null, "upper bound on tokens");
+    }
+    ta.addEventListener("input", draw);
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: vocab size vs params */
+  (function () {
+    const w = widget("w-vocab", { title: "What the vocabulary costs in parameters", kicker: "Calculator", note: "Reference models use their published configs. For \"your config\", the transformer body is taken from the selected model and scaled by \\((d/d_0)^2\\) at fixed depth, since most non-embedding weights are \\(d\\times d\\)-shaped. GPT-2's small learned position table is counted in the body." });
+    const MODELS = [
+      { v: "gpt2", l: "GPT-2 small", V: 50257, d: 768, tied: true, N: 124.4e6 },
+      { v: "qwen05", l: "Qwen2.5-0.5B", V: 151936, d: 896, tied: true, N: 494e6 },
+      { v: "l1b", l: "Llama-3.2-1B", V: 128256, d: 2048, tied: true, N: 1.236e9 },
+      { v: "g2b", l: "Gemma-2B", V: 256000, d: 2048, tied: true, N: 2.506e9 },
+      { v: "l3b", l: "Llama-3.2-3B", V: 128256, d: 3072, tied: true, N: 3.213e9 },
+      { v: "l27", l: "Llama-2-7B", V: 32000, d: 4096, tied: false, N: 6.738e9 },
+      { v: "l8b", l: "Llama-3-8B", V: 128256, d: 4096, tied: false, N: 8.030e9 },
+      { v: "l70", l: "Llama-3-70B", V: 128256, d: 8192, tied: false, N: 70.554e9 }
+    ];
+    const VS = [8000, 32000, 50257, 65536, 100277, 128256, 151936, 200019, 256000];
+    const VNAME = { 32000: " (Llama 2)", 50257: " (GPT-2)", 100277: " (cl100k)", 128256: " (Llama 3)", 151936: " (Qwen2.5)", 200019: " (o200k)", 256000: " (Gemma)" };
+    const DS = [512, 768, 896, 1024, 2048, 3072, 4096, 5120, 8192, 12288, 16384];
+    const embOf = (V, d, tied) => V * d * (tied ? 1 : 2);
+    let mdl = MODELS[6];
+    select(w.controls, { label: "Start from model", options: MODELS.map(m => ({ value: m.v, label: `${m.l} · V=${m.V.toLocaleString("en-US")} · d=${m.d}` })), value: mdl.v, onChange: v => {
+      mdl = MODELS.find(m => m.v === v); vs.value = VS.indexOf(mdl.V); ds.value = DS.indexOf(mdl.d); tieSel.value = mdl.tied ? "tied" : "untied"; draw();
+    } });
+    const vs = slider(w.controls, { label: "Vocabulary V", min: 0, max: VS.length - 1, step: 1, value: VS.indexOf(mdl.V), fmt: i => VS[i].toLocaleString("en-US") + (VNAME[VS[i]] || ""), onInput: draw });
+    const ds = slider(w.controls, { label: "Model width d", min: 0, max: DS.length - 1, step: 1, value: DS.indexOf(mdl.d), fmt: i => DS[i].toLocaleString("en-US"), onInput: draw });
+    const tieSel = select(w.controls, { label: "LM head", options: [{ value: "untied", label: "separate matrix (untied)" }, { value: "tied", label: "tied to embedding" }], value: mdl.tied ? "tied" : "untied", onChange: draw });
+    const set = stats(w.body, [{ key: "e", label: "Embedding E = V·d" }, { key: "u", label: "LM head" }, { key: "share", label: "Share of all params" }, { key: "mem", label: "In bf16" }, { key: "fl", label: "Logit FLOPs / token" }]);
+    const wrap = el("div", { class: "canvas-wrap", style: { marginTop: "12px" } }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 270, horizontal: true, labelWidth: 120 });
+    function draw() {
+      const V = VS[vs.value], d = DS[ds.value], tied = tieSel.value === "tied";
+      const body = (mdl.N - embOf(mdl.V, mdl.d, mdl.tied)) * (d / mdl.d) ** 2;
+      const emb = embOf(V, d, tied), total = body + emb, share = emb / total;
+      set("e", fmtSI(V * d, 1), null, `${V.toLocaleString("en-US")} × ${d.toLocaleString("en-US")}`);
+      set("u", tied ? "0 (shared)" : fmtSI(V * d, 1), tied ? "good" : null, tied ? "W_U = Eᵀ" : "another V × d");
+      set("share", (100 * share).toFixed(1) + "%", share > 0.2 ? "warn" : null, `of ≈ ${fmtSI(total, 2)} total`);
+      set("mem", (emb * 2 / 1e9).toFixed(2) + " GB", null, "embedding + head weights");
+      set("fl", fmtSI(2 * d * V, 2).replace("B", "G") + "FLOP", null, "2·d·V per generated token");
+      const labels = ["your config", ...MODELS.map(m => m.l)];
+      const vals = [share, ...MODELS.map(m => embOf(m.V, m.d, m.tied) / m.N)].map(x => 100 * x);
+      B.draw(labels, vals, { max: Math.max(35, ...vals), colors: vals.map((_, i) => i === 0 ? palette.brick : MODELS[i - 1] === mdl ? palette.gold : palette.green), fmt: v => v.toFixed(1) + "%" });
+    }
+    draw();
+    w.body.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 0" }, html: "Bars: embedding + LM head as a share of total parameters. <b style='color:#b0432e'>Brick</b> is your config, <b style='color:#9a7b22'>gold</b> the model you started from. Small models spend a large fraction of their budget on the vocabulary, which is why they tie weights." }));
+  })();
+
+  /* ---------------------------------------------------------- fig: tokenizer quirks */
+  (function () {
+    const host = document.getElementById("fig-quirks");
+    const rowH = 46, top = 14;
+    const R = [
+      { k: "Numbers", s: "GPT-4 / Llama 3", groups: [["202", "4"], ["123", "45"], ["100", "000", "0"]], note: "chunks of ≤3 digits, left to right" },
+      { k: "Numbers", s: "Llama 1 / 2", groups: [["2", "0", "2", "4"], ["1", "2", "3", "4", "5"]], note: "every digit its own token" },
+      { k: "Space & case", s: "four separate IDs", groups: [["cat"], [" cat"], [" Cat"], ["CAT"]], note: "the model must learn they're related" },
+      { k: "Letters", s: "\"strawberry\"", groups: [["str", "aw", "berry"]], note: "3 IDs; the three r's are invisible" },
+      { k: "Scripts", s: "UTF-8 bytes", groups: [["hello · 5 B"], ["你好 · 6 B"], ["नमस्ते · 18 B"]], note: "more bytes per character, fewer merges", raw: true },
+      { k: "Code indent", s: "GPT-2 pre-tokens", groups: [["   ", " return", " x"]], note: "a space run costs whatever the vocab allows" },
+      { k: "Glitch token", s: "GPT-2 / GPT-3", groups: [[" SolidGoldMagikarp"]], note: "one token, almost never seen in training", glitch: true }
+    ];
+    const s = svg("svg", { viewBox: `0 0 880 ${top + R.length * rowH + 6}` }); host.appendChild(s);
+    R.forEach((r, i) => {
+      const y = top + i * rowH;
+      if (i) s.appendChild(svg("line", { x1: 10, x2: 870, y1: y - 6, y2: y - 6, stroke: palette.line, "stroke-dasharray": "2 3" }));
+      T(s, 14, y + 13, r.k, { "font-size": 13, "font-weight": 600 });
+      T(s, 14, y + 29, r.s, { "font-size": 11, fill: palette.muted });
+      let x = 170;
+      r.groups.forEach(g => {
+        const end = chips(s, x, y + 4, g, { raw: r.raw, gap: 2, fill: (t, j) => r.glitch ? "rgba(176,67,46,.16)" : TINTS[j % 2 ? 1 : 0], stroke: () => r.glitch ? palette.brick : "rgba(28,27,25,.2)" });
+        x = end.x + 18;
+      });
+      T(s, Math.max(x + 4, 560), y + 20, r.note, { "font-size": 11.5, fill: r.glitch ? palette.brick : palette.ink });
+    });
+  })();
+
+  /* ---------------------------------------------------------- fig: embedding lookup */
+  (function () {
+    const host = document.getElementById("fig-lookup");
+    const s = svg("svg", { viewBox: "0 0 780 290" }); host.appendChild(s);
+    const V = 8, d = 5, x = 2;
+    const toks = ["<pad>", "the", "␣cat", "␣sat", "␣on", "␣mat", ".", "␣dog"];
+    const R = rng(5);
+    const E = Array.from({ length: V }, () => Array.from({ length: d }, () => +(R.normal() * 0.5).toFixed(2)));
+    // one-hot
+    const oc = 24, ox = 20, oy = 120;
+    T(s, ox, oy - 34, "onehot(2)  ·  1 × V", { "font-size": 12, class: "mono", fill: palette.muted });
+    for (let j = 0; j < V; j++) {
+      s.appendChild(svg("rect", { x: ox + j * oc, y: oy, width: oc - 2, height: oc - 2, rx: 3, fill: j === x ? "rgba(26,122,82,.75)" : "#efede6", stroke: palette.line }));
+      T(s, ox + j * oc + (oc - 2) / 2, oy + 16, j === x ? "1" : "0", { "text-anchor": "middle", "font-size": 11, class: "mono", fill: j === x ? "#fff" : palette.muted });
+      T(s, ox + j * oc + (oc - 2) / 2, oy - 8, String(j), { "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.faint });
+    }
+    T(s, ox + V * oc + 14, oy + 17, "×", { "font-size": 22, fill: palette.muted });
+    // E matrix
+    const ex = 300, ey = 30, cw = 44, ch = 26;
+    T(s, ex, ey - 12, "E  ·  V × d  (one row per token)", { "font-size": 12, class: "mono", fill: palette.muted });
+    E.forEach((row, i) => {
+      T(s, ex - 8, ey + i * ch + 17, `${i} ${toks[i]}`, { "text-anchor": "end", "font-size": 11, class: "mono", fill: i === x ? palette.green : palette.muted, "font-weight": i === x ? 700 : 400 });
+      row.forEach((v, j) => {
+        s.appendChild(svg("rect", { x: ex + j * cw, y: ey + i * ch, width: cw - 2, height: ch - 2, rx: 3, fill: i === x ? "rgba(26,122,82,.22)" : diverge(v / 1.4), stroke: i === x ? palette.green : "none", "stroke-width": 1.5 }));
+        T(s, ex + j * cw + (cw - 2) / 2, ey + i * ch + 16, v.toFixed(2), { "text-anchor": "middle", "font-size": 10.5, class: "mono" });
+      });
+    });
+    T(s, ex + d * cw + 14, oy + 17, "=", { "font-size": 22, fill: palette.muted });
+    // result
+    const rx = ex + d * cw + 44;
+    T(s, rx, oy - 34, "e = E[2]  ·  1 × d", { "font-size": 12, class: "mono", fill: palette.muted });
+    E[x].forEach((v, j) => {
+      s.appendChild(svg("rect", { x: rx + j * cw, y: oy, width: cw - 2, height: ch - 2, rx: 3, fill: "rgba(26,122,82,.22)", stroke: palette.green, "stroke-width": 1.5 }));
+      T(s, rx + j * cw + (cw - 2) / 2, oy + 16, v.toFixed(2), { "text-anchor": "middle", "font-size": 10.5, class: "mono" });
+    });
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arrLookup", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.green }))); s.appendChild(defs);
+    s.appendChild(svg("path", { d: `M${ex + d * cw},${ey + x * ch + 12} C ${ex + d * cw + 40},${ey + x * ch + 12} ${rx - 30},${oy - 10} ${rx - 4},${oy + 4}`, fill: "none", stroke: palette.green, "stroke-width": 1.4, "stroke-dasharray": "4 3", "marker-end": "url(#arrLookup)" }));
+    T(s, 20, 268, "No multiplication happens in practice: nn.Embedding just reads row x. The matrix form exists for the math (and the gradient: only row x gets one).", { "font-size": 12, fill: palette.ink });
+  })();
+
+  /* ---------------------------------------------------------- widget: toy 2D embedding space */
+  (function () {
+    const PTS = [
+      ["man", 2.2, 0.6], ["woman", 1.7, 1.5], ["king", 3.3, 1.1], ["queen", 2.85, 1.95], ["boy", 1.6, 0.1], ["girl", 1.15, 0.95],
+      ["cat", -2.2, 1.2], ["kitten", -2.8, 0.7], ["dog", -1.0, 2.4], ["puppy", -1.6, 1.9],
+      ["apple", -2.0, -1.5], ["banana", -2.6, -0.9], ["orange", -1.5, -2.1], ["bread", -0.9, -2.5],
+      ["France", 1.2, -1.8], ["Paris", 2.2, -1.4], ["Japan", 0.2, -2.9], ["Tokyo", 1.2, -2.5], ["Italy", 2.3, -2.0], ["Rome", 3.3, -1.6]
+    ];
+    const vec = Object.fromEntries(PTS.map(([n, x, y]) => [n, [x, y]]));
+    const names = PTS.map(p => p[0]);
+    const cos = (u, v) => (u[0] * v[0] + u[1] * v[1]) / (Math.hypot(...u) * Math.hypot(...v));
+    const dist = (u, v) => Math.hypot(u[0] - v[0], u[1] - v[1]);
+    const w = widget("w-space", { title: "A toy embedding space", kicker: "Interactive", note: "Hand-placed 2-D vectors so the arithmetic is visible; real embeddings have thousands of dimensions and nothing is this tidy. Click any word to make it the similarity query. The last preset has no correct answer in the vocabulary (it should be <em>prince</em>), so it returns the nearest wrong word with apparent confidence." });
+    let q = "king", metric = "cos", excl = "yes";
+    const opts = names.map(n => ({ value: n, label: n }));
+    const qSel = select(w.controls, { label: "Similarity to", options: opts, value: q, onChange: v => { q = v; draw(); } });
+    const aSel = select(w.controls, { label: "Analogy: A", options: opts, value: "king", onChange: () => draw() });
+    const bSel = select(w.controls, { label: "minus B", options: opts, value: "man", onChange: () => draw() });
+    const cSel = select(w.controls, { label: "plus C", options: opts, value: "woman", onChange: () => draw() });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Metric" })));
+    seg(c1, { options: [{ value: "cos", label: "cosine" }, { value: "euc", label: "euclidean" }], value: metric, onChange: v => { metric = v; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Exclude A, B, C from answers" })));
+    seg(c2, { options: [{ value: "yes", label: "yes (standard)" }, { value: "no", label: "no" }], value: excl, onChange: v => { excl = v; draw(); } });
+    w.controls.appendChild(c2);
+    const pres = el("div", { class: "btnrow", style: { gridColumn: "1 / -1", margin: "0" } });
+    [["king", "man", "woman"], ["Paris", "France", "Japan"], ["puppy", "dog", "cat"], ["Rome", "Italy", "France"], ["queen", "woman", "boy"]].forEach(([a, b, c]) =>
+      pres.appendChild(el("button", { class: "btn", text: `${a} − ${b} + ${c}`, onclick: () => { aSel.value = a; bSel.value = b; cSel.value = c; draw(); } })));
+    w.controls.appendChild(pres);
+    const grid = el("div", { class: "split r" }); w.body.appendChild(grid);
+    const wrap = el("div", { class: "canvas-wrap" }); grid.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 440" }); wrap.appendChild(s);
+    const side = el("div", { class: "panel" }); grid.appendChild(side);
+    const sideHead = el("div", { class: "ph" }); side.appendChild(sideHead);
+    const bw = el("div"); side.appendChild(bw);
+    const B = bars(bw, { width: 300, height: 260, horizontal: true, labelWidth: 70 });
+    const set = stats(w.body, [{ key: "ans", label: "A − B + C lands nearest" }, { key: "sc", label: "Its score" }, { key: "second", label: "Runner-up" }, { key: "nn", label: "Query's nearest neighbour" }]);
+    const X0 = -3.4, X1 = 3.9, Y0 = -3.3, Y1 = 2.9;
+    const sx = x => 30 + (x - X0) / (X1 - X0) * 700, sy = y => 20 + (Y1 - y) / (Y1 - Y0) * 400;
+    const score = (u, v) => metric === "cos" ? cos(u, v) : -dist(u, v);
+    function draw() {
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arrSpace", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.plum }))); s.appendChild(defs);
+      s.appendChild(svg("line", { x1: sx(X0), x2: sx(X1), y1: sy(0), y2: sy(0), stroke: palette.line }));
+      s.appendChild(svg("line", { x1: sx(0), x2: sx(0), y1: sy(Y0), y2: sy(Y1), stroke: palette.line }));
+      const qv = vec[q];
+      if (metric === "cos") s.appendChild(svg("line", { x1: sx(0), y1: sy(0), x2: sx(qv[0]), y2: sy(qv[1]), stroke: palette.ink, "stroke-width": 1, opacity: 0.45 }));
+      const maxD = Math.max(...names.map(n => dist(vec[n], qv)));
+      const A = aSel.value, Bw = bSel.value, Cw = cSel.value;
+      const r = [vec[A][0] - vec[Bw][0] + vec[Cw][0], vec[A][1] - vec[Bw][1] + vec[Cw][1]];
+      const cands = names.filter(n => excl === "no" || (n !== A && n !== Bw && n !== Cw)).map(n => [n, score(vec[n], r)]).sort((a, b) => b[1] - a[1]);
+      const ans = cands[0][0];
+      // analogy arrows
+      const arrow = (p, q2, dash) => s.appendChild(svg("line", { x1: sx(p[0]), y1: sy(p[1]), x2: sx(q2[0]), y2: sy(q2[1]), stroke: palette.plum, "stroke-width": 1.6, "stroke-dasharray": dash || null, "marker-end": "url(#arrSpace)" }));
+      arrow(vec[Bw], vec[A], "5 4");
+      arrow(vec[Cw], r);
+      // points
+      PTS.forEach(([n, x, y]) => {
+        const sc = metric === "cos" ? cos(vec[n], qv) : 1 - dist(vec[n], qv) / maxD;
+        const fill = n === q ? palette.ink : metric === "cos" ? diverge(sc) : heat(sc, "green");
+        const onclick = () => { q = n; qSel.value = n; draw(); };
+        if (n === ans) s.appendChild(svg("circle", { cx: sx(x), cy: sy(y), r: 12, fill: "none", stroke: palette.green, "stroke-width": 2 }));
+        s.appendChild(svg("circle", { cx: sx(x), cy: sy(y), r: n === q ? 7.5 : 6, fill, stroke: n === q ? palette.ink : "rgba(28,27,25,.35)", "stroke-width": 1, style: "cursor:pointer", onclick }));
+        s.appendChild(svg("text", { x: sx(x) + 9, y: sy(y) - 8, "font-size": 12.5, fill: [A, Bw, Cw].includes(n) ? palette.plum : palette.ink, "font-weight": n === q || n === ans ? 700 : 400, style: "cursor:pointer", onclick, text: n }));
+      });
+      s.appendChild(svg("path", { d: `M${sx(r[0])},${sy(r[1]) - 7} l7,7 l-7,7 l-7,-7 z`, fill: "#fff", stroke: palette.plum, "stroke-width": 1.8 }));
+      s.appendChild(svg("text", { x: sx(r[0]) - 10, y: sy(r[1]) + 22, "text-anchor": "end", "font-size": 11.5, class: "mono", fill: palette.plum, text: `${A} − ${Bw} + ${Cw}` }));
+      s.appendChild(svg("text", { x: 34, y: 432, "font-size": 11, fill: palette.muted, text: metric === "cos" ? "Colour = cosine to the query (green similar, brick opposite). Line from origin: cosine only sees direction." : "Colour = closeness to the query in straight-line distance." }));
+      // side ranking for the query
+      const rank = names.filter(n => n !== q).map(n => [n, metric === "cos" ? cos(vec[n], qv) : dist(vec[n], qv)]).sort((a, b) => metric === "cos" ? b[1] - a[1] : a[1] - b[1]).slice(0, 8);
+      sideHead.innerHTML = "";
+      sideHead.appendChild(el("span", { text: `Nearest to "${q}"` }));
+      sideHead.appendChild(el("span", { text: metric === "cos" ? "cosine" : "distance" }));
+      B.draw(rank.map(x => x[0]), rank.map(x => metric === "cos" ? Math.max(x[1], 0.001) : x[1]), { max: metric === "cos" ? 1 : Math.max(...rank.map(x => x[1])), colors: rank.map(() => palette.green), fmt: v => v.toFixed(3) });
+      const fmtS = v => metric === "cos" ? v.toFixed(3) : (-v).toFixed(2) + " away";
+      set("ans", ans, [A, Bw, Cw].includes(ans) ? "bad" : "good", [A, Bw, Cw].includes(ans) ? "an input word won" : `for ${A} − ${Bw} + ${Cw}`);
+      set("sc", fmtS(cands[0][1]), null, metric === "cos" ? "cosine with the query point" : "euclidean distance");
+      set("second", cands[1][0], null, fmtS(cands[1][1]));
+      set("nn", rank[0][0], null, metric === "cos" ? `cos = ${rank[0][1].toFixed(3)}` : `${rank[0][1].toFixed(2)} away`);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: LM head */
+  (function () {
+    const host = document.getElementById("fig-lmhead");
+    const s = svg("svg", { viewBox: "0 0 800 300" }); host.appendChild(s);
+    const toks = ["␣mat", "␣floor", "␣sofa", "␣rug", "␣cat", "␣dog", "␣the", "."];
+    const z = [3.1, 2.2, 1.9, 1.4, 0.3, 0.1, -0.8, -1.2];
+    const p = C.softmax(z);
+    const R = rng(3);
+    const d = 6, hx = 24, hy = 60, c = 26;
+    T(s, hx - 6, hy - 22, "h  (1 × d)", { "font-size": 12, class: "mono", fill: palette.muted });
+    for (let i = 0; i < d; i++) s.appendChild(svg("rect", { x: hx, y: hy + i * c, width: c - 2, height: c - 2, rx: 3, fill: diverge(R.normal() * 0.6) }));
+    T(s, hx + 40, hy + 3 * c + 8, "×", { "font-size": 22, fill: palette.muted });
+    const wx = 90;
+    T(s, wx, hy - 22, "W_U  (d × V)", { "font-size": 12, class: "mono", fill: palette.muted });
+    for (let i = 0; i < d; i++) for (let j = 0; j < toks.length; j++) s.appendChild(svg("rect", { x: wx + j * 22, y: hy + i * c, width: 20, height: c - 2, rx: 2, fill: diverge(R.normal() * 0.5) }));
+    T(s, wx + toks.length * 22 / 2, hy + d * c + 18, "column j = output vector of token j", { "font-size": 10.5, fill: palette.muted, "text-anchor": "middle" });
+    // tied note
+    s.appendChild(svg("rect", { x: wx - 4, y: hy + d * c + 30, width: toks.length * 22 + 8, height: 44, rx: 8, fill: "rgba(47,93,138,.07)", stroke: "rgba(47,93,138,.45)", "stroke-dasharray": "4 3" }));
+    T(s, wx + toks.length * 22 / 2, hy + d * c + 49, "tied: W_U = Eᵀ", { "font-size": 12, class: "mono", fill: palette.blue, "text-anchor": "middle" });
+    T(s, wx + toks.length * 22 / 2, hy + d * c + 65, "same numbers, no new params", { "font-size": 10.5, fill: palette.blue, "text-anchor": "middle" });
+    const lx = 300, rowH = 26, by = hy - 4;
+    T(s, lx + 70, hy - 22, "=  logits z", { "font-size": 12, class: "mono", fill: palette.muted });
+    T(s, 600, hy - 22, "softmax → p(next token)", { "font-size": 12, class: "mono", fill: palette.muted });
+    const zx0 = lx + 130, zs = 26;
+    s.appendChild(svg("line", { x1: zx0, x2: zx0, y1: by, y2: by + toks.length * rowH, stroke: palette.ink }));
+    toks.forEach((t, i) => {
+      const y = by + i * rowH;
+      T(s, lx + 60, y + 17, t, { "font-size": 12, class: "mono", "text-anchor": "end" });
+      const wd = z[i] * zs;
+      s.appendChild(svg("rect", { x: wd >= 0 ? zx0 : zx0 + wd, y: y + 5, width: Math.abs(wd), height: rowH - 10, rx: 2, fill: wd >= 0 ? palette.blue : palette.brick, opacity: 0.75 }));
+      T(s, wd >= 0 ? zx0 + wd + 5 : zx0 + 5, y + 17, z[i].toFixed(1), { "font-size": 10.5, class: "mono", fill: palette.muted });
+      const pw = p[i] * 300;
+      s.appendChild(svg("rect", { x: 600, y: y + 5, width: Math.max(pw, 1), height: rowH - 10, rx: 2, fill: palette.green, opacity: 0.8 }));
+      T(s, 606 + pw, y + 17, (100 * p[i]).toFixed(1) + "%", { "font-size": 10.5, class: "mono", fill: palette.muted });
+    });
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arrHead", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.muted }))); s.appendChild(defs);
+    s.appendChild(svg("line", { x1: 548, x2: 590, y1: by + 4 * rowH, y2: by + 4 * rowH, stroke: palette.muted, "stroke-width": 1.4, "marker-end": "url(#arrHead)" }));
+    T(s, 300, 290, "Toy V = 8. Real models score all 128,256 entries every step; that is the 2·d·V FLOPs from the vocabulary section.", { "font-size": 11.5, fill: palette.ink });
+  })();
+
+  /* ---------------------------------------------------------- widget: token cost estimator */
+  (function () {
+    const w = widget("w-cost", { title: "Estimate tokens and cost", kicker: "Approximate", note: "Token counts here come from characters ÷ (chars per token), a rule of thumb. English prose is about 4; code, JSON and non-English text are usually lower, so set the slider down for those. Prices are illustrative placeholders; use your provider's current price sheet, and remember cached input is often discounted." });
+    const pow = v => 10 ** v;
+    const cps = slider(w.controls, { label: "Chars per token (rule of thumb)", min: 1, max: 6, step: 0.1, value: 4, fmt: v => v.toFixed(1) + (Math.abs(v - 4) < 0.05 ? " · English" : ""), onInput: draw });
+    const inC = slider(w.controls, { label: "Prompt size (characters)", min: 2, max: 6, step: 0.05, value: 4, fmt: v => Math.round(pow(v)).toLocaleString("en-US"), onInput: draw });
+    const outT = slider(w.controls, { label: "Output tokens per call", min: 1, max: 4.3, step: 0.05, value: Math.log10(500), fmt: v => Math.round(pow(v)).toLocaleString("en-US"), onInput: draw });
+    const calls = slider(w.controls, { label: "Calls per day", min: 0, max: 6, step: 0.1, value: 4, fmt: v => Math.round(pow(v)).toLocaleString("en-US"), onInput: draw });
+    const pin = slider(w.controls, { label: "Input price ($ / 1M tokens)", min: 0.05, max: 15, step: 0.05, value: 3, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const pout = slider(w.controls, { label: "Output price ($ / 1M tokens)", min: 0.1, max: 75, step: 0.1, value: 15, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const ta = el("textarea", { class: "in", rows: 3, placeholder: "Paste a real prompt here to measure it…", spellcheck: "false" });
+    const meas = el("div", { class: "small muted", style: { marginTop: "4px" } });
+    const useBtn = el("button", { class: "btn", text: "Use as prompt size", onclick: () => { const n = cpLen(ta.value); if (n) { inC.value = clamp(Math.log10(n), 2, 6); draw(); } } });
+    w.controls.appendChild(el("div", { class: "ctl", style: { gridColumn: "1 / -1" } }, [el("label", null, el("span", { text: "Measure your own text" })), ta, el("div", { style: { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" } }, [useBtn, meas])]));
+    const usd = x => "$" + (x >= 100 ? fmtNum(x, 0) : x >= 1 ? fmtNum(x, 2) : x >= 0.01 ? x.toFixed(3) : x.toFixed(5));
+    const set = stats(w.body, [{ key: "tin", label: "≈ Input tokens" }, { key: "call", label: "Cost per call" }, { key: "day", label: "Per day" }, { key: "month", label: "Per 30 days" }, { key: "ctx", label: "Of a 128K window" }]);
+    const wrap = el("div", { class: "canvas-wrap", style: { marginTop: "12px" } }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 90, horizontal: true, labelWidth: 120 });
+    function measure() {
+      const n = cpLen(ta.value), words = (ta.value.match(/\S+/g) || []).length;
+      meas.textContent = n ? `${n.toLocaleString("en-US")} characters · ${words.toLocaleString("en-US")} words · ≈ ${Math.round(n / cps.value).toLocaleString("en-US")} tokens by chars, ≈ ${Math.round(words / 0.75).toLocaleString("en-US")} by words (both approximate)` : "";
+    }
+    function draw() {
+      const tin = pow(inC.value) / cps.value, tout = pow(outT.value), n = pow(calls.value);
+      const cin = tin * pin.value / 1e6, cout = tout * pout.value / 1e6, call = cin + cout;
+      set("tin", "≈ " + Math.round(tin).toLocaleString("en-US"), null, "approximate, from characters");
+      set("call", usd(call), null, `in ${usd(cin)} + out ${usd(cout)}`);
+      set("day", usd(call * n), call * n > 1000 ? "warn" : null, `${Math.round(n).toLocaleString("en-US")} calls`);
+      set("month", usd(call * n * 30), call * n * 30 > 30000 ? "bad" : null, "before caching or batch discounts");
+      const frac = (tin + tout) / 128000;
+      set("ctx", (100 * frac).toFixed(frac < 0.01 ? 2 : 1) + "%", frac > 1 ? "bad" : frac > 0.5 ? "warn" : "good", frac > 1 ? "doesn't fit" : "input + output");
+      B.draw(["input / day", "output / day"], [cin * n, cout * n], { colors: [palette.blue, palette.gold], fmt: usd });
+      measure();
+    }
+    ta.addEventListener("input", measure);
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>

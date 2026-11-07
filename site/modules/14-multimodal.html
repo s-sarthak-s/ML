@@ -1,0 +1,1728 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Seeing &amp; hearing — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .w-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  @media (max-width:760px){.w-split{grid-template-columns:1fr}}
+  .w-row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+  .px-table{border-collapse:collapse;font-family:var(--mono);font-size:12px}
+  .px-table td{border:1px solid var(--line);padding:5px 7px;text-align:center;min-width:44px;line-height:1.25;background:#fff}
+  .px-table td.c{outline:2px solid var(--ink);outline-offset:-2px}
+  .px-table td.pad{color:var(--faint);background:#f3f2ec}
+  .k3{border-collapse:collapse;font-family:var(--mono);font-size:12.5px;margin:0 auto}
+  .k3 td{border:1px solid var(--line);width:46px;height:34px;text-align:center;background:#fff}
+  .ax-lab{position:absolute;left:4px;font-family:var(--mono);font-size:10.5px;color:var(--muted);transform:translateY(-50%)}
+  .w-warn{color:var(--brick);font-size:13px;margin:8px 0 0}
+  #w-rvq svg{cursor:crosshair}
+</style>
+</head>
+<body data-module="14">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 14 · Beyond text</p>
+<h1 class="title">Seeing &amp; hearing: how models read <span class="it">pixels</span> and sound</h1>
+<p class="lede">A transformer only ever sees a sequence of vectors. To show it a photo, you cut the photo into 14-pixel squares and turn each square into a vector. To let it hear, you turn 30 seconds of speech into 3,000 thin slices of a spectrogram. This module walks through both pipelines number by number, from raw bytes to tokens, and shows where each conversion throws information away.</p>
+<div class="meta"><span class="tag">~3.5 hours</span><span class="tag n">prereqs: 01, 05, 06, 08</span><span class="tag g">hands-on: CLIP, Qwen2.5-VL, Whisper, librosa</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Turn an image, an audio clip, or a video into a token count, and estimate what that costs in context and prefill time.</li>
+    <li>Explain how a Vision Transformer turns patches into tokens, and why CLIP's contrastive loss makes zero-shot classification possible.</li>
+    <li>Sketch how a vision-language model such as LLaVA or Qwen2-VL wires a vision encoder into an LLM, and how it is trained.</li>
+    <li>Build a log-mel spectrogram from a waveform and justify every parameter: sample rate, window, hop, mel bins.</li>
+    <li>Describe Whisper's input and output format, and how neural audio codecs turn sound into discrete tokens with residual vector quantization.</li>
+    <li>Predict where multimodal models fail (small text, counting, spatial relations, long video) and design a test that exposes it.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="everything" data-short="Everything becomes vectors">Everything becomes a sequence of vectors</h2>
+
+<p>Module 05 turned text into token IDs, and each ID into a row of an embedding table. Module 06 pushed those rows through a stack of attention and MLP blocks. Nothing inside a block knows the vectors came from text. Attention mixes whatever vectors it's given, and the MLP transforms each one. So the recipe for every other kind of input is the same three steps:</p>
+<ol>
+  <li><strong>Chunk</strong> the signal into pieces: square patches of an image, 10 ms slices of audio, a handful of frames of video.</li>
+  <li><strong>Embed</strong> each piece as a vector of the model's width \(D\), usually with a small learned network (a linear layer, a few convolutions, or a whole pretrained encoder).</li>
+  <li><strong>Add position</strong> so the model knows where each piece came from: row and column for an image, time for audio, both for video.</li>
+</ol>
+<p>After that, a picture is just a few hundred extra tokens in the context window. Most of this module is about the first two steps, because that's where the engineering choices live and where the information gets lost.</p>
+
+<figure class="fig wide"><div id="fig-everything"></div>
+<figcaption>Three modalities, one interface. An image is cut into patches and each patch is projected to a vector. Audio becomes a spectrogram whose time slices become vectors. Video is sampled into frames that are patchified like images. All of them arrive at the transformer as rows of the same width \(D\), next to ordinary text tokens. The counts at the bottom of each row are worked examples, not universal constants.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Input</th><th>Raw form</th><th>Chunk</th><th class="num">Raw numbers</th><th class="num">Tokens (example)</th></tr></thead>
+  <tbody>
+    <tr><td>Text, ~500 English words</td><td>UTF-8 bytes</td><td>BPE token, about 4 characters</td><td class="num">~3,000 bytes</td><td class="num">~650</td></tr>
+    <tr><td>Image, 336×336 RGB</td><td>[336, 336, 3] uint8</td><td>14×14-pixel patch</td><td class="num">338,688</td><td class="num">576 (LLaVA-1.5)</td></tr>
+    <tr><td>Speech, 30 s</td><td>480,000 samples at 16 kHz</td><td>10 ms spectrogram frame, then stride 2</td><td class="num">480,000</td><td class="num">1,500 (Whisper encoder)</td></tr>
+    <tr><td>Audio for generation, 10 s</td><td>240,000 samples at 24 kHz</td><td>codec frame (13.3 ms) × 8 codebooks</td><td class="num">240,000</td><td class="num">6,000 (EnCodec, 6 kbps)</td></tr>
+    <tr><td>Video, 60 s at 1080p</td><td>1,800 frames at 30 fps</td><td>2 fps sample, 256 tokens/frame</td><td class="num">~11 billion</td><td class="num">30,720</td></tr>
+  </tbody>
+</table>
+
+<div class="def"><b>Definition · continuous vs discrete inputs</b>
+<p>There are two ways to hand a non-text signal to a transformer. <strong>Continuous embeddings</strong> (ViT patches, Whisper frames) go straight into the residual stream as vectors. The model can read them but can't produce them, because its output head is a softmax over a vocabulary. <strong>Discrete tokens</strong> come from a learned codebook (VQ image tokenizers, audio codecs). They get IDs like words do, so the same model can both read and <em>generate</em> them. Most image and speech <em>understanding</em> models use the first kind; models that speak or draw need the second.</p>
+</div>
+
+<div class="intuition"><b>Intuition</b>
+<p>A token is whatever the model attends over. For text, that's a word piece. For an image, it's a little square of pixels. The model's cost scales with how many of those you send, not with what they mean, so every modality comes down to the same bargain: fewer tokens are cheaper, and more tokens keep more detail.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="pixels" data-short="What an image is">What an image is to a computer</h2>
+
+<p>A digital image is a grid of pixels. Each pixel stores three brightness values, red, green and blue, usually as one byte each (0–255). Stack the three colour planes and you get a 3-D array, a <em>tensor</em>, of shape height × width × channels. That array is the entire image. There's no "cat" in the file, only 150,528 numbers for a 224×224 photo.</p>
+
+<div class="formula" data-name="An image as a tensor">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{X}} \in \{0,\dots,255\}^{\htmlClass{t2}{H} \times \htmlClass{t3}{W} \times \htmlClass{t4}{C}}, \qquad \htmlClass{t5}{\tilde{x}} = \frac{x/255 - \htmlClass{t6}{\mu_c}}{\htmlClass{t7}{\sigma_c}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{X}\)</dt><dd>the image: one integer per pixel per channel</dd></div>
+    <div data-t="t2"><dt>\(H\)</dt><dd>height in pixels (number of rows)</dd></div>
+    <div data-t="t3"><dt>\(W\)</dt><dd>width in pixels (number of columns)</dd></div>
+    <div data-t="t4"><dt>\(C\)</dt><dd>channels: 3 for RGB, 1 for grayscale, 4 if there's an alpha channel</dd></div>
+    <div data-t="t5"><dt>\(\tilde{x}\)</dt><dd>the normalized value the network actually receives, roughly zero-mean, unit-variance</dd></div>
+    <div data-t="t6"><dt>\(\mu_c\)</dt><dd>per-channel mean from the training set. ImageNet: (0.485, 0.456, 0.406). CLIP uses its own: (0.481, 0.458, 0.408)</dd></div>
+    <div data-t="t7"><dt>\(\sigma_c\)</dt><dd>per-channel standard deviation. ImageNet: (0.229, 0.224, 0.225)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>An image is \(H \times W \times C\) bytes. Before a network sees it, each byte is scaled to [0, 1] and then shifted and stretched so each channel has roughly mean 0 and spread 1, the same treatment the network saw in training.</p>
+  <p class="why"><b>Why it matters</b>Size grows with the <em>square</em> of resolution. Doubling the side length means 4× the pixels, and as you'll see, 4× the tokens and up to 16× the attention cost.</p>
+</div>
+
+<div id="w-pixels"></div>
+
+<details class="think"><summary>Think first: how many numbers are in a 12-megapixel phone photo?</summary>
+<div>4032 × 3024 × 3 = 36,578,304 bytes, about 36.6 MB uncompressed (the JPEG on disk is maybe 3 MB because JPEG throws away detail the eye won't miss). No vision model looks at that directly. Every pipeline starts by resizing, cropping, or tiling down to something like 224–1,000 pixels a side. Remember that step: it explains a lot of the failures in the last section.</div>
+</details>
+
+<div class="pitfall"><b>Pitfall · preprocessing mismatch</b>
+<p>The model learned on one exact pipeline, and quiet deviations cost accuracy without raising an error. OpenCV's <code>cv2.imread</code> returns <strong>BGR</strong>, not RGB. PyTorch wants channels first, <code>[B, C, H, W]</code>, while PIL and NumPy give <code>[H, W, C]</code>. CLIP, SigLIP and ImageNet models each use different mean/std values and resize rules. Always run inputs through the model's own processor (<code>AutoProcessor</code> in transformers) rather than writing your own.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="cnn" data-short="Convolutions and CNNs">Convolutions and CNNs, briefly</h2>
+
+<p>From AlexNet (Krizhevsky et al., 2012) to ResNet (He et al., 2015), computer vision ran on <strong>convolutional neural networks</strong>. You'll still meet convolutions everywhere: in the stem of Whisper, in the patch embedding of every ViT, and in the encoders of image and audio codecs. The idea is simple. Slide a small grid of weights, the <em>kernel</em>, over the image, and at each position take the dot product of the kernel with the pixels under it.</p>
+
+<div class="formula" data-name="2D convolution (as used in deep learning)">
+  <div class="tex">$$\htmlClass{t1}{Y}[i,j] = \htmlClass{t4}{b} + \sum_{m=-k}^{k}\;\sum_{n=-k}^{k} \htmlClass{t2}{K}[m,n]\;\htmlClass{t3}{X}[i+m,\; j+n]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(Y[i,j]\)</dt><dd>output value ("feature map") at row \(i\), column \(j\)</dd></div>
+    <div data-t="t2"><dt>\(K\)</dt><dd>the kernel: a \((2k+1)\times(2k+1)\) grid of learned weights. 3×3 means \(k=1\), nine weights</dd></div>
+    <div data-t="t3"><dt>\(X\)</dt><dd>the input image or previous feature map, padded at the borders</dd></div>
+    <div data-t="t4"><dt>\(b\)</dt><dd>a learned bias added everywhere</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each output pixel is a weighted sum of the 3×3 neighbourhood around the matching input pixel, and the <em>same nine weights</em> are used at every position. (Strictly this is cross-correlation; deep learning calls it convolution anyway.)</p>
+  <p class="why"><b>Why it matters</b>Weight sharing is enormously efficient. A 3×3 conv on a 32×32 image has 9 weights; a dense layer with the same input and output size has over a million. Real layers have many kernels and many channels, but the saving is the same in kind.</p>
+</div>
+
+<div id="w-conv"></div>
+
+<p>Two properties come for free with convolution, and they're called <strong>inductive biases</strong> because they bake an assumption about images into the architecture:</p>
+<ul>
+  <li><strong>Locality.</strong> Each output depends only on a small neighbourhood. Stacking \(L\) layers of 3×3 kernels (stride 1) grows the receptive field to \((2L+1)\times(2L+1)\) pixels, so deep layers see large regions built from small ones.</li>
+  <li><strong>Translation equivariance.</strong> Shift the input and the output shifts by the same amount: \(\text{conv}(\text{shift}(X)) = \text{shift}(\text{conv}(X))\). A cat detector learned in the top-left corner also works in the bottom-right. Pooling layers then make the final answer roughly <em>invariant</em> to position.</li>
+</ul>
+<p>The widget's shift slider checks the second claim: the output moves with the input and matches everywhere except a thin seam where the wrapped-around image meets the zero padding.</p>
+
+<div class="intuition"><b>Intuition</b>
+<p>Inductive biases are prior knowledge. They let a CNN learn from fewer examples because it doesn't have to discover that nearby pixels matter more than distant ones. The flip side is that a model with fewer built-in assumptions can learn better ones if you give it enough data. That trade is exactly what the Vision Transformer made.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="vit" data-short="Vision Transformer">The Vision Transformer: images as patch tokens</h2>
+
+<p>Dosovitskiy et al. (2020), in a paper titled <em>An Image is Worth 16x16 Words</em>, asked what happens if you drop convolutions and feed an image to a plain transformer encoder. Attention over individual pixels is hopeless: a 224×224 image has 50,176 pixels, and attention cost grows with the square of sequence length. Their answer was to cut the image into non-overlapping \(P\times P\) <strong>patches</strong> and treat each patch as one token.</p>
+
+<div class="formula" data-name="Patch count and patch size">
+  <div class="tex">$$\htmlClass{t1}{N} = \frac{\htmlClass{t2}{H}\,\htmlClass{t3}{W}}{\htmlClass{t4}{P}^2}, \qquad \htmlClass{t5}{d_{\text{patch}}} = \htmlClass{t4}{P}^2 \cdot \htmlClass{t6}{C}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(N\)</dt><dd>number of patch tokens, the sequence length the encoder sees</dd></div>
+    <div data-t="t2"><dt>\(H\)</dt><dd>image height after resizing (must be a multiple of \(P\))</dd></div>
+    <div data-t="t3"><dt>\(W\)</dt><dd>image width after resizing</dd></div>
+    <div data-t="t4"><dt>\(P\)</dt><dd>patch side in pixels: 16 in the original ViT-B/16, 14 in CLIP ViT-L/14 and most VLM encoders</dd></div>
+    <div data-t="t5"><dt>\(d_{\text{patch}}\)</dt><dd>numbers in one flattened patch</dd></div>
+    <div data-t="t6"><dt>\(C\)</dt><dd>channels (3)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A 224×224 image with 16-pixel patches is a 14×14 grid: 196 tokens, each a vector of 16·16·3 = 768 raw numbers. At 336 pixels with 14-pixel patches, it's 24×24 = 576 tokens.</p>
+</div>
+
+<figure class="fig wide"><div id="fig-vit"></div>
+<figcaption>The ViT pipeline (Dosovitskiy et al., 2020). The image is split into patches, each patch is flattened and multiplied by the same matrix \(\mathbf{E}\), a learned position embedding is added, and a learnable [CLS] token is prepended. A standard transformer encoder (bidirectional, no causal mask) processes the sequence. For classification, the final [CLS] vector goes to a small MLP head. VLMs instead keep all the patch outputs.</figcaption></figure>
+
+<div class="formula" data-name="Patch embedding (ViT input)">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{z}_0} = \big[\,\htmlClass{t2}{\mathbf{x}_{\text{cls}}};\; \htmlClass{t3}{\mathbf{x}_p^1}\htmlClass{t4}{\mathbf{E}};\; \htmlClass{t3}{\mathbf{x}_p^2}\htmlClass{t4}{\mathbf{E}};\; \dots;\; \htmlClass{t3}{\mathbf{x}_p^N}\htmlClass{t4}{\mathbf{E}}\,\big] + \htmlClass{t5}{\mathbf{E}_{\text{pos}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{z}_0\)</dt><dd>the input sequence to layer 1, shape \((N+1)\times D\)</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{x}_{\text{cls}}\)</dt><dd>a learned "class" vector prepended to the patches; its final state summarizes the image</dd></div>
+    <div data-t="t3"><dt>\(\mathbf{x}_p^i\)</dt><dd>patch \(i\), flattened to length \(P^2 C\)</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{E}\)</dt><dd>patch projection, shape \(P^2C \times D\), shared by all patches. Equivalent to a conv with kernel \(P\) and stride \(P\)</dd></div>
+    <div data-t="t5"><dt>\(\mathbf{E}_{\text{pos}}\)</dt><dd>learned position embeddings, one per slot, shape \((N+1)\times D\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every patch goes through the same linear layer to become a \(D\)-dimensional vector (768 for ViT-B, 1,024 for ViT-L). Add "you are patch number \(i\)" information, put a summary slot in front, and you have something a text transformer would recognize.</p>
+  <p class="why"><b>Why it matters</b>Position embeddings are learned for a fixed grid. Run the model at a new resolution and the grid changes, so ViT interpolates the 2-D position table to the new size. Many recent encoders use 2-D RoPE instead, which handles any grid natively.</p>
+</div>
+
+<div class="formula" data-name="Attention-score cost over patches">
+  <div class="tex">$$\htmlClass{t1}{\text{FLOPs}_{\text{attn}}} \approx 4\,\htmlClass{t2}{N}^2\,\htmlClass{t3}{D}\cdot \htmlClass{t4}{L}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\text{FLOPs}_{\text{attn}}\)</dt><dd>work for the score matrix \(QK^\top\) and the weighted sum with \(V\), per image</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>tokens per image (patches + CLS)</dd></div>
+    <div data-t="t3"><dt>\(D\)</dt><dd>model width</dd></div>
+    <div data-t="t4"><dt>\(L\)</dt><dd>number of layers</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Halve the patch size, or double the image side, and you get 4× the tokens and 16× the attention cost. The projections and MLPs only grow 4×, linearly in \(N\).</p>
+</div>
+
+<div id="w-vit"></div>
+
+<div class="flag"><b>Data hunger</b>
+<p>Without convolution's built-in biases, ViT has to learn locality from data. The original paper found that trained on ImageNet alone (1.3M images), ViTs trailed comparable ResNets; pretrained on much larger sets (14M–300M images), they matched or beat them. Modern vision encoders get that scale from web image-text pairs (CLIP, SigLIP) or self-supervision (MAE, He et al., 2021; DINOv2, Oquab et al., 2023).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="clip" data-short="CLIP">CLIP: one space for pictures and words</h2>
+
+<p>A ViT trained on ImageNet knows 1,000 labels. To talk about images in open language, you need image vectors and text vectors that live in the <em>same</em> space, so that a photo of a dog lands near the sentence "a photo of a dog". CLIP (Radford et al., 2021) built that space from about 400 million image–caption pairs collected from the web, using two encoders and one loss.</p>
+
+<ul>
+  <li>An <strong>image encoder</strong> (a ViT or a ResNet) maps each image to a vector \(\mathbf{u}_i\).</li>
+  <li>A <strong>text encoder</strong> (a transformer) maps each caption to a vector \(\mathbf{v}_j\).</li>
+  <li>Both are projected to the same width and L2-normalized, so their dot product is a cosine similarity.</li>
+</ul>
+<p>For a batch of \(N\) pairs, compute all \(N\times N\) similarities. The \(N\) matching pairs sit on the diagonal and the \(N^2-N\) mismatches everywhere else. Training pushes the diagonal up and everything else down.</p>
+
+<figure class="fig wide"><div id="fig-clip"></div>
+<figcaption>CLIP's training step. A batch of images and their captions go through separate encoders. The similarity matrix has the true pairs on the diagonal (green). Each row is a classification problem ("which caption is mine?") and so is each column ("which image is mine?"). CLIP trained with batches of 32,768, so every image competed against 32,767 wrong captions at once.</figcaption></figure>
+
+<div class="formula" data-name="Symmetric contrastive loss (InfoNCE)">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}} = -\frac{1}{2\htmlClass{t2}{N}} \sum_{i=1}^{\htmlClass{t2}{N}} \left[ \log \frac{e^{\htmlClass{t3}{s_{ii}}/\htmlClass{t4}{\tau}}}{\sum_{j} e^{\htmlClass{t3}{s_{ij}}/\htmlClass{t4}{\tau}}} + \log \frac{e^{\htmlClass{t3}{s_{ii}}/\htmlClass{t4}{\tau}}}{\sum_{j} e^{\htmlClass{t3}{s_{ji}}/\htmlClass{t4}{\tau}}} \right], \qquad \htmlClass{t3}{s_{ij}} = \frac{\htmlClass{t5}{\mathbf{u}_i}^{\top}\htmlClass{t6}{\mathbf{v}_j}}{\lVert \htmlClass{t5}{\mathbf{u}_i}\rVert\,\lVert \htmlClass{t6}{\mathbf{v}_j}\rVert}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}\)</dt><dd>the loss: average of image→text and text→image cross-entropy</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>batch size. Every other item in the batch is a negative example</dd></div>
+    <div data-t="t3"><dt>\(s_{ij}\)</dt><dd>cosine similarity between image \(i\) and caption \(j\), in [−1, 1]</dd></div>
+    <div data-t="t4"><dt>\(\tau\)</dt><dd><b>temperature</b>, learned. CLIP initialized it at 0.07 and clipped \(1/\tau\) at 100</dd></div>
+    <div data-t="t5"><dt>\(\mathbf{u}_i\)</dt><dd>image embedding</dd></div>
+    <div data-t="t6"><dt>\(\mathbf{v}_j\)</dt><dd>text embedding</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each image should pick its own caption out of the batch, and each caption should pick its own image. Softmax over a row (or column) of similarities, take the log-probability of the right answer, and average.</p>
+  <p class="why"><b>Why it matters</b>Cosine similarities live in [−1, 1]. Without dividing by a small \(\tau\), the softmax over values like 0.31 vs 0.12 would be nearly uniform and the gradient tiny. The learned temperature turns small cosine gaps into confident probabilities.</p>
+</div>
+
+<div id="w-clip"></div>
+
+<h3>Zero-shot classification</h3>
+<p>Once the space exists, a classifier is just a list of sentences. Write one prompt per class, such as "a photo of a {label}.", embed each with the text encoder, and pick the class whose text vector is closest to the image vector. No labelled training images, no new weights.</p>
+
+<div class="formula" data-name="Zero-shot classifier">
+  <div class="tex">$$\htmlClass{t1}{\hat{y}} = \arg\max_{c}\;\; \htmlClass{t2}{\mathbf{u}}^{\top}\, \htmlClass{t3}{\mathbf{v}_c}, \qquad \htmlClass{t3}{\mathbf{v}_c} = \text{TextEnc}(\text{"a photo of a } \htmlClass{t4}{c}\text{."})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat{y}\)</dt><dd>predicted class</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{u}\)</dt><dd>normalized embedding of the image to classify</dd></div>
+    <div data-t="t3"><dt>\(\mathbf{v}_c\)</dt><dd>normalized embedding of the prompt for class \(c\). These rows act as the classifier's weight matrix</dd></div>
+    <div data-t="t4"><dt>\(c\)</dt><dd>any label you can write in words</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The text encoder <em>generates</em> the classifier weights from label names on the fly. Add a class by writing a new sentence.</p>
+  <p class="why"><b>Why it matters</b>CLIP's best model reached ImageNet accuracy comparable to a supervised ResNet-50 without using any of ImageNet's 1.28M labelled training images. The paper also found that prompt templates and averaging embeddings over many templates added a few points over bare label names.</p>
+</div>
+
+<div class="flag"><b>Where CLIP-style embeddings are weak</b>
+<p>A contrastive loss only needs enough of the caption to pick the right image out of the batch, and web batches rarely contain "a horse riding an astronaut" next to "an astronaut riding a horse". Yuksekgonul et al. (2023) showed that such models often behave like bags of words, insensitive to word order and relations. They can also be fooled by text in the image: Goh et al. (2021) showed a CLIP model labelling an apple with a handwritten "iPod" note as an iPod. SigLIP (Zhai et al., 2023) replaces the batch softmax with a per-pair sigmoid loss and is now a common encoder choice for VLMs.</p>
+</div>
+
+<div class="mle"><b>MLE angle</b>
+<p>CLIP-family embeddings are a workhorse beyond classification. You can use them for text-to-image search (an ANN index over image vectors, Module 11), near-duplicate detection, and data filtering: LAION-5B kept web pairs whose CLIP similarity cleared a threshold. They're cheap, a single ViT forward pass per image, and you can cache them.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="vlm" data-short="Vision-language models">Vision-language models: plugging an encoder into an LLM</h2>
+
+<p>CLIP can match images to text but can't write anything. A <strong>vision-language model</strong> (VLM) can answer questions about an image, read a chart, or describe a screenshot, because it attaches a vision encoder to a full LLM. The most common design is almost embarrassingly simple.</p>
+
+<h3>The LLaVA recipe</h3>
+<p>LLaVA (Liu et al., 2023) takes a pretrained CLIP ViT, keeps the per-patch output vectors (from the second-to-last layer), passes each through a small <strong>projector</strong>, and drops the results into the LLM's input sequence as if they were word embeddings. The LLM is unchanged. It just sees 576 extra "words" it was taught to read.</p>
+
+<figure class="fig wide"><div id="fig-llava"></div>
+<figcaption>LLaVA-1.5 (Liu et al., 2023). A CLIP ViT-L/14 encoder at 336 pixels produces 24×24 = 576 patch vectors of width 1,024. A two-layer MLP projects each to the LLM's embedding width (4,096 for a 7B Vicuna). The visual tokens are spliced into the prompt where the image placeholder was, and the decoder attends to them like any other tokens.</figcaption></figure>
+
+<div class="def"><b>Definition · projector</b>
+<p>The small network that maps vision-encoder outputs into the LLM's embedding space. LLaVA-1 used a single linear layer; LLaVA-1.5 switched to a two-layer MLP with a GELU. Many current models also <em>compress</em> in the projector, merging neighbouring patches into one token before the LLM ever sees them.</p>
+</div>
+
+<h3>Three ways to fuse</h3>
+<figure class="fig wide"><div id="fig-fusion"></div>
+<figcaption>Three families of architecture. (a) Input-level fusion: visual tokens are concatenated with text tokens at the input; used by LLaVA, Qwen-VL and InternVL. (b) Cross-attention: a frozen LM gets new gated cross-attention layers that read from a fixed set of visual tokens; Flamingo (Alayrac et al., 2022) used a Perceiver Resampler to produce 64 visual tokens per image. (c) Early fusion: images are turned into discrete tokens from a VQ codebook and share one vocabulary and one transformer with text, so the model can read <em>and generate</em> images; Chameleon (Chameleon Team, 2024) encodes a 512×512 image as 1,024 tokens.</figcaption></figure>
+
+<div class="grid3">
+  <div class="card blue"><div class="k">Input-level fusion</div><h4>Cheap to build, costs context</h4><p>Reuses any pretrained LLM. Visual tokens occupy the context window and the KV cache like text, so a high-resolution image can cost thousands of tokens of prefill.</p></div>
+  <div class="card"><div class="k">Cross-attention</div><h4>Keeps the LM intact</h4><p>Text sequence length doesn't grow with image size, and the frozen LM's text skills are protected (Flamingo's gates start at zero). The trade is extra layers, and the image can only be read where cross-attention layers sit.</p></div>
+  <div class="card warn"><div class="k">Early fusion</div><h4>One model, any order, any direction</h4><p>The model can emit image tokens as easily as words. Training from scratch on mixed data is expensive, and Chameleon's authors reported stability problems they had to fix with architecture changes such as QK-norm.</p></div>
+</div>
+
+<h3>Image token budgets</h3>
+<p>For input-level fusion, the number that decides cost is how many visual tokens one image becomes. Fixed-resolution models squash every image to one square: LLaVA-1.5 at 336 pixels gives 576 tokens whether you send a thumbnail or a 12 MP scan. That's cheap but loses detail, so newer models increase the resolution and then compress the tokens:</p>
+<ul>
+  <li><strong>Tiling ("dynamic high resolution").</strong> Cut the image into encoder-sized crops, encode each, and add one downscaled thumbnail for global context. LLaVA-NeXT's AnyRes used up to four 336-pixel tiles plus the thumbnail, around 2,880 tokens. InternVL 1.5 uses 448-pixel tiles with a configurable maximum tile count.</li>
+  <li><strong>Native resolution.</strong> Qwen2-VL (Wang et al., 2024) feeds the image at roughly its own aspect ratio and resolution, with 2-D rotary positions, so the token count follows the pixel count. A <code>min_pixels</code>/<code>max_pixels</code> setting caps it.</li>
+  <li><strong>Token compression.</strong> Merge each 2×2 block of neighbouring patch vectors into one token: either concatenate them (pixel shuffle, or space-to-depth, giving a vector 4× wider) and project back down, or average-pool them. InternVL turns 1,024 patches per 448-pixel tile into 256 tokens this way. Qwen2-VL's 2×2 merge means each LLM token covers 28×28 pixels.</li>
+</ul>
+
+<div class="formula" data-name="Visual token budget">
+  <div class="tex">$$\htmlClass{t1}{T_{\text{vis}}} = \htmlClass{t2}{n_{\text{crops}}} \times \frac{(\htmlClass{t3}{R}/\htmlClass{t4}{P})^2}{\htmlClass{t5}{r}^2}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(T_{\text{vis}}\)</dt><dd>visual tokens the LLM must prefill for one image</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{crops}}\)</dt><dd>1 for a fixed-resolution model; tiles + 1 thumbnail for tiling</dd></div>
+    <div data-t="t3"><dt>\(R\)</dt><dd>encoder input side in pixels (224, 336, 448…)</dd></div>
+    <div data-t="t4"><dt>\(P\)</dt><dd>patch size (14 or 16)</dd></div>
+    <div data-t="t5"><dt>\(r\)</dt><dd>merge factor per side: 1 for none, 2 for a 2×2 pixel shuffle or pool (÷4)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>LLaVA-1.5: 1 × (336/14)² / 1 = 576. InternVL with 6 tiles + thumbnail: 7 × (448/14)² / 4 = 7 × 256 = 1,792. A native-resolution model at 1,288×728 with 28-pixel merged tokens: 46 × 26 = 1,196.</p>
+  <p class="why"><b>Why it matters</b>Visual tokens are prompt tokens. They add prefill latency, KV cache, and (with hosted APIs) billing. API providers publish their own per-image formulas based on tiles; check the current docs rather than guessing.</p>
+</div>
+
+<div id="w-vlm"></div>
+
+<table class="t">
+  <thead><tr><th>Model (paper)</th><th>Vision side</th><th>How the image enters</th><th class="num">Tokens per image</th></tr></thead>
+  <tbody>
+    <tr><td>LLaVA-1.5 (Liu et al., 2023)</td><td>CLIP ViT-L/14, 336 px</td><td>2-layer MLP projector, input fusion</td><td class="num">576</td></tr>
+    <tr><td>LLaVA-NeXT (Liu et al., 2024)</td><td>same encoder, AnyRes tiles</td><td>up to 4 tiles + thumbnail</td><td class="num">up to ~2,880</td></tr>
+    <tr><td>InternVL 1.5+ (Chen et al., 2024)</td><td>InternViT, 448 px tiles</td><td>pixel shuffle 2×2, MLP</td><td class="num">256 per tile</td></tr>
+    <tr><td>Qwen2-VL / 2.5-VL (Wang et al., 2024; Bai et al., 2025)</td><td>native-resolution ViT, 14 px patches</td><td>2×2 merge, MLP, M-RoPE</td><td class="num">pixels ÷ 784</td></tr>
+    <tr><td>Flamingo (Alayrac et al., 2022)</td><td>frozen NFNet</td><td>Perceiver Resampler + gated cross-attention</td><td class="num">64 (via cross-attn)</td></tr>
+    <tr><td>Chameleon (Chameleon Team, 2024)</td><td>VQ image tokenizer</td><td>discrete tokens, early fusion</td><td class="num">1,024 at 512 px</td></tr>
+  </tbody>
+</table>
+
+<h3>How VLMs are trained</h3>
+<p>The LLaVA recipe trains in two stages, and most later models elaborate on it rather than replace it.</p>
+<ol>
+  <li><strong>Stage 1: align the projector.</strong> Freeze the vision encoder and the LLM. Train only the projector on image–caption pairs (about 558K for LLaVA-1.5), with the plain next-token loss on the caption. This teaches the projector to output vectors the LLM already knows how to read. It's cheap: the projector is a few tens of millions of parameters.</li>
+  <li><strong>Stage 2: visual instruction tuning.</strong> Unfreeze the LLM (the encoder often stays frozen in LLaVA, though many later models unfreeze it too) and fine-tune on conversations about images: questions and answers, multi-turn chat, reasoning. LLaVA bootstrapped this data by giving text-only GPT-4 the COCO captions and bounding boxes for an image and asking it to write conversations; LLaVA-1.5 mixed in academic VQA, OCR and region-grounding sets for about 665K examples. As in Module 10, the loss is computed only on the answer tokens.</li>
+</ol>
+<p>Production-grade models add a large pretraining stage between the two, on billions of tokens of mixed data, and usually train the encoder as well. The data mix decides what the model is good at:</p>
+<div class="grid2">
+  <div class="card"><div class="k">Interleaved documents</div><h4>Web pages with images in place</h4><p>Datasets such as MMC4 (Zhu et al., 2023) and OBELICS (Laurençon et al., 2023) keep images inside their surrounding text, which teaches multi-image reasoning and in-context learning.</p></div>
+  <div class="card blue"><div class="k">OCR, documents, charts</div><h4>Reading, not just recognizing</h4><p>Rendered text, scanned PDFs, tables, charts and UI screenshots. This is where resolution matters most, and where synthetic data (render text, then ask about it) is cheap and effective.</p></div>
+  <div class="card warn"><div class="k">Grounding</div><h4>Boxes and points as text</h4><p>Region captions and "where is X" questions with coordinates written as tokens. Qwen2-VL wrote boxes on a 0–1000 normalized grid; Qwen2.5-VL switched to absolute pixel coordinates. This is what lets a model point at a button in a screenshot.</p></div>
+  <div class="card bad"><div class="k">Video and multi-image</div><h4>Time and comparison</h4><p>Captioned clips, temporal grounding ("when does the door open?"), and image pairs for comparison questions. Covered in the video section below.</p></div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="sound" data-short="What sound is">What sound is to a computer</h2>
+
+<p>Sound is air pressure wobbling over time. A microphone turns it into a voltage, and an analog-to-digital converter measures that voltage at regular intervals. The result, a <strong>waveform</strong>, is a single long list of numbers: one per sample, per channel. Two settings define it:</p>
+<ul>
+  <li><strong>Sample rate</strong> \(f_s\): measurements per second. CD audio is 44.1 kHz, most speech models use 16 kHz, telephone audio is 8 kHz.</li>
+  <li><strong>Bit depth</strong>: how finely each measurement is quantized. 16-bit gives 65,536 levels and about 96 dB of dynamic range (roughly 6 dB per bit, the same rule as Module 09's SNR). Models convert to float32 in [−1, 1].</li>
+</ul>
+<p>So 30 seconds of 16 kHz mono speech is 480,000 numbers, or 960 KB at 16 bits. That's about three times the numbers in a 224-pixel photo, for an amount of speech that transcribes to maybe 80 words.</p>
+
+<div class="formula" data-name="Nyquist limit and aliasing">
+  <div class="tex">$$\htmlClass{t1}{f_s} \gt 2\,\htmlClass{t2}{f_{\max}}, \qquad \htmlClass{t3}{f_{\text{alias}}} = \Big| \htmlClass{t4}{f} - \htmlClass{t1}{f_s}\cdot \text{round}\big(\htmlClass{t4}{f}/\htmlClass{t1}{f_s}\big) \Big|$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(f_s\)</dt><dd>sample rate in Hz</dd></div>
+    <div data-t="t2"><dt>\(f_{\max}\)</dt><dd>highest frequency you need to capture. \(f_s/2\) is the <b>Nyquist frequency</b></dd></div>
+    <div data-t="t3"><dt>\(f_{\text{alias}}\)</dt><dd>the frequency a tone appears to have after sampling</dd></div>
+    <div data-t="t4"><dt>\(f\)</dt><dd>the tone's true frequency</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>You need more than two samples per cycle to pin down a frequency. Anything above \(f_s/2\) doesn't vanish: it folds back and impersonates a lower frequency. A 10 kHz tone sampled at 16 kHz shows up as \(|10 - 16| = 6\) kHz.</p>
+  <p class="why"><b>Why it matters</b>16 kHz keeps everything up to 8 kHz, which covers the bulk of speech intelligibility (fricatives like "s" extend higher, so 8 kHz telephone audio makes "f" and "s" hard to tell apart). Resamplers apply a low-pass filter before downsampling so high frequencies are removed rather than aliased.</p>
+</div>
+
+<figure class="fig wide"><div id="fig-sampling"></div>
+<figcaption>Sampling at 8 samples per second. Left: a 2 Hz sine has four samples per cycle and is captured faithfully. Right: a 7 Hz sine is above the 4 Hz Nyquist limit. Its samples (dots) lie exactly on a 1 Hz sine (dashed): after sampling, the two signals are indistinguishable. This is aliasing, and no later processing can undo it.</figcaption></figure>
+
+<div class="pitfall"><b>Pitfall · the wrong sample rate</b>
+<p>Feed 44.1 kHz samples to a model that assumes 16 kHz and every sound plays 2.76× slower and lower than it should; the model hears garbage and may still confidently produce text. <code>librosa.load(path, sr=16000)</code>, <code>whisper.load_audio</code> and the Hugging Face feature extractors resample for you. Raw <code>soundfile.read</code> does not.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="spectrogram" data-short="Waveform to spectrogram">From waveform to spectrogram</h2>
+
+<p>A waveform is a poor input for a model. The same vowel spoken twice gives waveforms that barely line up, because the phases differ, while the <em>frequencies</em> it contains are nearly identical. Our ears work in frequency too: the cochlea splits sound into bands. So nearly every speech model first converts audio into a picture of how much energy there is at each frequency over time.</p>
+
+<h3>The Fourier transform</h3>
+<div class="formula" data-name="Discrete Fourier transform (one window)">
+  <div class="tex">$$\htmlClass{t1}{X[k]} = \sum_{n=0}^{\htmlClass{t2}{N}-1} \htmlClass{t3}{x[n]}\;\htmlClass{t6}{w[n]}\; e^{-i 2\pi \htmlClass{t4}{k} n / \htmlClass{t2}{N}}, \qquad \htmlClass{t5}{f_k} = \frac{\htmlClass{t4}{k}\, f_s}{\htmlClass{t2}{N}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(X[k]\)</dt><dd>a complex number; its magnitude \(|X[k]|\) says how much of frequency \(f_k\) is present</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>window length in samples (Whisper: 400 samples = 25 ms at 16 kHz)</dd></div>
+    <div data-t="t3"><dt>\(x[n]\)</dt><dd>the audio samples inside the window</dd></div>
+    <div data-t="t6"><dt>\(w[n]\)</dt><dd>a window function (Hann) that fades the edges to zero, reducing spectral leakage</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>frequency bin index, 0 to \(N/2\) for real signals</dd></div>
+    <div data-t="t5"><dt>\(f_k\)</dt><dd>centre frequency of bin \(k\). Bins are \(f_s/N\) Hz apart</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>For each test frequency, multiply the signal by a sine and cosine at that frequency and add up the result. If the signal contains that frequency, the products line up and the sum is large; otherwise they cancel. It's a dot product against a bank of sinusoids (Module 01), and the FFT computes all of them in \(O(N\log N)\).</p>
+</div>
+
+<h3>The short-time Fourier transform</h3>
+<p>Speech changes every few tens of milliseconds, so one Fourier transform of the whole clip would blur all the sounds together. The STFT slides a short window along the signal, moving by a <strong>hop</strong> each time, and takes a DFT per position. Stack the magnitudes as columns and you have a <strong>spectrogram</strong>: time on the x-axis, frequency on the y-axis, energy as brightness.</p>
+
+<div class="formula" data-name="STFT and frame count">
+  <div class="tex">$$\htmlClass{t1}{S[m,k]} = \Big|\sum_{n=0}^{\htmlClass{t2}{N}-1} x[n + m\htmlClass{t3}{H}]\; w[n]\; e^{-i2\pi kn/\htmlClass{t2}{N}}\Big|^2, \qquad \htmlClass{t4}{T_{\text{frames}}} \approx \frac{\htmlClass{t5}{L}}{\htmlClass{t3}{H}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(S[m,k]\)</dt><dd>power at frame \(m\), frequency bin \(k\)</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>window length: sets frequency resolution \(f_s/N\) and time blur \(N/f_s\)</dd></div>
+    <div data-t="t3"><dt>\(H\)</dt><dd>hop: samples between frames (Whisper: 160 = 10 ms)</dd></div>
+    <div data-t="t4"><dt>\(T_{\text{frames}}\)</dt><dd>number of spectrogram columns</dd></div>
+    <div data-t="t5"><dt>\(L\)</dt><dd>signal length in samples</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>30 s at 16 kHz is 480,000 samples; with a 160-sample hop that's 3,000 frames, 100 per second. Windows overlap (400-sample windows every 160 samples) so no moment falls between frames.</p>
+  <p class="why"><b>Why it matters</b>You can't have sharp time and sharp frequency at once. A long window resolves close pitches but smears fast events; a short one does the reverse. Speech systems settle on 20–30 ms windows, short enough to catch consonants and long enough to separate harmonics.</p>
+</div>
+
+<div id="w-spec"></div>
+
+<h3>The mel scale and log compression</h3>
+<p>Humans hear pitch roughly logarithmically. The step from 100 to 200 Hz sounds like a big jump (an octave); 5,000 to 5,100 Hz is barely noticeable. The <strong>mel scale</strong> warps frequency to match. A <strong>mel filterbank</strong> of overlapping triangular filters, evenly spaced in mel, pools the linear FFT bins into 80 or 128 bands: many narrow bands at low frequencies and a few wide ones at high frequencies. Then take the log, because loudness perception is also roughly logarithmic and the log tames the enormous dynamic range.</p>
+
+<div class="formula" data-name="Mel scale and log-mel spectrogram">
+  <div class="tex">$$\htmlClass{t1}{m} = 2595 \cdot \log_{10}\!\left(1 + \frac{\htmlClass{t2}{f}}{700}\right), \qquad \htmlClass{t3}{\text{LM}[t,b]} = \log\Big(\epsilon + \sum_{k} \htmlClass{t4}{F_{b,k}}\; S[t,k]\Big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(m\)</dt><dd>perceptual pitch in mels</dd></div>
+    <div data-t="t2"><dt>\(f\)</dt><dd>frequency in Hz</dd></div>
+    <div data-t="t3"><dt>\(\text{LM}[t,b]\)</dt><dd>log-mel value at frame \(t\), mel band \(b\): the actual model input</dd></div>
+    <div data-t="t4"><dt>\(F_{b,k}\)</dt><dd>triangular filter \(b\)'s weight on FFT bin \(k\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Below about 1 kHz the mel scale is close to linear; above it, close to logarithmic. 100→200 Hz is about 133 mels apart; 5,000→5,100 Hz is about 20.</p>
+  <p class="why"><b>Why it matters</b>An 80-band log-mel frame replaces 201 linear FFT bins (for a 400-sample window) with fewer numbers, weighted toward the frequencies that carry speech. This formula is the HTK convention; librosa's default (and Whisper's filters) use the Slaney variant, which is exactly linear below 1 kHz. Same idea, slightly different numbers.</p>
+</div>
+
+<figure class="fig"><div id="fig-mel"></div>
+<figcaption>The mel curve (green) against a straight line (dashed). The grey ticks on the x-axis mark the centres of 24 filters spaced evenly in mel: crowded below 1 kHz, sparse above. The two marked steps are both 100 Hz wide, but the low one spans about 7× more mels.</figcaption></figure>
+
+<div class="intuition"><b>Intuition</b>
+<p>A log-mel spectrogram is a grayscale image with 80 rows and 100 columns per second. That's why audio models borrow so much from vision: you can run convolutions over it, or cut it into patches (the Audio Spectrogram Transformer, Gong et al., 2021, does exactly that).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="whisper" data-short="Whisper">Whisper: speech recognition as sequence-to-sequence</h2>
+
+<p>Whisper (Radford et al., 2022) is an encoder-decoder transformer, the original Vaswani et al. layout, trained on 680,000 hours of audio paired with transcripts collected from the internet. Its design is deliberately plain. What made it strong was the scale and diversity of that weakly supervised data, plus a token format that packs several tasks into one decoder.</p>
+
+<figure class="fig wide"><div id="fig-whisper"></div>
+<figcaption>Whisper's pipeline. Audio is resampled to 16 kHz and padded or trimmed to exactly 30 s. A log-mel spectrogram with a 25 ms window and 10 ms hop gives 80 bands × 3,000 frames (128 bands in large-v3). Two 1-D convolutions with kernel width 3 and GELU, the second with stride 2, halve the length to 1,500 positions. Sinusoidal positions are added and the encoder runs. The decoder is a text transformer that cross-attends to all 1,500 encoder outputs and is prompted with special tokens that select language and task.</figcaption></figure>
+
+<p>The numbers line up like this, and you can check every one: 30 s × 16,000 samples/s = 480,000 samples; ÷ 160-sample hop = 3,000 frames; ÷ stride 2 = 1,500 encoder positions, each covering 20 ms of audio. Model widths range from 384 (tiny) to 1,280 (large). The decoder's context is 448 tokens, which is plenty for 30 s of speech.</p>
+
+<table class="t">
+  <thead><tr><th>Token</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>&lt;|startoftranscript|&gt;</code></td><td>Begins every output.</td></tr>
+    <tr><td><code>&lt;|en|&gt;</code>, <code>&lt;|de|&gt;</code>, … (99 languages; 100 in large-v3)</td><td>Spoken language. Predict it to do language ID, or force it to skip detection.</td></tr>
+    <tr><td><code>&lt;|transcribe|&gt;</code> / <code>&lt;|translate|&gt;</code></td><td>Write in the source language, or translate to English (translation only goes into English).</td></tr>
+    <tr><td><code>&lt;|notimestamps|&gt;</code> or <code>&lt;|0.00|&gt;</code> … <code>&lt;|30.00|&gt;</code></td><td>Timestamp tokens in 20 ms steps mark segment boundaries, so the same decoder produces time-aligned subtitles.</td></tr>
+    <tr><td><code>&lt;|nospeech|&gt;</code></td><td>Predicted when the window has no speech; its probability is used to skip silent chunks.</td></tr>
+    <tr><td><code>&lt;|endoftext|&gt;</code></td><td>Ends the window. Long audio is processed as consecutive 30 s windows, using the last timestamp to decide where the next one starts.</td></tr>
+  </tbody>
+</table>
+
+<div class="flag"><b>Known behaviours worth testing</b>
+<p>Every input is padded to 30 s, so a 2-second voice command costs as much encoder compute as a 30-second one. Because the decoder is a language model, it can <strong>hallucinate</strong>: on silence, music or noise it sometimes emits fluent text that was never said, or repeats a phrase in a loop. Voice-activity detection (<code>vad_filter=True</code> in faster-whisper) and the no-speech probability help. <code>large-v3-turbo</code> (OpenAI, 2024) cuts the decoder from 32 layers to 4, which makes decoding much faster with a small accuracy cost.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="audio-tokens" data-short="Audio as discrete tokens">Audio as discrete tokens: neural codecs</h2>
+
+<p>Whisper's encoder produces continuous vectors, which is fine for <em>reading</em> audio. To <em>generate</em> audio with a language model, you want a vocabulary: the model predicts a token ID, and something turns IDs back into sound. Neural audio codecs provide exactly that. SoundStream (Zeghidour et al., 2021) and EnCodec (Défossez et al., 2022) share a shape:</p>
+<ol>
+  <li>A convolutional <strong>encoder</strong> downsamples the waveform into a short sequence of latent vectors. EnCodec's 24 kHz model has a total stride of 320, giving 75 latent frames per second.</li>
+  <li>A <strong>residual vector quantizer</strong> replaces each latent with a few codebook indices.</li>
+  <li>A convolutional <strong>decoder</strong> turns the quantized latents back into a waveform.</li>
+</ol>
+<p>All three are trained together, with reconstruction losses plus adversarial and perceptual losses so the output sounds right rather than merely matching sample by sample.</p>
+
+<div class="formula" data-name="Residual vector quantization (RVQ)">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{r}_0} = \htmlClass{t2}{\mathbf{z}}, \quad \htmlClass{t3}{c_q} = \arg\min_{c}\, \big\lVert \htmlClass{t1}{\mathbf{r}_{q-1}} - \htmlClass{t4}{\mathbf{C}_q}[c] \big\rVert, \quad \htmlClass{t1}{\mathbf{r}_q} = \htmlClass{t1}{\mathbf{r}_{q-1}} - \htmlClass{t4}{\mathbf{C}_q}[\htmlClass{t3}{c_q}], \quad \htmlClass{t5}{\hat{\mathbf{z}}} = \sum_{q=1}^{\htmlClass{t6}{Q}} \htmlClass{t4}{\mathbf{C}_q}[\htmlClass{t3}{c_q}]$$</div>
+  <dl class="legend">
+    <div data-t="t2"><dt>\(\mathbf{z}\)</dt><dd>the encoder's latent vector for one frame</dd></div>
+    <div data-t="t1"><dt>\(\mathbf{r}_q\)</dt><dd>residual: what's still unexplained after \(q\) stages</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{C}_q\)</dt><dd>codebook for stage \(q\): \(K\) learned vectors (EnCodec: \(K=1024\))</dd></div>
+    <div data-t="t3"><dt>\(c_q\)</dt><dd>the chosen index at stage \(q\): <b>this is the token</b></dd></div>
+    <div data-t="t5"><dt>\(\hat{\mathbf{z}}\)</dt><dd>reconstruction: the sum of the chosen codewords</dd></div>
+    <div data-t="t6"><dt>\(Q\)</dt><dd>number of stages (codebooks) used</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Stage 1 picks the nearest codeword. Stage 2 quantizes the leftover error, stage 3 the error after that, and so on. Each stage refines the last, the way you'd give directions: "Europe, then France, then Paris, then the 7th arrondissement."</p>
+  <p class="why"><b>Why it matters</b>One codebook with enough entries for high quality would need billions of entries. \(Q\) codebooks of \(K\) entries give \(K^Q\) combinations from only \(Q\cdot K\) stored vectors. And you can drop the later stages to lower the bitrate, which is how one EnCodec model serves 1.5 to 24 kbps.</p>
+</div>
+
+<div id="w-rvq"></div>
+
+<div class="formula" data-name="Codec token rate and bitrate">
+  <div class="tex">$$\htmlClass{t1}{\text{tokens/s}} = \htmlClass{t2}{f_{\text{frame}}} \times \htmlClass{t3}{Q}, \qquad \htmlClass{t4}{\text{bitrate}} = \htmlClass{t2}{f_{\text{frame}}} \times \htmlClass{t3}{Q} \times \log_2 \htmlClass{t5}{K}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>tokens/s</dt><dd>codec tokens a language model has to predict per second of audio</dd></div>
+    <div data-t="t2"><dt>\(f_{\text{frame}}\)</dt><dd>latent frames per second (sample rate ÷ encoder stride)</dd></div>
+    <div data-t="t3"><dt>\(Q\)</dt><dd>codebooks used per frame</dd></div>
+    <div data-t="t4"><dt>bitrate</dt><dd>bits per second of compressed audio</dd></div>
+    <div data-t="t5"><dt>\(K\)</dt><dd>entries per codebook</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>EnCodec at 6 kbps: 75 frames/s × 8 codebooks = 600 tokens per second, × 10 bits = 6,000 bits/s. A minute of audio is 36,000 tokens. Kyutai's Mimi codec (Défossez et al., 2024) runs at 12.5 frames/s with 8 codebooks of 2,048 entries: 100 tokens/s and 1.1 kbps.</p>
+  <p class="why"><b>Why it matters</b>Text is about 3–4 tokens per second of speech. Audio tokens are one to two orders of magnitude denser, which is why audio LMs care so much about low frame rates.</p>
+</div>
+
+<h3>Modelling several codebooks per frame</h3>
+<p>With \(Q\) tokens per frame, flattening them into one long sequence multiplies the length by \(Q\). Models avoid that in different ways. VALL-E (Wang et al., 2023) predicts the first codebook autoregressively and the rest in parallel. MusicGen (Copet et al., 2023) uses a "delay pattern" that offsets codebook \(q\) by \(q\) steps so all streams are predicted at once. AudioLM (Borsos et al., 2022) separates coarse <strong>semantic</strong> tokens (k-means clusters of self-supervised speech features, which capture what is said) from <strong>acoustic</strong> codec tokens (which capture how it sounds) and generates them in stages.</p>
+
+<!-- ================================================================== -->
+<h2 id="speech" data-short="Speech in, speech out">Speech in, speech out</h2>
+
+<p>A voice assistant has to hear, think, and talk. There are two ways to build one.</p>
+
+<figure class="fig wide"><div id="fig-cascade"></div>
+<figcaption>Top: a cascaded pipeline. Each stage is a separate model joined by text, which makes it easy to debug and swap parts, but tone, emotion and overlapping speech are lost at the ASR step, and latencies add up. Bottom: an audio-native model reads audio tokens (or encoder features) and writes audio tokens that a codec decoder turns into sound. Moshi (Défossez et al., 2024) works this way and is full-duplex: it models the user's and its own audio streams at once, so it can listen while talking.</figcaption></figure>
+
+<div class="formula" data-name="Voice response latency budget">
+  <div class="tex">$$\htmlClass{t1}{T_{\text{response}}} = \htmlClass{t2}{T_{\text{endpoint}}} + \htmlClass{t3}{T_{\text{ASR}}} + \htmlClass{t4}{T_{\text{LLM}}} + \htmlClass{t5}{T_{\text{TTS}}} + \htmlClass{t6}{T_{\text{net}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(T_{\text{response}}\)</dt><dd>time from the user's last word to the first sound of the reply</dd></div>
+    <div data-t="t2"><dt>\(T_{\text{endpoint}}\)</dt><dd>how long you wait in silence before deciding the user has finished</dd></div>
+    <div data-t="t3"><dt>\(T_{\text{ASR}}\)</dt><dd>time to final transcript after end of speech</dd></div>
+    <div data-t="t4"><dt>\(T_{\text{LLM}}\)</dt><dd>time to first token (TTFT, Module 08) plus enough tokens for the TTS to start</dd></div>
+    <div data-t="t5"><dt>\(T_{\text{TTS}}\)</dt><dd>time to first audio chunk from the speech synthesizer</dd></div>
+    <div data-t="t6"><dt>\(T_{\text{net}}\)</dt><dd>network round trips and audio buffering</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The user waits for the sum of every stage on the critical path. Streaming moves work off that path: transcribe while the user is still talking, and start speaking the first clause while the LLM is still writing the rest.</p>
+  <p class="why"><b>Why it matters</b>Conversation is fast. Stivers et al. (2009), measuring ten languages, found that the typical gap between turns is around 200 ms. A cascade that waits for silence, transcribes, generates the full reply and then synthesizes it easily exceeds a second and a half.</p>
+</div>
+
+<div id="w-latency"></div>
+
+<div class="grid2">
+  <div class="card"><div class="k">Cascaded</div><h4>Modular and inspectable</h4><p>Swap in a better ASR or a cheaper LLM independently. Every hop is text, so you can log it, evaluate it, filter it, and reuse your text tooling (RAG, tools, guardrails). Most production voice agents still look like this, with heavy streaming.</p></div>
+  <div class="card blue"><div class="k">Audio-native</div><h4>Lower latency, richer signal</h4><p>One model hears prosody, laughter and hesitation and can answer in kind. Harder to train (audio tokens are dense; text reasoning can degrade), harder to evaluate, and harder to steer. OpenAI has said GPT-4o processes audio natively but hasn't published the architecture.</p></div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="video" data-short="Video">Video: frames times tokens</h2>
+
+<p>A video is a stack of images plus an audio track. Models handle it the way you'd expect: sample some frames, turn each into visual tokens, and concatenate them in time order with timestamps or temporal position encodings. The problem is pure multiplication. Thirty frames a second at 576 tokens each is over a million tokens for one minute.</p>
+
+<div class="formula" data-name="Video token count">
+  <div class="tex">$$\htmlClass{t1}{T_{\text{video}}} = \frac{\htmlClass{t2}{d}\cdot\htmlClass{t3}{f_{\text{sample}}}}{\htmlClass{t4}{t_c}} \times \htmlClass{t5}{T_{\text{frame}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(T_{\text{video}}\)</dt><dd>visual tokens for the whole clip</dd></div>
+    <div data-t="t2"><dt>\(d\)</dt><dd>duration in seconds</dd></div>
+    <div data-t="t3"><dt>\(f_{\text{sample}}\)</dt><dd>frames sampled per second (typically 0.5–2, not 30)</dd></div>
+    <div data-t="t4"><dt>\(t_c\)</dt><dd>temporal compression: frames merged into one set of tokens. Qwen2-VL merges 2 consecutive frames with a 3-D patch</dd></div>
+    <div data-t="t5"><dt>\(T_{\text{frame}}\)</dt><dd>tokens per frame after spatial merging, e.g. 256 for a 448-pixel frame with 2×2 merge</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A 10-minute video at 1 fps with 256 tokens per frame and no temporal merge is 600 × 256 = 153,600 tokens, already beyond a 128K context.</p>
+</div>
+
+<div id="w-video"></div>
+
+<p>The tools for fitting video in are the image tools, applied harder: sample sparsely (0.5–2 fps, or pick scene-change keyframes), lower per-frame resolution, pool more aggressively (frames are spatially redundant and temporally redundant), and merge across time. Long-context models help: the Gemini 1.5 report (Gemini Team, 2024) demonstrated hour-scale video in context. Hosted APIs publish per-second token rates for video and audio, and those rates change between model versions.</p>
+
+<details class="think"><summary>Think first: what does sampling at 1 fps cost you?</summary>
+<div>Anything shorter than a second can fall between samples. A goal, a gesture, a two-second warning light, or a line of on-screen text that flashes by can be missing from the model's input entirely, and the model will answer from what it did see, often confidently. If your task depends on brief events, sample densely around them (or run a cheap detector first and only send the interesting segments).</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="limits" data-short="Limits and failure modes">Limits and failure modes, and how to test them</h2>
+
+<p>Most multimodal failures trace back to two causes covered above. Information was destroyed during conversion (downscaling, sparse sampling, bandwidth), or the language model's prior filled a gap with something plausible. Both are testable, cheaply, with synthetic inputs where you know the answer.</p>
+
+<table class="t">
+  <thead><tr><th>Failure</th><th>Why it happens</th><th>Cheap test</th></tr></thead>
+  <tbody>
+    <tr><td>Small text, dense documents</td><td>A 4,032-pixel scan squashed to 336 pixels is 12× smaller; a 10-pixel-tall digit becomes under one pixel. Even at native resolution, each token covers 14–28 px.</td><td>Render known text at sizes 6–40 px into an image; ask the model to transcribe it; plot accuracy against pixel height and against <code>max_pixels</code>.</td></tr>
+    <tr><td>Counting</td><td>Nothing in the architecture counts. Objects are spread across patch tokens and merged by pooling; answers drift toward common numbers.</td><td>Generate images with 1–20 identical dots or shapes; compare model count to ground truth; look for the count where accuracy collapses.</td></tr>
+    <tr><td>Spatial relations</td><td>Contrastive encoders are weak on word order and relations; "left of" depends on position embeddings surviving merges.</td><td>Pairs of images with swapped object positions ("red cube left of blue sphere" vs right). Score the pair, not each image, so guessing gets 25%.</td></tr>
+    <tr><td>Hallucinated details</td><td>The LLM's prior supplies typical objects ("a kitchen" → "a fridge"). POPE (Li et al., 2023) measures this with yes/no questions about absent objects.</td><td>Ask "Is there a X in the image?" for objects that are absent but likely in context; measure the false-yes rate.</td></tr>
+    <tr><td>Resolution cut-offs</td><td>Thin lines in charts, chart legends, and UI icons vanish below the token grid. Tiling caps (max tiles) silently downscale big images.</td><td>Log the processor's output grid (e.g. <code>image_grid_thw</code>); rerun the same question at 2–3 resolutions; watch for answers that change.</td></tr>
+    <tr><td>Audio hallucination</td><td>Whisper's decoder is an LM; given non-speech audio it may produce fluent text.</td><td>Feed silence, music, and noise clips; any non-empty transcript is a failure. Compare with and without VAD.</td></tr>
+    <tr><td>Missed events in video</td><td>Sparse frame sampling skips short events.</td><td>Insert a 0.5 s visual marker at a random time in a long clip; ask when it appears.</td></tr>
+  </tbody>
+</table>
+
+<div class="mle"><b>MLE angle · build the probe set before you pick the model</b>
+<p>Public benchmarks (MMMU, DocVQA, ChartQA, BLINK, and others) tell you roughly where a model stands. They won't tell you whether it reads <em>your</em> invoices at <em>your</em> scan resolution. Build 50–200 synthetic and real probes for the failure modes your product cares about, score them automatically (Module 13), and rerun them whenever you change the model, the processor settings, or the image pipeline. Resolution settings in particular are a quality knob and a cost knob at the same time.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. CLIP zero-shot classification</h3>
+<div class="code" data-lang="python" data-title="clip_zeroshot.py"><pre><code>
+import torch
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").eval()
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+image = Image.open("photo.jpg").convert("RGB")
+labels = ["dog", "cat", "bicycle", "bowl of ramen", "city skyline"]
+prompts = [f"a photo of a {l}." for l in labels]
+
+inputs = processor(text=prompts, images=image, return_tensors="pt", padding=True)
+print(inputs["pixel_values"].shape)          # [1, 3, 224, 224]: resized, cropped, normalized
+
+with torch.no_grad():
+    out = model(**inputs)
+probs = out.logits_per_image.softmax(dim=-1)[0]   # logits = cos_sim * exp(logit_scale)
+for l, p in sorted(zip(labels, probs.tolist()), key=lambda t: -t[1]):
+    print(f"{p:6.1%}  {l}")
+
+# The same thing by hand: normalized embeddings and the learned temperature
+with torch.no_grad():
+    u = model.get_image_features(pixel_values=inputs["pixel_values"])
+    v = model.get_text_features(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+u = u / u.norm(dim=-1, keepdim=True)
+v = v / v.norm(dim=-1, keepdim=True)
+print("raw cosine:", (u @ v.T)[0].tolist())       # small numbers, typically 0.1-0.35
+print("1/tau:", model.logit_scale.exp().item())   # about 100
+</code></pre></div>
+
+<h3>2. Ask a VLM about an image, and count its visual tokens</h3>
+<div class="code" data-lang="python" data-title="qwen25_vl.py (transformers ≥ 4.49, pip install qwen-vl-utils)"><pre><code>
+import torch
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+# min/max_pixels bound the visual token count: each token covers 28x28 pixels
+processor = AutoProcessor.from_pretrained(model_id, min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28)
+
+messages = [{"role": "user", "content": [
+    {"type": "image", "image": "file:///path/to/chart.png"},
+    {"type": "text", "text": "What is the highest value in this chart, and which month is it?"},
+]}]
+text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+image_inputs, video_inputs = process_vision_info(messages)
+inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                   padding=True, return_tensors="pt").to(model.device)
+
+t, h, w = inputs["image_grid_thw"][0].tolist()   # grid in 14-px patches
+print(f"patch grid {h}x{w} -> {t * h * w // 4} visual tokens; prompt total {inputs['input_ids'].shape[1]}")
+
+out = model.generate(**inputs, max_new_tokens=128)
+answer = processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+print(answer)
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="On a Mac with mlx-vlm"><pre><code>
+pip install -U mlx-vlm
+python -m mlx_vlm.generate --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit \
+  --image chart.png --prompt "What is the highest value in this chart?" \
+  --max-tokens 128 --temperature 0.0
+</code></pre></div>
+
+<h3>3. A log-mel spectrogram with librosa</h3>
+<div class="code" data-lang="python" data-title="logmel.py"><pre><code>
+import librosa
+import numpy as np
+
+y, sr = librosa.load("speech.wav", sr=16000, mono=True)   # resamples to 16 kHz, float32 in [-1, 1]
+print(len(y), "samples =", len(y) / sr, "s")
+
+S = librosa.feature.melspectrogram(
+    y=y, sr=sr,
+    n_fft=400,        # 25 ms window
+    hop_length=160,   # 10 ms hop -> 100 frames per second
+    n_mels=80,        # Whisper v1-v3 small/medium; large-v3 uses 128
+    power=2.0,
+)
+log_S = np.log10(np.maximum(S, 1e-10))
+log_S = np.maximum(log_S, log_S.max() - 8.0)   # Whisper-style: clamp to 80 dB of dynamic range
+log_S = (log_S + 4.0) / 4.0                    # ...and rescale to roughly [-1, 1]
+print(log_S.shape)   # (80, 1 + len(y) // 160); Whisper drops the last frame to get exactly 3000 per 30 s
+</code></pre></div>
+
+<h3>4. Transcribe with Whisper</h3>
+<div class="code" data-lang="python" data-title="whisper_inspect.py (pip install -U openai-whisper)"><pre><code>
+import whisper
+
+model = whisper.load_model("small")
+audio = whisper.load_audio("speech.wav")          # ffmpeg decode + resample to 16 kHz
+audio = whisper.pad_or_trim(audio)                # exactly 480,000 samples (30 s)
+mel = whisper.log_mel_spectrogram(audio, n_mels=model.dims.n_mels).to(model.device)
+print(mel.shape)                                  # torch.Size([80, 3000])
+
+_, probs = model.detect_language(mel)
+print("language:", max(probs, key=probs.get))
+result = whisper.decode(model, mel, whisper.DecodingOptions(fp16=False))
+print(result.text, "| no_speech_prob:", round(result.no_speech_prob, 3))
+
+# Full file, any length, with timestamps:
+for seg in model.transcribe("speech.wav")["segments"]:
+    print(f"[{seg['start']:6.2f} -> {seg['end']:6.2f}] {seg['text']}")
+</code></pre></div>
+
+<div class="code" data-lang="python" data-title="faster-whisper (CTranslate2, int8 on CPU)"><pre><code>
+from faster_whisper import WhisperModel
+
+model = WhisperModel("small", device="cpu", compute_type="int8")
+segments, info = model.transcribe("speech.wav", beam_size=5, vad_filter=True)
+print(info.language, round(info.language_probability, 2))
+for s in segments:                      # a generator: decoding happens as you iterate
+    print(f"[{s.start:6.2f} -> {s.end:6.2f}] {s.text}")
+</code></pre></div>
+
+<div class="code" data-lang="python" data-title="mlx-whisper (Apple silicon)"><pre><code>
+import mlx_whisper
+
+result = mlx_whisper.transcribe("speech.wav", path_or_hf_repo="mlx-community/whisper-large-v3-turbo")
+print(result["text"])
+</code></pre></div>
+
+<div class="code" data-lang="python" data-title="Word error rate (pip install jiwer)"><pre><code>
+from jiwer import wer
+
+reference = open("speech_reference.txt").read().lower()
+hypothesis = result["text"].lower()
+print(f"WER = {wer(reference, hypothesis):.1%}")   # (substitutions + deletions + insertions) / reference words
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have all four of these, with numbers you produced yourself:</p>
+<ol>
+  <li><strong>CLIP:</strong> top-1 accuracy on 20+ of your own photos over 5+ labels, for bare labels vs "a photo of a {label}." prompts. You can explain why the raw cosines are around 0.2–0.3 but the probabilities are confident.</li>
+  <li><strong>VLM tokens:</strong> for one screenshot, the hand-computed visual token count matches <code>image_grid_thw</code> (t·h·w/4). Then lower <code>max_pixels</code> step by step until the model misreads small text, and record the token count where it breaks.</li>
+  <li><strong>Audio:</strong> <code>mel.shape</code> is (80, 3000) for a 30 s window, and you can derive both numbers. A spectrogram of yourself saying "sss" and "ooo" shows energy above 4 kHz only for "sss".</li>
+  <li><strong>Whisper:</strong> WER and real-time factor (processing time ÷ audio duration) for two model sizes on the same 2-minute clip, plus the output on 10 s of silence with and without VAD.</li>
+</ol>
+</div>
+
+<h3>Further reading</h3>
+<ul>
+  <li>Dosovitskiy et al., 2020. <a href="https://arxiv.org/abs/2010.11929">An Image is Worth 16x16 Words (ViT)</a></li>
+  <li>Radford et al., 2021. <a href="https://arxiv.org/abs/2103.00020">Learning Transferable Visual Models From Natural Language Supervision (CLIP)</a></li>
+  <li>Zhai et al., 2023. <a href="https://arxiv.org/abs/2303.15343">Sigmoid Loss for Language Image Pre-Training (SigLIP)</a></li>
+  <li>Liu et al., 2023. <a href="https://arxiv.org/abs/2304.08485">Visual Instruction Tuning (LLaVA)</a> and <a href="https://arxiv.org/abs/2310.03744">Improved Baselines (LLaVA-1.5)</a></li>
+  <li>Alayrac et al., 2022. <a href="https://arxiv.org/abs/2204.14198">Flamingo</a>; Chameleon Team, 2024. <a href="https://arxiv.org/abs/2405.09818">Chameleon</a>; Wang et al., 2024. <a href="https://arxiv.org/abs/2409.12191">Qwen2-VL</a></li>
+  <li>Radford et al., 2022. <a href="https://arxiv.org/abs/2212.04356">Robust Speech Recognition via Large-Scale Weak Supervision (Whisper)</a></li>
+  <li>Zeghidour et al., 2021. <a href="https://arxiv.org/abs/2107.03312">SoundStream</a>; Défossez et al., 2022. <a href="https://arxiv.org/abs/2210.13438">EnCodec</a>; Défossez et al., 2024. <a href="https://arxiv.org/abs/2410.00037">Moshi</a></li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="14-main" data-title="Check yourself · Seeing &amp; hearing">
+  <div class="q" data-answer="1"><p>A ViT-B/16 receives a 224×224 image. How many <em>patch</em> tokens does it create (not counting [CLS])?</p>
+    <ol><li>14</li><li>196</li><li>256</li><li>3,136</li></ol>
+    <div class="explain">224 / 16 = 14 patches per side, and 14 × 14 = 196. With the [CLS] token the sequence is 197. 256 would be a 16×16 grid (e.g. 224 px with 14 px patches is 16×16 = 256); 3,136 would be 4-pixel patches.</div></div>
+  <div class="q" data-answer="2"><p>Using \(m = 2595\log_{10}(1 + f/700)\): the step from 200 to 300 Hz and the step from 6,000 to 6,100 Hz are both 100 Hz. Roughly how much larger is the low step in mels?</p>
+    <ol><li>About the same</li><li>About 2×</li><li>About 7×</li><li>About 60×</li></ol>
+    <div class="explain">m(200) ≈ 283, m(300) ≈ 402, a step of about 119 mels. m(6000) ≈ 2,546, m(6100) ≈ 2,562, about 17 mels. 119 / 17 ≈ 7. That's why mel filterbanks spend most of their bands on low frequencies, where pitch differences are most audible.</div></div>
+  <div class="q" data-answer="0"><p>Whisper gets a 30-second clip. How many positions does its encoder attend over?</p>
+    <ol><li>1,500</li><li>3,000</li><li>480,000</li><li>750</li></ol>
+    <div class="explain">30 s × 16,000 = 480,000 samples. A 160-sample (10 ms) hop gives 3,000 log-mel frames. The second convolution in the stem has stride 2, so the encoder sees 1,500 positions, each covering 20 ms.</div></div>
+  <div class="q" data-answer="3"><p>Why can CLIP classify images into categories it never saw labelled examples of?</p>
+    <ol><li>It was secretly trained on ImageNet's labels</li><li>It has a 1,000-way classification head that generalizes</li><li>Its image encoder memorizes the label of every web image</li><li>Classes are defined by text: each label's prompt is embedded by the text encoder and the image is matched to the nearest one</li></ol>
+    <div class="explain">The contrastive loss puts images and captions in one space. At test time the text encoder turns "a photo of a {label}." into a vector for each class, and those vectors act as the classifier's weights. Any label you can write becomes a class, with no retraining.</div></div>
+  <div class="q" data-answer="1"><p>A 5-minute video is sampled at 2 fps, each frame becomes 256 tokens, and pairs of consecutive frames are merged (temporal compression 2). How many visual tokens?</p>
+    <ol><li>38,400</li><li>76,800</li><li>153,600</li><li>600</li></ol>
+    <div class="explain">300 s × 2 fps = 600 frames. Merging pairs gives 300 frame groups. 300 × 256 = 76,800 tokens. Without the temporal merge it would be 153,600, beyond a 128K window.</div></div>
+  <div class="q" data-answer="2"><p>You record a 10 kHz whistle at a 16 kHz sample rate with no anti-aliasing filter. What does a spectrogram of the recording show?</p>
+    <ol><li>Nothing: frequencies above Nyquist are removed automatically</li><li>A 10 kHz tone</li><li>A 6 kHz tone</li><li>An 8 kHz tone</li></ol>
+    <div class="explain">The Nyquist frequency is 8 kHz. A 10 kHz tone folds back to |10 − 16| = 6 kHz. It doesn't disappear and can't be told apart from a real 6 kHz tone, which is why resampling must low-pass filter first.</div></div>
+  <div class="q" data-answer="0"><p>A VLM with a fixed 336-pixel input reads a 4032×3024 photo of a receipt and makes up several prices. What's the most likely root cause?</p>
+    <ol><li>The photo was shrunk about 12×, so each 14-pixel patch covers roughly 170 original pixels and the digits are a pixel or two tall; the LLM filled in plausible numbers</li><li>The tokenizer can't represent digits</li><li>Sampling temperature was too high</li><li>The vision encoder was never trained on any text</li></ol>
+    <div class="explain">4032 / 336 = 12. Printed digits maybe 20–30 px tall become 2–3 px, under one patch. The information is gone before the LLM sees it, and its language prior writes something receipt-shaped. Fix it with tiling or native-resolution processing, or by cropping the region first, and test with rendered text at known sizes.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, heatmap, widget, fmtNum, fmtSI, rng, softmax, palette, clamp, lerp, heat } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const INK = palette.ink, MUTED = palette.muted;
+  const COL = { img: palette.blue, aud: palette.plum, vid: palette.teal, txt: palette.green };
+  const tint = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+  const rgbStr = p => `rgb(${p[0]},${p[1]},${p[2]})`;
+
+  // A tiny procedural scene (sky, sun, hill, tree, house) sampled at any resolution. u, v in [0, 1].
+  function scene(u, v) {
+    let c = [150 + 50 * v, 190 + 35 * v, 238 - 8 * v];
+    const d2 = (cx, cy) => (u - cx) ** 2 + (v - cy) ** 2;
+    if (d2(0.78, 0.2) < 0.11 ** 2) c = [250, 204, 72];
+    const ground = 0.66 - 0.07 * Math.sin(Math.PI * u * 1.2 + 0.3);
+    if (v > ground) c = [68 - 30 * (v - ground), 142 - 60 * (v - ground), 74];
+    if (u > 0.64 && u < 0.69 && v > 0.52 && v < 0.74) c = [112, 76, 46];
+    if (d2(0.665, 0.47) < 0.085 ** 2) c = [42, 112, 62];
+    if (u > 0.16 && u < 0.46 && v > 0.5 && v < 0.8) c = [184, 76, 56];
+    if (v <= 0.5 && v > 0.3 && Math.abs(u - 0.31) < (v - 0.3) / 0.2 * 0.19) c = [92, 58, 50];
+    if (u > 0.27 && u < 0.35 && v > 0.63 && v < 0.8) c = [74, 46, 36];
+    if (u > 0.38 && u < 0.44 && v > 0.56 && v < 0.62) c = [244, 228, 150];
+    return c;
+  }
+  function rasterize(n, ss) {
+    ss = ss || 3;
+    const img = [];
+    for (let y = 0; y < n; y++) {
+      const row = [];
+      for (let x = 0; x < n; x++) {
+        let r = 0, g = 0, b = 0;
+        for (let i = 0; i < ss; i++) for (let j = 0; j < ss; j++) {
+          const c = scene((x + (j + 0.5) / ss) / n, (y + (i + 0.5) / ss) / n);
+          r += c[0]; g += c[1]; b += c[2];
+        }
+        const k = ss * ss;
+        row.push([Math.round(r / k), Math.round(g / k), Math.round(b / k)]);
+      }
+      img.push(row);
+    }
+    return img;
+  }
+
+  // SVG figure kit: one arrowhead marker per figure (unique id)
+  function kit(host, W, H, id) {
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+    host.appendChild(s);
+    const defs = svg("defs");
+    defs.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: MUTED })));
+    s.appendChild(defs);
+    const add = n => { s.appendChild(n); return n; };
+    return {
+      s, add,
+      rect: (x, y, w, h, fill, o) => { o = o || {}; return add(svg("rect", { x, y, width: w, height: h, rx: o.rx != null ? o.rx : 3, fill, stroke: o.stroke || "none", "stroke-width": o.sw || 1, "stroke-dasharray": o.dash || null })); },
+      text: (x, y, t, o) => { o = o || {}; return add(svg("text", { x, y, "text-anchor": o.anchor || "middle", "font-size": o.size || 12, fill: o.color || INK, "font-weight": o.weight || null, class: o.mono ? "mono" : null, text: t })); },
+      box: (x, y, w, h, title, sub, o) => {
+        o = o || {};
+        add(svg("rect", { x, y, width: w, height: h, rx: 9, fill: o.fill || "#fff", stroke: o.stroke || "rgba(28,27,25,.28)", "stroke-width": 1.2, "stroke-dasharray": o.dash || null }));
+        const lines = sub ? sub.split("|") : [];
+        const ty = y + h / 2 - (lines.length * 13) / 2 + 4;
+        add(svg("text", { x: x + w / 2, y: ty, "text-anchor": "middle", "font-size": o.size || 13, "font-weight": 600, fill: o.color || INK, text: title }));
+        lines.forEach((t, i) => add(svg("text", { x: x + w / 2, y: ty + 14 + i * 13, "text-anchor": "middle", "font-size": 11, fill: MUTED, text: t })));
+      },
+      arrow: (x1, y1, x2, y2, o) => {
+        o = o || {};
+        const d = o.curve ? `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}` : o.vcurve ? `M${x1},${y1} C${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2}` : `M${x1},${y1} L${x2},${y2}`;
+        return add(svg("path", { d, fill: "none", stroke: o.color || MUTED, "stroke-width": o.w || 1.3, "stroke-dasharray": o.dash || null, "marker-end": `url(#${id})` }));
+      },
+      line: (x1, y1, x2, y2, o) => { o = o || {}; return add(svg("line", { x1, y1, x2, y2, stroke: o.color || MUTED, "stroke-width": o.w || 1, "stroke-dasharray": o.dash || null })); },
+      raster: (x, y, img, cell, map) => { img.forEach((row, i) => row.forEach((p, j) => add(svg("rect", { x: x + j * cell, y: y + i * cell, width: cell + 0.35, height: cell + 0.35, fill: rgbStr(map ? map(p) : p) })))); },
+      vecs: (x, y, n, color, o) => {
+        o = o || {};
+        const w = o.w || 7, h = o.h || 40, g = o.gap != null ? o.gap : 4;
+        for (let i = 0; i < n; i++) add(svg("rect", { x: x + i * (w + g), y, width: w, height: h, rx: 2, fill: tint(color, 0.18 + 0.5 * ((i * 37) % 10) / 10), stroke: color, "stroke-width": 0.8 }));
+        return x + n * (w + g) - g;
+      }
+    };
+  }
+
+  /* ---------------------------------------------------------- FIG: everything becomes vectors */
+  (function () {
+    const K = kit(document.getElementById("fig-everything"), 980, 440, "arr-every");
+    const big = rasterize(12, 2);
+    const rowsY = [30, 170, 310];
+    const names = [["Image", COL.img], ["Audio", COL.aud], ["Video", COL.vid]];
+    names.forEach(([n, c], i) => K.text(40, rowsY[i] - 6, n, { anchor: "start", size: 13, weight: 700, color: c }));
+    const step = (x1, x2, y, label) => { K.arrow(x1, y, x2, y); const ls = label ? label.split("|") : []; ls.forEach((t, i) => K.text((x1 + x2) / 2, y - 8 - (ls.length - 1 - i) * 13, t, { size: 10.5, color: MUTED, mono: true })); };
+
+    // image row
+    let y0 = rowsY[0];
+    K.raster(40, y0 + 5, big, 8);
+    step(146, 218, y0 + 53, "patchify");
+    for (let bi = 0; bi < 3; bi++) for (let bj = 0; bj < 3; bj++) for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++)
+      K.rect(225 + bj * 33 + j * 7, y0 + 6 + bi * 33 + i * 7, 7.3, 7.3, rgbStr(big[bi * 4 + i][bj * 4 + j]), { rx: 0 });
+    step(330, 388, y0 + 53, "flatten");
+    for (let p = 0; p < 9; p++) {
+      const bi = Math.floor(p / 3), bj = p % 3;
+      for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) K.rect(395 + p * 18 + j * 3.5, y0 + 46 + i * 3.5, 3.8, 3.8, rgbStr(big[bi * 4 + i][bj * 4 + j]), { rx: 0 });
+    }
+    step(560, 604, y0 + 53, "\u00d7 E");
+    K.vecs(610, y0 + 30, 9, COL.img, { w: 7, gap: 3, h: 46 });
+    K.text(370, y0 + 118, "336\u00d7336\u00d73 = 338,688 numbers  \u2192  24\u00d724 = 576 patch tokens", { size: 11, color: MUTED, mono: true });
+
+    // audio row
+    y0 = rowsY[1];
+    let d = "";
+    for (let i = 0; i <= 96; i++) { const t = i / 96; const v = Math.sin(t * 40) * 0.6 + Math.sin(t * 97) * 0.3; const env = Math.sin(Math.PI * t) * (0.5 + 0.5 * Math.sin(t * 9)); d += (i ? "L" : "M") + (40 + i).toFixed(1) + "," + (y0 + 53 - 34 * v * env).toFixed(1); }
+    K.add(svg("path", { d, fill: "none", stroke: COL.aud, "stroke-width": 1.4 }));
+    K.line(40, y0 + 53, 136, y0 + 53, { color: palette.line });
+    step(146, 218, y0 + 53, "STFT + mel");
+    const spec = (col, row) => { const f1 = 6 - 2.5 * Math.sin(col / 2.2), f2 = 2.2 + Math.cos(col / 3); return clamp(Math.exp(-((row - f1) ** 2) / 1.6) + 0.8 * Math.exp(-((row - f2) ** 2) / 1.2) + 0.08, 0, 1); };
+    for (let c = 0; c < 14; c++) for (let r = 0; r < 9; r++) K.rect(225 + c * 7, y0 + 22 + r * 7, 7.3, 7.3, tint(COL.aud, spec(c, r) * 0.85), { rx: 0 });
+    K.rect(225 + 5 * 7, y0 + 21, 7, 65, "none", { stroke: INK, sw: 1.2, rx: 1 });
+    step(330, 388, y0 + 53, "10 ms|frames");
+    for (let c = 0; c < 9; c++) for (let r = 0; r < 9; r++) K.rect(395 + c * 18, y0 + 22 + r * 7, 10, 7.3, tint(COL.aud, spec(c, r) * 0.85), { rx: 0 });
+    step(560, 604, y0 + 53, "conv|stem");
+    K.vecs(610, y0 + 30, 9, COL.aud, { w: 7, gap: 3, h: 46 });
+    K.text(370, y0 + 118, "30 s \u00d7 16 kHz = 480,000 samples  \u2192  3,000 frames  \u2192  1,500 tokens (Whisper)", { size: 11, color: MUTED, mono: true });
+
+    // video row
+    y0 = rowsY[2];
+    const small = rasterize(10, 2);
+    [[40, 4], [48, 12], [56, 20]].forEach(([x, y]) => { K.rect(x - 2, y0 + y - 2, 74, 74, "#fff", { stroke: palette.line, rx: 2 }); K.raster(x, y0 + y, small, 7); });
+    step(146, 218, y0 + 53, "sample|1\u20132 fps");
+    const tiny = rasterize(6, 2);
+    [0, 1, 2].forEach(f => {
+      const fx = 225 + f * 42;
+      for (let qi = 0; qi < 2; qi++) for (let qj = 0; qj < 2; qj++) for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+        K.rect(fx + qj * 17 + j * 5, y0 + 34 + qi * 17 + i * 5, 5.3, 5.3, rgbStr(tiny[qi * 3 + i][qj * 3 + j]), { rx: 0 });
+      K.text(fx + 16, y0 + 84, ["t=0 s", "t=0.5", "t=1.0"][f], { size: 9.5, color: MUTED, mono: true });
+    });
+    step(360, 388, y0 + 53, "");
+    K.text(395, y0 + 40, "patchify each frame,", { size: 10.5, color: MUTED, mono: true, anchor: "start" });
+    K.text(395, y0 + 54, "merge 2\u00d72 neighbours,", { size: 10.5, color: MUTED, mono: true, anchor: "start" });
+    K.text(395, y0 + 68, "concatenate in time", { size: 10.5, color: MUTED, mono: true, anchor: "start" });
+    step(560, 604, y0 + 53, "");
+    K.vecs(610, y0 + 30, 12, COL.vid, { w: 5, gap: 2.6, h: 46 });
+    K.text(370, y0 + 118, "60 s \u00d7 2 fps \u00d7 256 tokens/frame = 30,720 tokens", { size: 11, color: MUTED, mono: true });
+
+    // transformer
+    K.box(762, 96, 188, 284, "Transformer", "decoder from Module 06|every row has width D|text and non-text tokens|attend to each other", { fill: "#fbfaf7", size: 15 });
+    K.text(856, 22, "text tokens", { size: 11, color: COL.txt, mono: true });
+    K.vecs(818, 32, 8, COL.txt, { w: 7, gap: 4, h: 34 });
+    K.arrow(856, 70, 856, 94);
+    rowsY.forEach(y => K.arrow(704, y + 53, 760, Math.min(Math.max(y + 53, 110), 366), { curve: true }));
+    K.arrow(856, 382, 856, 410);
+    K.text(856, 424, "next token", { size: 11, color: MUTED, mono: true });
+    K.text(856, 437, "(text, audio or image codes)", { size: 10.5, color: MUTED, mono: true });
+  })();
+
+  /* ---------------------------------------------------------- FIG: ViT */
+  (function () {
+    const K = kit(document.getElementById("fig-vit"), 900, 330, "arr-vit");
+    const img = rasterize(9, 3);
+    K.raster(20, 110, img, 12);
+    for (let k = 1; k < 3; k++) { K.line(20 + k * 36, 110, 20 + k * 36, 218, { color: "#fff", w: 2.2 }); K.line(20, 110 + k * 36, 128, 110 + k * 36, { color: "#fff", w: 2.2 }); }
+    for (let p = 0; p < 9; p++) K.text(20 + (p % 3) * 36 + 8, 110 + Math.floor(p / 3) * 36 + 12, String(p + 1), { size: 9.5, color: "#fff", weight: 700, anchor: "start" });
+    K.text(74, 236, "9 patches, read", { size: 11, color: MUTED, mono: true });
+    K.text(74, 250, "row by row \u2192", { size: 11, color: MUTED, mono: true });
+    const sx = i => 190 + i * 66;
+    // tokens row
+    K.rect(sx(0), 262, 40, 40, tint(palette.gold, 0.18), { stroke: palette.gold, rx: 5, dash: "3 2" });
+    K.text(sx(0) + 20, 286, "CLS", { size: 11, mono: true, weight: 600 });
+    for (let p = 0; p < 9; p++) {
+      const bi = Math.floor(p / 3), bj = p % 3;
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) K.rect(sx(p + 1) + j * 13.3, 262 + i * 13.3, 13.6, 13.6, rgbStr(img[bi * 3 + i][bj * 3 + j]), { rx: 0 });
+      K.arrow(sx(p + 1) + 20, 258, sx(p + 1) + 20, 234);
+    }
+    K.text(sx(5) + 20, 320, "flattened patches  x\u209a\u00b9 \u2026 x\u209a\u2079  (each P\u00b2\u00b7C numbers)", { size: 11, color: MUTED, mono: true });
+    K.box(sx(1) - 6, 200, sx(9) - sx(1) + 52, 32, "Linear projection E  (P\u00b2\u00b7C \u2192 D), shared by every patch", null, { fill: tint(COL.img, 0.08), stroke: tint(COL.img, 0.5), size: 12 });
+    K.arrow(sx(0) + 20, 258, sx(0) + 20, 186);
+    for (let i = 0; i < 10; i++) {
+      if (i > 0) K.arrow(sx(i) + 20, 198, sx(i) + 20, 186);
+      K.add(svg("circle", { cx: sx(i) + 20, cy: 172, r: 11, fill: "#fff", stroke: palette.gold, "stroke-width": 1.2 }));
+      K.text(sx(i) + 20, 176, String(i), { size: 10.5, mono: true, color: palette.gold });
+      K.arrow(sx(i) + 20, 160, sx(i) + 20, 144);
+    }
+    K.text(sx(0) - 12, 176, "+ E_pos", { size: 11, mono: true, color: palette.gold, anchor: "end" });
+    K.box(sx(0) - 10, 72, sx(9) - sx(0) + 60, 70, "Transformer encoder \u00d7 L", "bidirectional self-attention + MLP, no causal mask|ViT-B: L = 12, D = 768 \u00b7 ViT-L: L = 24, D = 1,024", { fill: "#fbfaf7", size: 14 });
+    K.box(20, 14, 130, 46, "MLP head", "\u2192 class label", { fill: tint(palette.gold, 0.1) });
+    K.arrow(sx(0) + 20, 70, 152, 38, { curve: true });
+    K.arrow(sx(6) + 20, 70, sx(6) + 20, 34);
+    K.text(sx(6) + 32, 30, "VLMs keep all N patch outputs instead", { size: 11, color: MUTED, mono: true, anchor: "start" });
+  })();
+
+  /* ---------------------------------------------------------- FIG: CLIP */
+  (function () {
+    const K = kit(document.getElementById("fig-clip"), 900, 320, "arr-clip");
+    const im = rasterize(6, 2);
+    const maps = [p => p, p => [p[2], p[1], p[0]], p => [p[1], p[0], p[2]], p => { const g = Math.round(0.3 * p[0] + 0.59 * p[1] + 0.11 * p[2]); return [g, g, g]; }];
+    const caps = ["T1  a dog on a beach", "T2  a red sports car", "T3  a bowl of ramen", "T4  a city at night"];
+    // text pipeline (top)
+    caps.forEach((c, i) => K.text(330, 20 + i * 13, c, { size: 10.5, mono: true, anchor: "start", color: COL.txt }));
+    K.arrow(478, 38, 556, 38);
+    K.box(560, 20, 280, 38, "Text encoder (transformer)", null, { fill: tint(COL.txt, 0.07), stroke: tint(COL.txt, 0.5), size: 12.5 });
+    const cx0 = 560, cy0 = 90, cw = 70, ch = 46;
+    for (let j = 0; j < 4; j++) { K.arrow(cx0 + j * cw + cw / 2, 60, cx0 + j * cw + cw / 2, 72); K.text(cx0 + j * cw + cw / 2, 84, "v" + (j + 1), { size: 11.5, mono: true, color: COL.txt, weight: 600 }); }
+    // image pipeline (left)
+    [[20, 128], [60, 128], [20, 186], [60, 186]].forEach(([x, y], i) => { K.raster(x, y, im, 6, maps[i]); K.text(x + 18, y + 47, "I" + (i + 1), { size: 9.5, mono: true, color: MUTED }); });
+    K.arrow(100, 182, 128, 182);
+    K.box(132, 152, 140, 60, "Image encoder", "ViT or ResNet", { fill: tint(COL.img, 0.07), stroke: tint(COL.img, 0.5) });
+    K.arrow(274, 182, 298, 182);
+    for (let i = 0; i < 4; i++) { K.rect(302 + i * 12, 162, 8, 40, tint(COL.img, 0.3 + 0.15 * i), { stroke: COL.img, sw: 0.8, rx: 2 }); }
+    K.text(325, 218, "u1 \u2026 u4", { size: 10.5, mono: true, color: COL.img });
+    K.arrow(352, 182, 512, 182, { curve: true });
+    K.text(430, 174, "normalize, dot", { size: 10.5, mono: true, color: MUTED });
+    // matrix
+    for (let i = 0; i < 4; i++) {
+      K.text(cx0 - 10, cy0 + i * ch + ch / 2 + 4, "u" + (i + 1), { size: 11.5, mono: true, color: COL.img, weight: 600, anchor: "end" });
+      for (let j = 0; j < 4; j++) {
+        const diag = i === j;
+        K.rect(cx0 + j * cw + 2, cy0 + i * ch + 2, cw - 4, ch - 4, diag ? tint(palette.green, 0.75) : "#f3f2ec", { rx: 4 });
+        K.text(cx0 + j * cw + cw / 2, cy0 + i * ch + ch / 2 + 4, `u${i + 1}\u00b7v${j + 1}`, { size: 11, mono: true, color: diag ? "#fff" : MUTED, weight: diag ? 600 : null });
+      }
+    }
+    K.text(700, 294, "each row: softmax over captions \u2192 image\u2192text loss", { size: 11, color: MUTED });
+    K.text(700, 310, "each column: softmax over images \u2192 text\u2192image loss", { size: 11, color: MUTED });
+  })();
+
+  /* ---------------------------------------------------------- FIG: LLaVA */
+  (function () {
+    const K = kit(document.getElementById("fig-llava"), 940, 300, "arr-llava");
+    K.raster(20, 30, rasterize(10, 2), 8);
+    K.text(60, 126, "image", { size: 11, mono: true, color: MUTED });
+    K.arrow(104, 70, 124, 70);
+    K.box(128, 34, 150, 72, "Vision encoder", "CLIP ViT-L/14 @ 336 px|frozen", { fill: tint(COL.img, 0.07), stroke: tint(COL.img, 0.5) });
+    K.arrow(280, 70, 302, 70);
+    K.vecs(306, 48, 10, COL.img, { w: 6, gap: 3, h: 44 });
+    K.text(345, 112, "576 \u00d7 1,024", { size: 11, mono: true, color: MUTED });
+    K.arrow(392, 70, 420, 70);
+    K.box(424, 34, 160, 72, "Projector", "2-layer MLP, GELU|trained in stages 1 and 2", { fill: tint(palette.gold, 0.1), stroke: tint(palette.gold, 0.6) });
+    K.arrow(586, 70, 610, 70);
+    K.vecs(614, 44, 10, COL.img, { w: 7, gap: 3, h: 52 });
+    K.text(664, 112, "576 \u00d7 4,096", { size: 11, mono: true, color: MUTED });
+    // sequence strip
+    const sy = 158;
+    let x = 40;
+    K.text(40, sy - 8, "prompt sequence", { size: 11, mono: true, color: MUTED, anchor: "start" });
+    x = K.vecs(x, sy, 6, COL.txt, { w: 9, gap: 3, h: 30 }) + 10;
+    const vStart = x;
+    x = K.vecs(x, sy, 18, COL.img, { w: 9, gap: 3, h: 30 }) + 10;
+    const vEnd = x - 10;
+    x = K.vecs(x, sy, 9, COL.txt, { w: 9, gap: 3, h: 30 });
+    K.text(73, sy + 46, "system text", { size: 10.5, mono: true, color: COL.txt });
+    K.text((vStart + vEnd) / 2, sy + 46, "576 image tokens", { size: 10.5, mono: true, color: COL.img });
+    K.text(x - 52, sy + 46, "user question", { size: 10.5, mono: true, color: COL.txt });
+    K.arrow(664, 120, (vStart + vEnd) / 2 + 40, sy - 4, { vcurve: true });
+    K.box(40, 222, x - 40, 56, "LLM decoder (e.g. Vicuna-7B)", "frozen in stage 1 \u00b7 trained in stage 2 \u00b7 causal attention over all tokens", { fill: "#fbfaf7" });
+    [100, (vStart + vEnd) / 2, x - 50].forEach(ax => K.arrow(ax, sy + 52, ax, 220));
+    K.arrow(x + 2, 250, x + 46, 250);
+    K.text(x + 52, 246, "answer tokens", { size: 12, anchor: "start", weight: 600 });
+    K.text(x + 52, 262, "loss on these only", { size: 11, anchor: "start", color: MUTED });
+  })();
+
+  /* ---------------------------------------------------------- FIG: fusion styles */
+  (function () {
+    const K = kit(document.getElementById("fig-fusion"), 940, 290, "arr-fusion");
+    const panel = (x0, title, sub) => { K.text(x0 + 150, 20, title, { size: 13.5, weight: 700 }); K.text(x0 + 150, 36, sub, { size: 11, color: MUTED, mono: true }); };
+    // (a) input-level
+    let x0 = 10;
+    panel(x0, "(a) Input-level fusion", "LLaVA \u00b7 Qwen-VL \u00b7 InternVL");
+    for (let i = 0; i < 4; i++) K.box(x0 + 50, 56 + i * 32, 200, 26, "decoder layer", null, { size: 11.5 });
+    K.arrow(x0 + 150, 214, x0 + 150, 186);
+    K.vecs(x0 + 62, 222, 6, COL.img, { w: 9, gap: 3, h: 26 });
+    K.vecs(x0 + 166, 222, 6, COL.txt, { w: 9, gap: 3, h: 26 });
+    K.text(x0 + 150, 268, "[image tokens][text tokens] concatenated", { size: 10.5, mono: true, color: MUTED });
+    // (b) cross-attention
+    x0 = 320;
+    panel(x0, "(b) Cross-attention", "Flamingo");
+    const kinds = ["gated x-attn", "frozen LM layer", "gated x-attn", "frozen LM layer"];
+    kinds.forEach((k, i) => K.box(x0 + 14, 56 + i * 32, 170, 26, k, null, { size: 11.5, fill: k.startsWith("gated") ? tint(COL.img, 0.12) : "#f3f2ec", stroke: k.startsWith("gated") ? tint(COL.img, 0.6) : "rgba(28,27,25,.2)" }));
+    K.box(x0 + 200, 92, 96, 50, "Resampler", "64 tokens", { fill: tint(COL.img, 0.06), size: 12 });
+    K.arrow(x0 + 200, 105, x0 + 186, 69, { dash: "3 2" });
+    K.arrow(x0 + 200, 130, x0 + 186, 133, { dash: "3 2" });
+    K.box(x0 + 200, 196, 96, 44, "vision enc.", "frozen", { size: 12 });
+    K.arrow(x0 + 248, 194, x0 + 248, 144);
+    K.arrow(x0 + 99, 214, x0 + 99, 186);
+    K.vecs(x0 + 56, 222, 8, COL.txt, { w: 9, gap: 3, h: 26 });
+    K.text(x0 + 150, 268, "text only in the sequence; image read via x-attn", { size: 10.5, mono: true, color: MUTED });
+    // (c) early fusion
+    x0 = 630;
+    panel(x0, "(c) Early fusion", "Chameleon");
+    for (let i = 0; i < 4; i++) K.box(x0 + 14, 56 + i * 32, 170, 26, "transformer layer", null, { size: 11.5 });
+    K.box(x0 + 200, 92, 96, 50, "VQ tokenizer", "512\u00b2 \u2192 1,024 IDs", { fill: tint(palette.gold, 0.1), size: 12 });
+    K.arrow(x0 + 248, 144, x0 + 182, 234, { vcurve: true });
+    K.raster(x0 + 236, 58, rasterize(4, 2), 6);
+    K.arrow(x0 + 248, 83, x0 + 248, 90);
+    K.arrow(x0 + 99, 214, x0 + 99, 186);
+    const pat = "ttiiiittiit";
+    for (let i = 0; i < pat.length; i++) { const c = pat[i] === "t" ? COL.txt : palette.gold; K.rect(x0 + 30 + i * 13, 222, 9, 26, tint(c, 0.45), { stroke: c, sw: 0.8, rx: 2 }); }
+    K.text(x0 + 150, 268, "one vocabulary: text IDs + image-code IDs", { size: 10.5, mono: true, color: MUTED });
+    K.text(x0 + 150, 284, "can generate images as tokens", { size: 10.5, mono: true, color: MUTED });
+  })();
+
+  /* ---------------------------------------------------------- FIG: sampling and aliasing */
+  (function () {
+    const host = document.getElementById("fig-sampling");
+    const grid = el("div", { class: "w-split" }); host.appendChild(grid);
+    [[2, null, "2 Hz tone, 8 samples/s: captured"], [7, -1, "7 Hz tone, 8 samples/s: aliases to 1 Hz"]].forEach(([f, alias, title]) => {
+      const d = el("div"); grid.appendChild(d);
+      const P = plot(d, { width: 440, height: 230, x: [0, 1], y: [-1.35, 1.35], xlabel: "time (s)", ylabel: "amplitude", xticks: [0, 0.25, 0.5, 0.75, 1], yticks: [-1, 0, 1], margin: { l: 44, t: 26 } });
+      const pts = Array.from({ length: 9 }, (_, k) => [k / 8, Math.sin(2 * Math.PI * f * k / 8)]);
+      const layers = [{ fn: t => Math.sin(2 * Math.PI * f * t), color: palette.faint, width: 1.4, samples: 400 }];
+      if (alias) layers.push({ fn: t => alias * Math.sin(2 * Math.PI * t), color: palette.brick, dash: "5 4", width: 1.8 });
+      pts.forEach(p => layers.push({ marker: p, color: alias ? palette.brick : palette.green, r: 4.5 }));
+      layers.push({ text: [0.02, 1.22], label: title, color: INK, mono: false });
+      P.draw(layers);
+    });
+  })();
+
+  /* ---------------------------------------------------------- FIG: mel scale */
+  const mel = f => 2595 * Math.log10(1 + f / 700);
+  const melInv = m => 700 * (10 ** (m / 2595) - 1);
+  (function () {
+    const host = document.getElementById("fig-mel");
+    const P = plot(host, { width: 760, height: 290, x: [0, 8000], y: [0, 2900], xlabel: "frequency (Hz)", ylabel: "mels", xticks: [0, 1000, 2000, 4000, 6000, 8000], yfmt: v => String(v), xfmt: v => v >= 1000 ? (v / 1000) + "k" : String(v), margin: { l: 56 } });
+    const top = mel(8000);
+    P.draw([
+      { fn: mel, color: palette.green, width: 2.4, label: "m = 2595 log10(1 + f/700)" },
+      { fn: f => f * top / 8000, color: palette.muted, dash: "5 4", width: 1.3, label: "linear, for reference" },
+      { marker: [150, mel(150)], color: palette.brick, r: 4 },
+      { text: [330, 150], label: "100\u2192200 Hz: ~133 mels", color: palette.brick },
+      { marker: [5050, mel(5050)], color: palette.blue, r: 4 },
+      { text: [5150, 2180], label: "5000\u21925100 Hz: ~20 mels", color: palette.blue }
+    ]);
+    for (let i = 1; i <= 24; i++) {
+      const f = melInv(i * top / 25), x = P.sx(f);
+      P.svg.appendChild(svg("line", { x1: x, x2: x, y1: 290 - 42, y2: 290 - 52, stroke: palette.muted, "stroke-width": 1.2 }));
+    }
+  })();
+
+  /* ---------------------------------------------------------- FIG: Whisper */
+  (function () {
+    const K = kit(document.getElementById("fig-whisper"), 960, 300, "arr-whisper");
+    let d = "";
+    for (let i = 0; i <= 120; i++) { const t = i / 120; const v = (Math.sin(t * 61) * 0.6 + Math.sin(t * 143) * 0.3) * (0.35 + 0.65 * Math.abs(Math.sin(t * 7))); d += (i ? "L" : "M") + (20 + i) + "," + (90 - 30 * v).toFixed(1); }
+    K.add(svg("path", { d, fill: "none", stroke: COL.aud, "stroke-width": 1.3 }));
+    K.text(80, 140, "30 s @ 16 kHz", { size: 11, mono: true, color: MUTED });
+    K.text(80, 154, "480,000 samples", { size: 11, mono: true, color: MUTED });
+    K.arrow(146, 90, 170, 90);
+    for (let c = 0; c < 30; c++) for (let r = 0; r < 12; r++) {
+      const v = clamp(Math.exp(-((r - 8 + 3 * Math.sin(c / 3)) ** 2) / 3) + 0.7 * Math.exp(-((r - 3 - Math.cos(c / 4)) ** 2) / 2) + 0.06, 0, 1);
+      K.rect(175 + c * 4, 66 + r * 4, 4.2, 4.2, tint(COL.aud, v * 0.9), { rx: 0 });
+    }
+    K.text(235, 140, "log-mel", { size: 11, mono: true, color: MUTED });
+    K.text(235, 154, "80 \u00d7 3,000", { size: 11, mono: true, color: MUTED });
+    K.arrow(298, 90, 322, 90);
+    K.box(326, 46, 140, 88, "Conv stem", "2 \u00d7 Conv1D, k = 3, GELU|2nd conv stride 2|\u2192 1,500 \u00d7 d", { fill: tint(COL.aud, 0.06) });
+    K.arrow(468, 90, 492, 90);
+    K.box(496, 46, 140, 88, "Encoder \u00d7 L", "+ sinusoidal positions|bidirectional|1,500 states", { fill: tint(COL.aud, 0.06) });
+    K.arrow(638, 90, 706, 90);
+    K.text(672, 80, "cross-attn", { size: 10.5, mono: true, color: MUTED });
+    K.box(710, 46, 230, 88, "Decoder \u00d7 L", "causal self-attention|+ cross-attention to encoder|max 448 tokens", { fill: tint(COL.txt, 0.06) });
+    K.text(40, 196, "decoder sequence: special tokens choose the task, then text and timestamps are predicted", { size: 11, color: MUTED, anchor: "start" });
+    const chips = [["<|startoftranscript|>", "p"], ["<|en|>", "p"], ["<|transcribe|>", "p"], ["<|0.00|>", "ts"], [" The", "t"], [" quick", "t"], [" brown", "t"], [" fox", "t"], ["<|1.80|>", "ts"], ["<|endoftext|>", "e"]];
+    const cc = { p: palette.gold, ts: palette.blue, t: palette.green, e: palette.muted };
+    let x = 40;
+    chips.forEach(([t, k]) => {
+      const w = t.length * 6.5 + 14;
+      K.rect(x, 210, w, 26, tint(cc[k], 0.14), { stroke: tint(cc[k], 0.6), rx: 5 });
+      K.text(x + w / 2, 227, t, { size: 10.5, mono: true, color: k === "e" ? MUTED : INK });
+      x += w + 6;
+    });
+    K.arrow(x - 40, 206, 830, 138, { vcurve: true });
+    [["language + task prompt", palette.gold], ["timestamp tokens (20 ms steps)", palette.blue], ["text tokens", palette.green]].forEach(([t, c], i) => {
+      K.rect(40 + i * 240, 262, 12, 12, tint(c, 0.4), { stroke: c, rx: 2 });
+      K.text(58 + i * 240, 272, t, { size: 11, color: MUTED, anchor: "start" });
+    });
+  })();
+
+  /* ---------------------------------------------------------- FIG: cascade vs end-to-end */
+  (function () {
+    const K = kit(document.getElementById("fig-cascade"), 960, 290, "arr-cascade");
+    K.text(20, 24, "Cascaded", { size: 13.5, weight: 700, anchor: "start" });
+    const r1 = [[20, 70, "Mic", null], [110, 120, "Endpointing", "VAD waits for|silence"], [262, 120, "ASR", "e.g. Whisper"], [432, 120, "LLM", "text in, text out"], [602, 120, "TTS", "text \u2192 speech"], [754, 80, "Speaker", null]];
+    r1.forEach(([x, w, t, s]) => K.box(x, 40, w, 58, t, s));
+    for (let i = 0; i < r1.length - 1; i++) K.arrow(r1[i][0] + r1[i][1] + 2, 69, r1[i + 1][0] - 2, 69);
+    K.text(407, 62, "text", { size: 10.5, mono: true, color: MUTED });
+    K.text(577, 62, "text", { size: 10.5, mono: true, color: MUTED });
+    K.text(407, 118, "prosody, emotion, overlap dropped here", { size: 10.5, color: palette.brick });
+    K.text(860, 62, "latency =", { size: 11, color: MUTED, anchor: "start" });
+    K.text(860, 76, "sum of stages", { size: 11, color: MUTED, anchor: "start" });
+    K.text(20, 168, "Audio-native (end-to-end)", { size: 13.5, weight: 700, anchor: "start" });
+    const r2 = [[20, 70, "Mic", null], [104, 178, "Audio encoder / codec", "audio \u2192 tokens or features"], [316, 254, "Audio-native LLM", "reads and writes audio + text tokens"], [610, 124, "Codec decoder", "tokens \u2192 waveform"], [774, 80, "Speaker", null]];
+    r2.forEach(([x, w, t, s]) => K.box(x, 184, w, 58, t, s, { fill: t.indexOf("LLM") >= 0 ? tint(COL.aud, 0.07) : "#fff" }));
+    for (let i = 0; i < r2.length - 1; i++) K.arrow(r2[i][0] + r2[i][1] + 2, 213, r2[i + 1][0] - 2, 213);
+    K.text(440, 262, "keeps tone and timing; can listen while speaking (full-duplex, e.g. Moshi)", { size: 10.5, color: palette.green });
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: pixels */
+  (function () {
+    const w = widget("w-pixels", { title: "An image is a block of numbers", kicker: "Interactive", note: "A 16\u00d716 RGB image drawn procedurally in your browser. Hover or tap any pixel to read the raw bytes around it. Each colour plane on its own is just a grayscale image; the model sees all three stacked, then normalized." });
+    const n = 16, img = rasterize(n, 4);
+    let ch = "rgb", sel = [10, 5];
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Channel" })));
+    seg(c1, { options: [{ value: "rgb", label: "RGB" }, { value: "r", label: "R" }, { value: "g", label: "G" }, { value: "b", label: "B" }, { value: "gray", label: "Gray" }], value: "rgb", onChange: v => { ch = v; draw(); } });
+    w.controls.appendChild(c1);
+    const row = el("div", { class: "w-row" });
+    const wrap = el("div", { class: "canvas-wrap", style: { flex: "0 1 330px", padding: "8px" } });
+    const s = svg("svg", { viewBox: `0 0 ${n * 20} ${n * 20}` }); wrap.appendChild(s);
+    const side = el("div", { style: { flex: "1 1 300px", minWidth: "260px" } });
+    row.appendChild(wrap); row.appendChild(side); w.body.appendChild(row);
+    const set = stats(w.body, [{ key: "shape", label: "Tensor shape" }, { key: "count", label: "Numbers stored" }, { key: "px", label: "Selected pixel" }, { key: "norm", label: "After normalization" }]);
+    const cells = [];
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      const r = svg("rect", { x: x * 20, y: y * 20, width: 20.4, height: 20.4 });
+      const pick = () => { sel = [y, x]; draw(); };
+      r.addEventListener("mouseenter", pick); r.addEventListener("click", pick);
+      s.appendChild(r); cells.push(r);
+    }
+    const box = svg("rect", { fill: "none", stroke: INK, "stroke-width": 2, "pointer-events": "none" }); s.appendChild(box);
+    const dot = svg("rect", { fill: "none", stroke: "#fff", "stroke-width": 1.5, "pointer-events": "none" }); s.appendChild(dot);
+    const lum = p => 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+    const val = p => ch === "r" ? p[0] : ch === "g" ? p[1] : ch === "b" ? p[2] : Math.round(lum(p));
+    function color(p) {
+      if (ch === "rgb") return rgbStr(p);
+      if (ch === "r") return `rgb(${p[0]},0,0)`;
+      if (ch === "g") return `rgb(0,${p[1]},0)`;
+      if (ch === "b") return `rgb(0,0,${p[2]})`;
+      const v = Math.round(lum(p)); return `rgb(${v},${v},${v})`;
+    }
+    function draw() {
+      cells.forEach((r, i) => r.setAttribute("fill", color(img[Math.floor(i / n)][i % n])));
+      const [sy, sx] = sel;
+      box.setAttribute("x", (sx - 1) * 20); box.setAttribute("y", (sy - 1) * 20); box.setAttribute("width", 60); box.setAttribute("height", 60);
+      dot.setAttribute("x", sx * 20 + 2); dot.setAttribute("y", sy * 20 + 2); dot.setAttribute("width", 16); dot.setAttribute("height", 16);
+      side.innerHTML = "";
+      side.appendChild(el("div", { class: "small muted", style: { marginBottom: "6px" }, text: `3\u00d73 neighbourhood around [row ${sy}, col ${sx}]` + (ch === "rgb" ? " \u00b7 (R, G, B) bytes" : ch === "gray" ? " \u00b7 luminance 0.299R + 0.587G + 0.114B" : ` \u00b7 ${ch.toUpperCase()} channel bytes`) }));
+      const tbl = el("table", { class: "px-table" });
+      for (let dy = -1; dy <= 1; dy++) {
+        const tr = el("tr");
+        for (let dx = -1; dx <= 1; dx++) {
+          const yy = sy + dy, xx = sx + dx;
+          if (yy < 0 || xx < 0 || yy >= n || xx >= n) { tr.appendChild(el("td", { class: "pad", text: "pad" })); continue; }
+          const p = img[yy][xx];
+          const td = el("td", { class: dy === 0 && dx === 0 ? "c" : "" });
+          if (ch === "rgb") [0, 1, 2].forEach(k => td.appendChild(el("div", { text: String(p[k]), style: { color: [palette.brick, palette.green, palette.blue][k] } })));
+          else td.appendChild(el("div", { text: String(val(p)) }));
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+      side.appendChild(tbl);
+      side.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 0" }, html: "In memory this is a flat run of bytes: row by row, and within each pixel R, G, B. PyTorch reorders it to <code>[C, H, W]</code> and adds a batch dimension." }));
+      const p = img[sy][sx];
+      const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+      const nm = p.map((v, i) => ((v / 255 - mean[i]) / std[i]).toFixed(2));
+      const C_ = ch === "rgb" ? 3 : 1;
+      set("shape", `[16, 16, ${C_}]`, null, "[H, W, C]");
+      set("count", String(16 * 16 * C_), null, `${16 * 16 * C_} bytes as uint8; 224\u00b2\u00d73 = 150,528`);
+      set("px", `(${p.join(", ")})`, null, "R, G, B in 0\u2013255");
+      set("norm", `(${nm.join(", ")})`, null, "(x/255 \u2212 \u03bc) / \u03c3, ImageNet stats");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: convolution */
+  (function () {
+    const w = widget("w-conv", { title: "Slide a 3\u00d73 kernel over an image", kicker: "Interactive", note: "32\u00d732 grayscale version of the same scene. Zero padding keeps the output 32\u00d732. Signed outputs (edge, Sobel) are shown green for positive and brick for negative. The shift slider rolls the input sideways with wrap-around; compare conv(shift(x)) against shift(conv(x))." });
+    const n = 32, rgb = rasterize(n, 3);
+    const X0 = rgb.map(r => r.map(p => (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255));
+    const KS = {
+      identity: { k: [[0, 0, 0], [0, 1, 0], [0, 0, 0]], label: "identity" },
+      blur: { k: [[1, 1, 1], [1, 1, 1], [1, 1, 1]].map(r => r.map(v => v / 9)), label: "box blur" },
+      gauss: { k: [[1, 2, 1], [2, 4, 2], [1, 2, 1]].map(r => r.map(v => v / 16)), label: "Gaussian blur" },
+      sharpen: { k: [[0, -1, 0], [-1, 5, -1], [0, -1, 0]], label: "sharpen" },
+      edge: { k: [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], label: "edge (Laplacian)", signed: true },
+      sobel: { k: [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], label: "Sobel x (vertical edges)", signed: true }
+    };
+    let kname = "edge";
+    select(w.controls, { label: "Kernel", options: Object.keys(KS).map(k => ({ value: k, label: KS[k].label })), value: "edge", onChange: v => { kname = v; draw(); } });
+    const sh = slider(w.controls, { label: "Shift input right", min: 0, max: 16, step: 1, value: 0, fmt: v => v + " px", onInput: draw });
+    const grid = el("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) auto minmax(0,1fr)", gap: "14px", alignItems: "center" } });
+    const mk = () => el("canvas", { width: n, height: n, style: { width: "100%", imageRendering: "pixelated", borderRadius: "6px", display: "block", border: "1px solid rgba(28,27,25,.12)" } });
+    const cin = mk(), cout = mk();
+    const kbox = el("div");
+    grid.appendChild(el("div", null, [el("div", { class: "small muted", text: "input X" }), cin]));
+    grid.appendChild(kbox);
+    grid.appendChild(el("div", null, [el("div", { class: "small muted", text: "output Y = K \u2217 X" }), cout]));
+    w.body.appendChild(el("div", { class: "canvas-wrap", style: { padding: "12px" } }, grid));
+    const set = stats(w.body, [{ key: "params", label: "Weights in this layer" }, { key: "dense", label: "Dense layer, same size" }, { key: "equi", label: "Equivariance check" }, { key: "range", label: "Output range" }]);
+    const shift = (X, k) => X.map(r => r.map((_, x) => r[((x - k) % n + n) % n]));
+    function conv(X, K) {
+      const Y = [];
+      for (let i = 0; i < n; i++) {
+        const row = [];
+        for (let j = 0; j < n; j++) {
+          let s = 0;
+          for (let m = -1; m <= 1; m++) for (let q = -1; q <= 1; q++) {
+            const a = i + m, b = j + q;
+            if (a >= 0 && b >= 0 && a < n && b < n) s += K[m + 1][q + 1] * X[a][b];
+          }
+          row.push(s);
+        }
+        Y.push(row);
+      }
+      return Y;
+    }
+    function paint(cv, M, signed) {
+      const ctx = cv.getContext("2d"); if (!ctx) return;
+      const id = ctx.createImageData(n, n);
+      const mx = signed ? Math.max(1e-9, ...M.flat().map(Math.abs)) : 1;
+      const pap = [247, 246, 242], gr = [26, 122, 82], br = [176, 67, 46];
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const v = M[i][j], o = 4 * (i * n + j);
+        let c;
+        if (signed) { const t = clamp(v / mx, -1, 1), base = t < 0 ? br : gr, a = Math.abs(t) ** 0.7; c = pap.map((p, k) => Math.round(p + (base[k] - p) * a)); }
+        else { const g = Math.round(clamp(v, 0, 1) * 255); c = [g, g, g]; }
+        id.data[o] = c[0]; id.data[o + 1] = c[1]; id.data[o + 2] = c[2]; id.data[o + 3] = 255;
+      }
+      ctx.putImageData(id, 0, 0);
+    }
+    function draw() {
+      const K = KS[kname].k, k = sh.value;
+      const X = shift(X0, k), Y = conv(X, K);
+      paint(cin, X, false); paint(cout, Y, !!KS[kname].signed);
+      kbox.innerHTML = "";
+      const t = el("table", { class: "k3" });
+      K.forEach(r => t.appendChild(el("tr", null, r.map(v => el("td", { text: Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(3), style: { color: v < 0 ? palette.brick : v > 0 ? palette.green : palette.faint } })))));
+      kbox.appendChild(el("div", { class: "small muted", style: { textAlign: "center", marginBottom: "4px" }, text: "kernel K" }));
+      kbox.appendChild(t);
+      const B = shift(conv(X0, K), k);
+      let bad = 0;
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) if (Math.abs(Y[i][j] - B[i][j]) > 1e-9) bad++;
+      const flat = Y.flat();
+      set("params", "9 + 1 bias", "good", "shared across all 1,024 positions");
+      set("dense", "1,049,600", "bad", "1,024 \u00d7 1,024 weights + 1,024 biases");
+      set("equi", `${n * n - bad} / ${n * n} match`, bad === 0 ? "good" : "warn", bad === 0 ? "conv(shift x) = shift(conv x)" : "mismatch only at the wrap-around seam");
+      set("range", `${fmtNum(Math.min(...flat), 2)} \u2026 ${fmtNum(Math.max(...flat), 2)}`, null, KS[kname].signed ? "sums to 0: flat regions \u2192 0" : "weights sum to 1: brightness kept");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: ViT patch grid */
+  (function () {
+    const w = widget("w-vit", { title: "Patchify: image size \u00d7 patch size \u2192 tokens", kicker: "Interactive", note: "Attention cost is relative to ViT-B/16 at 224 px (196 patches) and counts only the N\u00b2 score term from the formula above. If the side isn't a multiple of P, the leftover strip (shaded brick) is cropped or the image is resized first." });
+    const V = 320;
+    const base = document.createElement("canvas"); base.width = V; base.height = V;
+    const bctx = base.getContext("2d");
+    if (bctx) {
+      const id = bctx.createImageData(V, V);
+      for (let y = 0; y < V; y++) for (let x = 0; x < V; x++) { const c = scene((x + 0.5) / V, (y + 0.5) / V), o = 4 * (y * V + x); id.data[o] = c[0]; id.data[o + 1] = c[1]; id.data[o + 2] = c[2]; id.data[o + 3] = 255; }
+      bctx.putImageData(id, 0, 0);
+    }
+    let P = 16;
+    const S = slider(w.controls, { label: "Image side", min: 64, max: 1024, step: 16, value: 224, fmt: v => v + " px", onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Patch size P" })));
+    seg(c1, { options: [8, 14, 16, 32].map(v => ({ value: v, label: v + " px" })), value: 16, onChange: v => { P = v; draw(); } });
+    w.controls.appendChild(c1);
+    const row = el("div", { class: "w-row" });
+    const cv = el("canvas", { width: V, height: V, style: { width: "100%", maxWidth: "320px", display: "block", borderRadius: "6px" } });
+    row.appendChild(el("div", { class: "canvas-wrap", style: { flex: "0 1 336px", padding: "8px" } }, cv));
+    const pw = el("div", { class: "canvas-wrap", style: { flex: "1 1 360px" } }); row.appendChild(pw);
+    w.body.appendChild(row);
+    const PL = plot(pw, { width: 440, height: 320, x: [64, 1024], y: [1e-4, 1e4], logy: true, xlabel: "image side (px)", ylabel: "attention cost vs 224 px / P16", xticks: [64, 224, 448, 640, 896, 1024], yfmt: v => v >= 1 ? fmtSI(v, 0) + "\u00d7" : v + "\u00d7", margin: { l: 62 } });
+    const set = stats(w.body, [{ key: "grid", label: "Patch grid" }, { key: "n", label: "Tokens N (+CLS)" }, { key: "dim", label: "Numbers per patch" }, { key: "cost", label: "Attention cost" }]);
+    const ctx = cv.getContext("2d");
+    function draw() {
+      const s = S.value, g = Math.floor(s / P), N = g * g;
+      if (ctx) {
+        ctx.drawImage(base, 0, 0);
+        const px = V * P / s, used = g * px;
+        ctx.fillStyle = "rgba(176,67,46,0.45)";
+        if (used < V) { ctx.fillRect(used, 0, V - used, V); ctx.fillRect(0, used, used, V - used); }
+        ctx.strokeStyle = px < 4 ? "rgba(255,255,255,0.35)" : "rgba(255,255,255,0.85)";
+        ctx.lineWidth = px < 4 ? 0.5 : 1;
+        ctx.beginPath();
+        for (let k = 0; k <= g; k++) { ctx.moveTo(k * px, 0); ctx.lineTo(k * px, used); ctx.moveTo(0, k * px); ctx.lineTo(used, k * px); }
+        ctx.stroke();
+        const hi = Math.floor(g * 0.55), hj = Math.floor(g * 0.3);
+        ctx.strokeStyle = "#1c1b19"; ctx.lineWidth = 2; ctx.strokeRect(hj * px, hi * px, px, px);
+      }
+      const rel = (N / 196) ** 2;
+      const layers = [8, 14, 16, 32].map((p, i) => ({ fn: x => { const gg = Math.floor(x / p); return gg > 0 ? (gg * gg / 196) ** 2 : NaN; }, color: [palette.brick, palette.blue, palette.green, palette.gold][i], width: p === P ? 2.6 : 1.1, dash: p === P ? null : "4 3", label: "P = " + p, samples: 400 }));
+      layers.push({ vline: s, color: palette.muted, dash: "2 3" });
+      layers.push({ marker: [s, rel], color: INK, r: 5, label: fmtNum(rel, rel < 1 ? 3 : rel < 10 ? 1 : 0) + "\u00d7" });
+      PL.draw(layers);
+      set("grid", `${g} \u00d7 ${g}`, null, s % P ? `${s % P} px left over per side` : "divides evenly");
+      set("n", `${fmtNum(N, 0)} (+1)`, N > 2000 ? "bad" : N > 700 ? "warn" : "good", "sequence length");
+      set("dim", fmtNum(P * P * 3, 0), null, `${P}\u00b7${P}\u00b73 \u2192 projected to D`);
+      set("cost", fmtNum(rel, rel < 1 ? 3 : rel < 10 ? 1 : 0) + "\u00d7", rel > 20 ? "bad" : rel > 3 ? "warn" : "good", "(N / 196)\u00b2");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: CLIP similarity matrix */
+  (function () {
+    const w = widget("w-clip", { title: "A toy CLIP batch: similarities, temperature, loss", kicker: "Interactive", note: "Five image\u2013caption pairs with illustrative cosine similarities in the range real CLIP models produce (matching pairs around 0.3, others around 0.1). Image 1 and image 5 are a hard-negative pair: a dog on a beach and a puppy in sand. Chance-level loss for 5 options is ln 5 \u2248 1.61." });
+    const rows = ["img: dog, beach", "img: red car", "img: ramen", "img: city, night", "img: puppy, sand"];
+    const cols = ["dog on beach", "red sports car", "bowl of ramen", "city at night", "puppy in sand"];
+    const S1 = [[0.31, 0.12, 0.10, 0.11, 0.27], [0.11, 0.33, 0.09, 0.15, 0.10], [0.09, 0.08, 0.34, 0.12, 0.09], [0.12, 0.16, 0.11, 0.30, 0.10], [0.26, 0.10, 0.09, 0.09, 0.29]];
+    const R = rng(3);
+    const S0 = S1.map(r => r.map(() => 0.15 + 0.03 * R.normal()));
+    let view = "row";
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Show" })));
+    seg(c1, { options: [{ value: "cos", label: "cosine s\u1d62\u2c7c" }, { value: "row", label: "row softmax (image\u2192text)" }, { value: "col", label: "column softmax (text\u2192image)" }], value: "row", onChange: v => { view = v; draw(); } });
+    w.controls.appendChild(c1);
+    const ts = slider(w.controls, { label: "Logit scale 1/\u03c4", min: 0, max: 2, step: 0.01, value: 2, fmt: v => `${fmtNum(10 ** v, 10 ** v < 10 ? 1 : 0)}  (\u03c4 = ${(10 ** -v).toFixed(3)})`, onInput: draw });
+    const tp = slider(w.controls, { label: "Training progress", min: 0, max: 1, step: 0.01, value: 1, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap", style: { padding: "10px 80px 10px 10px" } }); w.body.appendChild(wrap);
+    const H = heatmap(wrap, { cell: 58, rowLabels: rows, colLabels: cols, labelWidth: 118, labelHeight: 92, fmt: v => v.toFixed(2), maxWidth: 560 });
+    H.svg.style.overflow = "visible";
+    const set = stats(w.body, [{ key: "i2t", label: "Image\u2192text loss" }, { key: "t2i", label: "Text\u2192image loss" }, { key: "L", label: "Symmetric loss \u2112" }, { key: "acc", label: "Rows correct (argmax)" }]);
+    const T = M => M[0].map((_, j) => M.map(r => r[j]));
+    function draw() {
+      const t = tp.value, scale = 10 ** ts.value;
+      const S = S0.map((r, i) => r.map((v, j) => lerp(v, S1[i][j], t)));
+      const rowP = S.map(r => softmax(r.map(v => v * scale)));
+      const colP = T(S).map(c => softmax(c.map(v => v * scale)));
+      const n = S.length;
+      let a = 0, b = 0, acc = 0;
+      for (let i = 0; i < n; i++) { a -= Math.log(rowP[i][i]); b -= Math.log(colP[i][i]); if (S[i].indexOf(Math.max(...S[i])) === i) acc++; }
+      a /= n; b /= n;
+      const M = view === "cos" ? S : view === "row" ? rowP : T(colP);
+      H.draw(M, view === "cos" ? { min: 0, max: 0.4, hue: "blue" } : { min: 0, max: 1, hue: "green" });
+      const cls = v => v < 0.6 ? "good" : v < 1.3 ? "warn" : "bad";
+      set("i2t", a.toFixed(3), cls(a), "mean \u2212log p(own caption)");
+      set("t2i", b.toFixed(3), cls(b), "mean \u2212log p(own image)");
+      set("L", ((a + b) / 2).toFixed(3), cls((a + b) / 2), "chance = ln 5 = 1.609");
+      set("acc", `${acc} / ${n}`, acc === n ? "good" : "warn", "argmax ignores \u03c4");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: VLM token budget */
+  (function () {
+    const w = widget("w-vlm", { title: "How many tokens is this image?", kicker: "Calculator", note: "Thin lines show the LLM-token grid mapped back onto the original image; thick lines show tiles. Fixed mode squashes the whole image into one square (or pads it). Prefill time is illustrative: prompt tokens \u00f7 your prefill speed, ignoring the vision encoder's own cost. Tiling here picks the tile grid that covers the image at native size, then shrinks it to the tile cap; real models choose from a list of allowed grids." });
+    let mode = "tiles", Rz = 448, Pz = 14, mr = 2;
+    select(w.controls, { label: "Strategy", options: [{ value: "fixed", label: "Fixed resolution (LLaVA-1.5-style)" }, { value: "tiles", label: "Tiles + thumbnail (InternVL / AnyRes-style)" }, { value: "native", label: "Native resolution (Qwen2-VL-style)" }], value: "tiles", onChange: v => { mode = v; draw(); } });
+    const Ws = slider(w.controls, { label: "Image width", min: 224, max: 4096, step: 16, value: 1920, fmt: v => v + " px", onInput: draw });
+    const Hs = slider(w.controls, { label: "Image height", min: 224, max: 4096, step: 16, value: 1088, fmt: v => v + " px", onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Encoder input R" })));
+    seg(c1, { options: [224, 336, 384, 448].map(v => ({ value: v, label: String(v) })), value: 448, onChange: v => { Rz = v; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Patch P" })));
+    seg(c2, { options: [14, 16].map(v => ({ value: v, label: v + " px" })), value: 14, onChange: v => { Pz = v; draw(); } });
+    w.controls.appendChild(c2);
+    const c3 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Token merge" })));
+    seg(c3, { options: [{ value: 1, label: "none" }, { value: 2, label: "2\u00d72 (\u00f74)" }, { value: 3, label: "3\u00d73 (\u00f79)" }], value: 2, onChange: v => { mr = v; draw(); } });
+    w.controls.appendChild(c3);
+    const mt = slider(w.controls, { label: "Max tiles (tiles mode)", min: 1, max: 12, step: 1, value: 6, onInput: draw });
+    const mp = slider(w.controls, { label: "Max pixels (native mode)", min: 0.1, max: 12.8, step: 0.1, value: 1.0, fmt: v => v.toFixed(1) + " MP", onInput: draw });
+    const tt = slider(w.controls, { label: "Text tokens in prompt", min: 0, max: 4000, step: 10, value: 300, onInput: draw });
+    const ps = slider(w.controls, { label: "Prefill speed", min: 200, max: 10000, step: 100, value: 1500, fmt: v => fmtNum(v, 0) + " tok/s", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 560 300" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "vis", label: "Visual tokens" }, { key: "tot", label: "Prompt total" }, { key: "pre", label: "Prefill (illustrative)" }, { key: "det", label: "Original px per token" }]);
+    function compute(W, H) {
+      const g = Math.floor(Rz / Pz), per = Math.floor(g / mr);
+      if (mode === "fixed") return { tokens: per * per, cellsX: per, cellsY: per, cols: 1, rows: 1, crops: 1, effW: Rz, effH: Rz, thumb: false };
+      if (mode === "tiles") {
+        let cols = Math.ceil(W / Rz), rows = Math.ceil(H / Rz);
+        const ar = W / H, off = (c, r) => Math.abs(Math.log((c / r) / ar));
+        while (cols * rows > mt.value) {
+          if (cols === 1) rows--; else if (rows === 1) cols--;
+          else if (off(cols - 1, rows) <= off(cols, rows - 1)) cols--; else rows--;
+        }
+        cols = Math.max(1, cols); rows = Math.max(1, rows);
+        const nt = cols * rows, thumb = nt > 1;
+        return { tokens: (nt + (thumb ? 1 : 0)) * per * per, cellsX: cols * per, cellsY: rows * per, cols, rows, crops: nt + (thumb ? 1 : 0), effW: cols * Rz, effH: rows * Rz, thumb };
+      }
+      const unit = Pz * mr, f = Math.min(1, Math.sqrt(mp.value * 1e6 / (W * H)));
+      const Wn = Math.max(unit, Math.round(W * f / unit) * unit), Hn = Math.max(unit, Math.round(H * f / unit) * unit);
+      return { tokens: (Wn / unit) * (Hn / unit), cellsX: Wn / unit, cellsY: Hn / unit, cols: 1, rows: 1, crops: 1, effW: Wn, effH: Hn, thumb: false };
+    }
+    function draw() {
+      const W = Ws.value, H = Hs.value, r = compute(W, H);
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const sc = Math.min(520 / W, 230 / H), rw = W * sc, rh = H * sc, x0 = (560 - rw) / 2, y0 = 44;
+      s.appendChild(svg("rect", { x: x0, y: y0, width: rw, height: rh, fill: "rgba(47,93,138,0.07)", stroke: INK, "stroke-width": 1.2 }));
+      const thin = (nx, ny) => {
+        if (nx > 140 || ny > 140) { s.appendChild(svg("rect", { x: x0, y: y0, width: rw, height: rh, fill: "rgba(47,93,138,0.14)" })); return false; }
+        for (let i = 1; i < nx; i++) s.appendChild(svg("line", { x1: x0 + i * rw / nx, x2: x0 + i * rw / nx, y1: y0, y2: y0 + rh, stroke: "rgba(47,93,138,0.35)", "stroke-width": 0.6 }));
+        for (let i = 1; i < ny; i++) s.appendChild(svg("line", { x1: x0, x2: x0 + rw, y1: y0 + i * rh / ny, y2: y0 + i * rh / ny, stroke: "rgba(47,93,138,0.35)", "stroke-width": 0.6 }));
+        return true;
+      };
+      const drawn = thin(r.cellsX, r.cellsY);
+      if (mode === "tiles") {
+        for (let i = 1; i < r.cols; i++) s.appendChild(svg("line", { x1: x0 + i * rw / r.cols, x2: x0 + i * rw / r.cols, y1: y0, y2: y0 + rh, stroke: palette.gold, "stroke-width": 2.5 }));
+        for (let i = 1; i < r.rows; i++) s.appendChild(svg("line", { x1: x0, x2: x0 + rw, y1: y0 + i * rh / r.rows, y2: y0 + i * rh / r.rows, stroke: palette.gold, "stroke-width": 2.5 }));
+      }
+      const head = mode === "fixed" ? `squashed to ${Rz}\u00d7${Rz}: ${r.cellsX}\u00d7${r.cellsY} token grid` : mode === "tiles" ? `${r.cols}\u00d7${r.rows} tiles of ${Rz} px` + (r.thumb ? " + 1 thumbnail" : "") + ` \u00b7 ${r.cellsX}\u00d7${r.cellsY} tokens on the tiles` : `resized to ${r.effW}\u00d7${r.effH}: ${r.cellsX}\u00d7${r.cellsY} token grid`;
+      s.appendChild(svg("text", { x: 280, y: 22, "text-anchor": "middle", "font-size": 12.5, fill: INK, class: "mono", text: head }));
+      s.appendChild(svg("text", { x: 280, y: 36, "text-anchor": "middle", "font-size": 11, fill: MUTED, text: `original ${W}\u00d7${H}` + (drawn ? "" : " \u00b7 grid too dense to draw") }));
+      const total = r.tokens + tt.value, sec = total / ps.value;
+      const pxX = W / r.cellsX, pxY = H / r.cellsY;
+      set("vis", fmtNum(r.tokens, 0), r.tokens > 3000 ? "bad" : r.tokens > 1200 ? "warn" : "good", r.crops > 1 ? `${r.crops} crops \u00d7 ${fmtNum(r.tokens / r.crops, 0)}` : `${r.cellsX} \u00d7 ${r.cellsY}`);
+      set("tot", fmtNum(total, 0), null, `${Math.round(100 * r.tokens / Math.max(1, total))}% of it is the image`);
+      set("pre", sec < 1 ? Math.round(sec * 1000) + " ms" : fmtNum(sec, 1) + " s", sec > 2 ? "bad" : sec > 0.7 ? "warn" : "good", "at " + fmtNum(ps.value, 0) + " tok/s");
+      const worst = Math.max(pxX, pxY);
+      set("det", `${fmtNum(pxX, 0)} \u00d7 ${fmtNum(pxY, 0)}`, worst > 60 ? "bad" : worst > 30 ? "warn" : "good", "smaller = finer detail kept");
+      mt.wrap.style.opacity = mode === "tiles" ? 1 : 0.4;
+      mp.wrap.style.opacity = mode === "native" ? 1 : 0.4;
+      c1.style.opacity = mode === "native" ? 0.4 : 1;
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- FFT helper */
+  function fft(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), h = len >> 1;
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < h; k++) {
+          const a = i + k, b = a + h;
+          const br = re[b] * cr - im[b] * ci, bi = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - br; im[b] = im[a] - bi;
+          re[a] += br; im[a] += bi;
+          const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+        }
+      }
+    }
+  }
+  const hannCache = {};
+  function hann(N) { if (!hannCache[N]) { const w = new Float64Array(N); for (let i = 0; i < N; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1)); hannCache[N] = w; } return hannCache[N]; }
+  function magSpectrum(x, start, N) {
+    const w = hann(N), re = new Float64Array(N), im = new Float64Array(N);
+    let sw = 0;
+    for (let i = 0; i < N; i++) { re[i] = (x[start + i] || 0) * w[i]; sw += w[i]; }
+    fft(re, im);
+    const m = new Float64Array(N / 2 + 1);
+    for (let k = 0; k <= N / 2; k++) m[k] = 2 * Math.hypot(re[k], im[k]) / sw;
+    return m;
+  }
+
+  /* ---------------------------------------------------------- WIDGET: waveform, spectrum, spectrogram */
+  (function () {
+    const w = widget("w-spec", { title: "Build a sound, then look at it three ways", kicker: "Interactive \u00b7 FFT in your browser", note: "Sample rate here is 8 kHz (Nyquist 4 kHz) to keep the arithmetic light; Whisper uses 16 kHz. Push a frequency past 4,000 Hz and watch it fold back. The chirp sweeps component 1 upward by 2 kHz over the one-second clip. The spectrum uses a 1,024-sample Hann window from the middle of the clip; the spectrogram uses the window length you choose, with a hop of a quarter window." });
+    const fs = 8000, L = 8000, NY = fs / 2;
+    const comps = [{ f: 440, a: 0.8 }, { f: 1250, a: 0.4 }, { f: 2600, a: 0 }];
+    let chirp = false, Nw = 256, axis = "linear";
+    const mkF = i => slider(w.controls, { label: `Tone ${i + 1} frequency`, min: 20, max: 6000, step: 10, value: comps[i].f, fmt: v => fmtNum(v, 0) + " Hz", onInput: v => { comps[i].f = v; draw(); } });
+    const mkA = i => slider(w.controls, { label: `Tone ${i + 1} amplitude`, min: 0, max: 1, step: 0.05, value: comps[i].a, fmt: v => v.toFixed(2), onInput: v => { comps[i].a = v; draw(); } });
+    [0, 1, 2].forEach(i => { mkF(i); mkA(i); });
+    const noise = slider(w.controls, { label: "Noise", min: 0, max: 0.5, step: 0.01, value: 0.02, fmt: v => v.toFixed(2), onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Tone 1 chirp" })));
+    seg(c1, { options: [{ value: "off", label: "steady" }, { value: "on", label: "chirp +2 kHz" }], value: "off", onChange: v => { chirp = v === "on"; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "STFT window N" })));
+    seg(c2, { options: [64, 256, 1024].map(v => ({ value: v, label: `${v} (${v / 8} ms)` })), value: 256, onChange: v => { Nw = v; draw(); } });
+    w.controls.appendChild(c2);
+    const c3 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Frequency axis" })));
+    seg(c3, { options: [{ value: "linear", label: "linear Hz" }, { value: "mel", label: "mel" }], value: "linear", onChange: v => { axis = v; draw(); } });
+    w.controls.appendChild(c3);
+    const split = el("div", { class: "w-split" });
+    const wv = el("div", { class: "canvas-wrap" }), sp = el("div", { class: "canvas-wrap" });
+    split.appendChild(wv); split.appendChild(sp); w.body.appendChild(split);
+    const PW = plot(wv, { width: 440, height: 210, x: [0, 40], y: [-1.5, 1.5], xlabel: "time (ms): first 40 ms", ylabel: "amplitude", margin: { l: 46 } });
+    const PS = plot(sp, { width: 440, height: 210, x: [0, 4000], y: [0, 1.1], xlabel: "frequency (Hz)", ylabel: "|X[k]|", xfmt: v => v >= 1000 ? (v / 1000) + "k" : String(v), margin: { l: 46 } });
+    const sgWrap = el("div", { class: "canvas-wrap", style: { marginTop: "10px", padding: "8px 8px 8px 46px" } });
+    const cv = el("canvas", { width: 100, height: 128, style: { width: "100%", height: "200px", display: "block", imageRendering: "pixelated" } });
+    const sgInner = el("div", { style: { position: "relative" } });
+    sgInner.appendChild(cv);
+    const labs = [0, 1, 2, 3].map(() => { const l = el("span", { class: "ax-lab", style: { left: "-42px" } }); sgInner.appendChild(l); return l; });
+    sgWrap.appendChild(sgInner);
+    sgWrap.appendChild(el("div", { class: "small muted", style: { marginTop: "4px" }, text: "spectrogram: time 0 \u2192 1 s left to right; darker = louder (dB, 60 dB range)" }));
+    w.body.appendChild(sgWrap);
+    const set = stats(w.body, [{ key: "nyq", label: "Nyquist" }, { key: "res", label: "STFT resolution" }, { key: "frames", label: "Spectrogram size" }, { key: "alias", label: "Aliasing" }]);
+    const aliasF = f => Math.abs(f - fs * Math.round(f / fs));
+    function signal() {
+      const x = new Float64Array(L), R = rng(5), nz = noise.value;
+      for (let n = 0; n < L; n++) {
+        const t = n / fs;
+        let v = 0;
+        comps.forEach((c, i) => {
+          if (!c.a) return;
+          if (i === 0 && chirp) v += c.a * Math.sin(2 * Math.PI * (c.f * t + 0.5 * 2000 * t * t));
+          else v += c.a * Math.sin(2 * Math.PI * c.f * t);
+        });
+        x[n] = v + nz * R.normal();
+      }
+      return x;
+    }
+    const ctx = cv.getContext("2d");
+    function draw() {
+      const x = signal();
+      const amp = Math.max(1, comps.reduce((s, c) => s + c.a, 0) + 3 * noise.value);
+      PW.y[0] = -amp * 1.05; PW.y[1] = amp * 1.05;
+      PW.draw([{ points: Array.from({ length: 321 }, (_, n) => [n * 1000 / fs, x[n]]), color: palette.plum, width: 1.5 }]);
+      const N = 1024, m = magSpectrum(x, 3500, N);
+      const pts = Array.from(m, (v, k) => [k * fs / N, v]);
+      PS.y[1] = Math.max(1.1, Math.max(...m) * 1.1);
+      const lay = [{ points: pts, color: palette.blue, width: 1.5, area: true, areaOpacity: 0.08 }];
+      comps.forEach((c, i) => { if (c.a > 0 && !(i === 0 && chirp)) { const fa = aliasF(c.f); lay.push({ vline: fa, color: c.f > NY ? palette.brick : palette.faint, dash: "3 3", label: c.f > NY ? `${fmtNum(c.f, 0)}\u2192${fmtNum(fa, 0)}` : null }); } });
+      PS.draw(lay);
+      // spectrogram
+      const hop = Nw / 4, frames = Math.floor((L - Nw) / hop) + 1, Hh = 128;
+      cv.width = frames; cv.height = Hh;
+      if (ctx) {
+        const id = ctx.createImageData(frames, Hh);
+        const top = axis === "mel" ? mel(NY) : NY;
+        const binOf = [];
+        for (let r = 0; r < Hh; r++) { const fr = 1 - (r + 0.5) / Hh, f = axis === "mel" ? melInv(fr * top) : fr * top; binOf.push(Math.min(Nw / 2, Math.round(f * Nw / fs))); }
+        const pap = [247, 246, 242], base = [47, 93, 138];
+        for (let fI = 0; fI < frames; fI++) {
+          const mm = magSpectrum(x, fI * hop, Nw);
+          for (let r = 0; r < Hh; r++) {
+            const db = 20 * Math.log10(mm[binOf[r]] + 1e-6), t = clamp((db + 60) / 60, 0, 1), o = 4 * (r * frames + fI);
+            for (let k = 0; k < 3; k++) id.data[o + k] = Math.round(pap[k] + (base[k] - pap[k]) * t);
+            id.data[o + 3] = 255;
+          }
+        }
+        ctx.putImageData(id, 0, 0);
+        [[4000, "4 kHz"], [2000, "2 kHz"], [1000, "1 kHz"], [0, "0"]].forEach(([f, t], i) => {
+          const frac = axis === "mel" ? mel(f) / top : f / top;
+          labs[i].textContent = t; labs[i].style.top = (100 * (1 - frac)) + "%";
+        });
+      }
+      const aliased = comps.filter(c => c.a > 0 && c.f > NY);
+      const chirpAl = chirp && comps[0].a > 0 && comps[0].f + 2000 > NY;
+      set("nyq", "4,000 Hz", null, "f\u209b / 2 at f\u209b = 8 kHz");
+      set("res", `\u0394f ${fmtNum(fs / Nw, 1)} Hz \u00b7 ${Nw / 8} ms`, null, "long window: sharp pitch, blurry time");
+      set("frames", `${Nw / 2 + 1} bins \u00d7 ${frames}`, null, `hop ${hop} samples = ${hop / 8} ms`);
+      set("alias", aliased.length || chirpAl ? (aliased.length ? aliased.map(c => `${fmtNum(c.f, 0)}\u2192${fmtNum(aliasF(c.f), 0)} Hz`).join(", ") : "chirp folds") : "none", aliased.length || chirpAl ? "bad" : "good", aliased.length || chirpAl ? "above Nyquist: folded back" : "all tones below 4 kHz");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: residual vector quantization */
+  (function () {
+    const w = widget("w-rvq", { title: "Residual vector quantization in 2-D", kicker: "Interactive", note: "A toy RVQ with 2-D latents and six codebooks of 16 entries each (a jittered 4\u00d74 grid, each stage 4\u00d7 finer than the last). Click anywhere on the plane to move the target latent z. Zoom into stage q to see codebook q placed around the sum of the earlier stages' picks. Real codecs use latents of 128 or more dimensions and 1,024-entry codebooks learned with k-means-style updates." });
+    const R = rng(21), Kc = 16, QM = 6;
+    const books = [];
+    for (let q = 0; q < QM; q++) { const d = 0.8 / 4 ** q, pts = []; for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) pts.push([(i - 1.5) * d + R.normal() * 0.07 * d, (j - 1.5) * d + R.normal() * 0.07 * d]); books.push(pts); }
+    let target = [0.93, -0.41], fr = 75;
+    const qs = slider(w.controls, { label: "Stages used Q", min: 1, max: QM, step: 1, value: 3, fmt: v => v + (v > 1 ? " codebooks" : " codebook"), onInput: draw });
+    const zs = slider(w.controls, { label: "Zoom into stage", min: 1, max: QM, step: 1, value: 1, fmt: v => "stage " + v, onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Codec frame rate (for the rate stats)" })));
+    seg(c1, { options: [{ value: 12.5, label: "12.5 Hz (Mimi)" }, { value: 50, label: "50 Hz" }, { value: 75, label: "75 Hz (EnCodec 24k)" }], value: 75, onChange: v => { fr = v; draw(); } });
+    w.controls.appendChild(c1);
+    const row = el("div", { class: "w-row" });
+    const pwrap = el("div", { class: "canvas-wrap", style: { flex: "0 1 380px" } });
+    const s = svg("svg", { viewBox: "0 0 360 360" }); pwrap.appendChild(s);
+    const bwrap = el("div", { class: "canvas-wrap", style: { flex: "1 1 340px" } });
+    row.appendChild(pwrap); row.appendChild(bwrap); w.body.appendChild(row);
+    const PR = plot(bwrap, { width: 420, height: 360, x: [0, QM], y: [1e-4, 3], logy: true, xlabel: "stages applied q", ylabel: "residual \u2016r_q\u2016", xticks: [0, 1, 2, 3, 4, 5, 6], yfmt: v => v >= 1 ? String(v) : v.toExponential(0), margin: { l: 58 } });
+    const set = stats(w.body, [{ key: "codes", label: "Tokens for this frame" }, { key: "err", label: "Error \u2016z \u2212 \u1e91\u2016" }, { key: "tps", label: "Tokens / s" }, { key: "kbps", label: "Bitrate (K = 1,024)" }]);
+    let view = { c: [0, 0], ext: 1.7 };
+    s.addEventListener("click", e => {
+      const rc = s.getBoundingClientRect();
+      const px = (e.clientX - rc.left) / rc.width * 360, py = (e.clientY - rc.top) / rc.height * 360;
+      target = [view.c[0] + (px - 180) / 170 * view.ext, view.c[1] - (py - 180) / 170 * view.ext];
+      draw();
+    });
+    function encode(Q) {
+      let r = target.slice();
+      const codes = [], partial = [[0, 0]], res = [Math.hypot(r[0], r[1])];
+      for (let q = 0; q < Q; q++) {
+        let best = 0, bd = Infinity;
+        books[q].forEach((c, i) => { const d = (r[0] - c[0]) ** 2 + (r[1] - c[1]) ** 2; if (d < bd) { bd = d; best = i; } });
+        const c = books[q][best], pv = partial[partial.length - 1];
+        codes.push(best); r = [r[0] - c[0], r[1] - c[1]];
+        partial.push([pv[0] + c[0], pv[1] + c[1]]); res.push(Math.hypot(r[0], r[1]));
+      }
+      return { codes, partial, res };
+    }
+    function draw() {
+      const Q = Math.round(qs.value), e = encode(QM), v = Math.min(Math.round(zs.value), QM);
+      const center = e.partial[v - 1], ext = 1.7 / 4 ** (v - 1);
+      view = { c: center, ext };
+      const X = x => 180 + (x - center[0]) / ext * 170, Y = y => 180 - (y - center[1]) / ext * 170;
+      while (s.firstChild) s.removeChild(s.firstChild);
+      for (let k = -4; k <= 4; k++) {
+        const g = k * ext / 4;
+        s.appendChild(svg("line", { x1: X(center[0] + g), x2: X(center[0] + g), y1: 10, y2: 350, stroke: palette.line, "stroke-width": 0.6 }));
+        s.appendChild(svg("line", { y1: Y(center[1] + g), y2: Y(center[1] + g), x1: 10, x2: 350, stroke: palette.line, "stroke-width": 0.6 }));
+      }
+      const cb = books[v - 1], chosen = e.codes[v - 1];
+      cb.forEach((c, i) => s.appendChild(svg("circle", { cx: X(center[0] + c[0]), cy: Y(center[1] + c[1]), r: i === chosen ? 7 : 4.5, fill: i === chosen ? palette.green : "#fff", stroke: palette.green, "stroke-width": 1.5, opacity: v <= Q ? 1 : 0.35 })));
+      const pts = e.partial.slice(0, Q + 1);
+      s.appendChild(svg("polyline", { points: pts.map(p => X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1)).join(" "), fill: "none", stroke: INK, "stroke-width": 1.6 }));
+      pts.forEach((p, i) => s.appendChild(svg("circle", { cx: X(p[0]), cy: Y(p[1]), r: i === 0 ? 3 : 3.5, fill: i === Q ? palette.blue : INK })));
+      const zh = pts[pts.length - 1];
+      s.appendChild(svg("line", { x1: X(zh[0]), y1: Y(zh[1]), x2: X(target[0]), y2: Y(target[1]), stroke: palette.brick, "stroke-width": 1.4, "stroke-dasharray": "4 3" }));
+      s.appendChild(svg("circle", { cx: X(target[0]), cy: Y(target[1]), r: 6, fill: "none", stroke: palette.brick, "stroke-width": 2 }));
+      s.appendChild(svg("text", { x: 14, y: 24, "font-size": 11.5, fill: INK, class: "mono", text: v === 1 ? "stage 1 codebook (16 entries) around the origin" : `stage ${v} codebook around \u03a3 of stages 1..${v - 1}` }));
+      s.appendChild(svg("text", { x: 14, y: 40, "font-size": 11, fill: MUTED, class: "mono", text: `view width \u00b1${ext.toPrecision(2)}` + (v > Q ? "  (stage not used at this Q)" : "") }));
+      s.appendChild(svg("text", { x: 14, y: 346, "font-size": 11, fill: palette.brick, class: "mono", text: "\u25cb target z   \u2014 path of partial sums   \u2022 \u1e91" }));
+      const resQ = e.res.slice(0, Q + 1);
+      PR.draw([
+        { points: e.res.map((r, i) => [i, Math.max(r, 1.2e-4)]), color: palette.faint, dash: "3 3", width: 1.2 },
+        { points: resQ.map((r, i) => [i, Math.max(r, 1.2e-4)]), color: palette.green, width: 2.4, dots: true, r: 4 },
+        { vline: Q, color: palette.muted, label: "Q = " + Q }
+      ]);
+      set("codes", "[" + e.codes.slice(0, Q).join(", ") + "]", null, `${Q} \u00d7 log\u2082 16 = ${Q * 4} bits in this toy`);
+      const err = resQ[Q];
+      set("err", err < 1e-3 ? err.toExponential(1) : err.toFixed(4), err < 0.01 ? "good" : err < 0.1 ? "warn" : "bad", "shrinks about 4\u00d7 per stage here");
+      set("tps", fmtNum(fr * Q, fr * Q < 100 ? 1 : 0), null, `${fr} frames/s \u00d7 ${Q} codebooks`);
+      set("kbps", fmtNum(fr * Q * 10 / 1000, 2) + " kbps", null, `${fr} \u00d7 ${Q} \u00d7 10 bits`);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: voice latency */
+  (function () {
+    const w = widget("w-latency", { title: "Where a voice reply's latency goes", kicker: "Calculator", note: "All stage times are inputs you set; the defaults are illustrative, not measurements. Sequential: TTS waits for the whole LLM reply (60 tokens at the decode speed you set). Streaming: ASR runs while the user talks, so only its final-chunk lag (taken here as 25% of the full ASR time) is on the critical path, and TTS starts after the first ~8 tokens. Audio-native: one model goes from audio in to the first audio out." });
+    let mode = "stream";
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Pipeline" })));
+    seg(c1, { options: [{ value: "seq", label: "cascade, sequential" }, { value: "stream", label: "cascade, streaming" }, { value: "native", label: "audio-native" }], value: "stream", onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    const ms = v => v + " ms";
+    const ep = slider(w.controls, { label: "End-of-turn wait", min: 0, max: 1200, step: 10, value: 500, fmt: ms, onInput: draw });
+    const asr = slider(w.controls, { label: "ASR (full utterance)", min: 30, max: 1200, step: 10, value: 300, fmt: ms, onInput: draw });
+    const ttft = slider(w.controls, { label: "LLM time to first token", min: 50, max: 2000, step: 10, value: 350, fmt: ms, onInput: draw });
+    const dec = slider(w.controls, { label: "LLM decode speed", min: 10, max: 200, step: 5, value: 60, fmt: v => v + " tok/s", onInput: draw });
+    const tts = slider(w.controls, { label: "TTS time to first audio", min: 30, max: 800, step: 10, value: 150, fmt: ms, onInput: draw });
+    const nat = slider(w.controls, { label: "Audio-native: first audio out", min: 50, max: 1500, step: 10, value: 250, fmt: ms, onInput: draw });
+    const net = slider(w.controls, { label: "Network + buffering", min: 0, max: 400, step: 10, value: 100, fmt: ms, onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 150" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "tot", label: "User waits" }, { key: "big", label: "Largest stage" }, { key: "vs", label: "vs ~200 ms human gap" }]);
+    function draw() {
+      let segs;
+      if (mode === "seq") segs = [["end-of-turn", ep.value, palette.faint], ["ASR", asr.value, palette.plum], ["LLM TTFT", ttft.value, palette.green], ["LLM full reply", 60 / dec.value * 1000, palette.teal], ["TTS first audio", tts.value, palette.gold], ["network", net.value, palette.muted]];
+      else if (mode === "stream") segs = [["end-of-turn", ep.value, palette.faint], ["ASR tail", 0.25 * asr.value, palette.plum], ["LLM TTFT", ttft.value, palette.green], ["first clause", 8 / dec.value * 1000, palette.teal], ["TTS first audio", tts.value, palette.gold], ["network", net.value, palette.muted]];
+      else segs = [["end-of-turn", ep.value, palette.faint], ["model: first audio", nat.value, palette.plum], ["network", net.value, palette.muted]];
+      const total = segs.reduce((a, b) => a + b[1], 0);
+      const maxT = Math.max(2000, total * 1.08);
+      const X = t => 20 + t / maxT * 720;
+      while (s.firstChild) s.removeChild(s.firstChild);
+      let t = 0;
+      segs.forEach(([lab, d, c], i) => {
+        if (d <= 0) return;
+        s.appendChild(svg("rect", { x: X(t), y: 40, width: Math.max(0.5, X(t + d) - X(t) - 1), height: 40, rx: 3, fill: c, opacity: 0.8 }));
+        if (X(t + d) - X(t) > 46) s.appendChild(svg("text", { x: (X(t) + X(t + d)) / 2, y: 64, "text-anchor": "middle", "font-size": 10.5, fill: "#fff", class: "mono", text: Math.round(d) }));
+        s.appendChild(svg("text", { x: (X(t) + X(t + d)) / 2, y: i % 2 ? 100 : 30, "text-anchor": "middle", "font-size": 10.5, fill: MUTED, text: lab }));
+        t += d;
+      });
+      s.appendChild(svg("line", { x1: X(200), x2: X(200), y1: 20, y2: 120, stroke: palette.green, "stroke-width": 1.4, "stroke-dasharray": "4 3" }));
+      s.appendChild(svg("text", { x: X(200) + 4, y: 132, "font-size": 10.5, fill: palette.green, class: "mono", text: "~200 ms" }));
+      s.appendChild(svg("line", { x1: 20, x2: 740, y1: 86, y2: 86, stroke: palette.line }));
+      for (let k = 0; k <= maxT; k += 500) s.appendChild(svg("text", { x: X(k), y: 146, "text-anchor": "middle", "font-size": 10, fill: palette.faint, class: "mono", text: k + " ms" }));
+      const big = segs.reduce((a, b) => b[1] > a[1] ? b : a);
+      set("tot", fmtNum(total, 0) + " ms", total < 800 ? "good" : total < 1500 ? "warn" : "bad", "last word \u2192 first sound");
+      set("big", big[0], null, fmtNum(big[1], 0) + " ms");
+      set("vs", fmtNum(total / 200, 1) + "\u00d7", total < 600 ? "good" : "warn", "Stivers et al., 2009");
+      [asr, ttft, dec, tts].forEach(c => c.wrap.style.opacity = mode === "native" ? 0.4 : 1);
+      nat.wrap.style.opacity = mode === "native" ? 1 : 0.4;
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- WIDGET: video token explosion */
+  (function () {
+    const w = widget("w-video", { title: "Video tokens vs your context window", kicker: "Calculator", note: "Tokens per frame = (R / 14 / merge)\u00b2, with 14-pixel patches. Temporal merge folds consecutive sampled frames into one set of tokens (Qwen2-VL uses 2). Audio tokens and timestamp tokens are not included." });
+    const DUR = [5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600, 5400, 7200];
+    const fmtDur = s => s < 60 ? s + " s" : s < 3600 ? (s / 60) + " min" : (s / 3600) + " h";
+    let fps = 1, Rv = 448, mg = 2, tc = 1, ctxW = 131072;
+    const ds = slider(w.controls, { label: "Duration", min: 0, max: DUR.length - 1, step: 1, value: 6, fmt: i => fmtDur(DUR[i]), onInput: draw });
+    const mk = (label, opts, val, cb) => { const c = el("div", { class: "ctl" }, el("label", null, el("span", { text: label }))); seg(c, { options: opts, value: val, onChange: v => { cb(v); draw(); } }); w.controls.appendChild(c); };
+    mk("Frames sampled per second", [0.5, 1, 2, 4].map(v => ({ value: v, label: v + " fps" })), 1, v => fps = v);
+    mk("Frame resolution", [224, 336, 448, 672].map(v => ({ value: v, label: v + " px" })), 448, v => Rv = v);
+    mk("Spatial merge", [{ value: 1, label: "none" }, { value: 2, label: "2\u00d72" }, { value: 4, label: "4\u00d74" }], 2, v => mg = v);
+    mk("Temporal merge", [1, 2, 4].map(v => ({ value: v, label: v + " frame" + (v > 1 ? "s" : "") })), 1, v => tc = v);
+    mk("Context window", [{ value: 32768, label: "32K" }, { value: 131072, label: "128K" }, { value: 1048576, label: "1M" }], 131072, v => ctxW = v);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 280, x: [5, 7200], y: [10, 1e8], logx: true, logy: true, xlabel: "video duration (s)", ylabel: "visual tokens", yfmt: v => fmtSI(v, 0), xfmt: v => v >= 60 ? fmtNum(v / 60, 0) + "m" : v + "s", xticks: [10, 60, 600, 3600], margin: { l: 58 } });
+    const set = stats(w.body, [{ key: "frames", label: "Frames sampled" }, { key: "tpf", label: "Tokens per frame" }, { key: "tot", label: "Visual tokens" }, { key: "max", label: "Longest video that fits" }]);
+    function draw() {
+      const d = DUR[ds.value], tpf = Math.floor(Rv / 14 / mg) ** 2;
+      const tok = dd => Math.ceil(Math.ceil(dd * fps) / tc) * tpf;
+      const total = tok(d), frames = Math.ceil(d * fps);
+      const maxD = Math.floor(ctxW / tpf) * tc / fps;
+      P.draw([
+        { fn: tok, color: palette.teal, width: 2.4, label: `${tpf} tokens/frame, ${fps} fps, merge ${tc}`, samples: 300 },
+        { fn: dd => Math.ceil(dd * 30) * 576, color: palette.faint, dash: "4 3", width: 1.2, label: "every frame at 30 fps, 576 tokens each" },
+        { hline: ctxW, color: palette.brick, label: "context " + fmtSI(ctxW, 0) },
+        { marker: [d, total], color: total > ctxW ? palette.brick : palette.green, r: 6 }
+      ]);
+      set("frames", fmtNum(frames, 0), null, `${fmtDur(d)} \u00d7 ${fps} fps`);
+      set("tpf", fmtNum(tpf, 0), null, `(${Rv}/14/${mg})\u00b2`);
+      set("tot", fmtNum(total, 0), total > ctxW ? "bad" : total > 0.5 * ctxW ? "warn" : "good", `${fmtNum(100 * total / ctxW, total / ctxW < 0.1 ? 1 : 0)}% of the window`);
+      set("max", maxD >= 3600 ? fmtNum(maxD / 3600, 1) + " h" : maxD >= 60 ? fmtNum(maxD / 60, 1) + " min" : fmtNum(maxD, 0) + " s", null, "visual tokens only");
+    }
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>

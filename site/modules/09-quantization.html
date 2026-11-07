@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Quantization — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+</head>
+<body data-module="09">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 09 · Running models</p>
+<h1 class="title">Quantization: trading <span class="it">bits</span> for speed</h1>
+<p class="lede">An 8B-parameter model takes 16 GB in bf16. At 4 bits it fits in about 4.5 GB and generates roughly three times faster on the same laptop, with output you'd struggle to tell apart. This module explains the bookkeeping behind that and where it breaks.</p>
+<div class="meta"><span class="tag">~2.5 hours</span><span class="tag n">prereqs: 01, 08</span><span class="tag g">hands-on: llama.cpp, MLX</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Work out a model's memory footprint and decode speed ceiling from its parameter count and bit width.</li>
+    <li>Read a floating-point bit layout and say why bf16 beat fp16 for training.</li>
+    <li>Quantize a vector by hand with absmax and zero-point schemes, and predict how an outlier ruins it.</li>
+    <li>Explain group-wise scales, NF4, GPTQ, AWQ, and what "Q4_K_M" actually means.</li>
+    <li>Pick a quantization for a given device and task, then measure whether it hurt.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="why">Why quantize at all</h2>
+
+<p>A language model's weights are a few billion numbers. Every time the model generates <em>one</em> token, the hardware has to read essentially <em>all</em> of them from memory (Module 08 covers why). So two numbers decide whether a model is usable on a machine:</p>
+<ol>
+  <li><strong>Does it fit?</strong> Weight memory has to fit in GPU memory or unified RAM.</li>
+  <li><strong>How fast is it?</strong> At batch size 1, generation speed is capped by how quickly those bytes can be streamed.</li>
+</ol>
+<p>Both scale with <em>bytes per parameter</em>, and quantization is the practice of making that number smaller.</p>
+
+<div class="formula" data-name="Weight memory">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{weights}}} = \htmlClass{t2}{N} \times \frac{\htmlClass{t3}{b}}{8}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M\)</dt><dd>bytes needed to hold the weights</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>number of parameters (8B model → \(8\times10^9\))</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bits per weight, including any per-group scale overhead</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Count the numbers, multiply by how many bits each one takes, divide by 8 to get bytes.</p>
+  <p class="why"><b>Why it matters</b>8B × 16 bits = 16 GB. 8B × 4.5 bits = 4.5 GB. That's the difference between needing a server GPU and running on a laptop.</p>
+</div>
+
+<div class="formula" data-name="Decode speed ceiling (batch 1)">
+  <div class="tex">$$\htmlClass{t1}{\text{tokens/s}} \;\lesssim\; \frac{\htmlClass{t2}{B_{\text{mem}}}}{\htmlClass{t3}{M_{\text{weights}}} + \htmlClass{t4}{M_{\text{KV}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>tokens/s</dt><dd>upper bound on generation speed for one sequence</dd></div>
+    <div data-t="t2"><dt>\(B_{\text{mem}}\)</dt><dd>memory bandwidth, bytes per second (M3 Max ≈ 400 GB/s, H100 ≈ 3.35 TB/s)</dd></div>
+    <div data-t="t3"><dt>\(M_{\text{weights}}\)</dt><dd>bytes of weights read per token</dd></div>
+    <div data-t="t4"><dt>\(M_{\text{KV}}\)</dt><dd>bytes of KV cache read per token (grows with context, Module 08)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each token requires streaming every weight once. Halve the bytes and you roughly double the ceiling.</p>
+  <p class="why"><b>Why it matters</b>That's why quantization speeds up generation even though the arithmetic is the same: the bottleneck is moving bytes, not doing multiplies.</p>
+</div>
+
+<div id="w-size"></div>
+
+<div class="intuition"><b>Intuition</b>
+<p>Picture the weights as a library the model has to read cover to cover for every word it writes. Quantization is printing the same library in a smaller font. Read too small and you start misreading letters.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="floats">How computers store numbers</h2>
+
+<p>Before compressing numbers, you need to know how they're stored. A floating-point number has three fields, like scientific notation in base 2:</p>
+
+<div class="formula" data-name="Floating-point value">
+  <div class="tex">$$x = (-1)^{\htmlClass{t2}{s}} \times 2^{\,\htmlClass{t3}{e} - \htmlClass{t4}{\text{bias}}} \times \left(1 + \frac{\htmlClass{t1}{m}}{2^{\htmlClass{t5}{M}}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t2"><dt>\(s\)</dt><dd><b>sign</b> bit: 0 for positive, 1 for negative</dd></div>
+    <div data-t="t3"><dt>\(e\)</dt><dd><b>exponent</b> field (unsigned int). More exponent bits = wider <em>range</em></dd></div>
+    <div data-t="t4"><dt>bias</dt><dd>\(2^{E-1}-1\), so the exponent can be negative (fp32: 127)</dd></div>
+    <div data-t="t1"><dt>\(m\)</dt><dd><b>mantissa</b> field. More mantissa bits = finer <em>precision</em></dd></div>
+    <div data-t="t5"><dt>\(M\)</dt><dd>number of mantissa bits (fp32: 23, bf16: 7)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The exponent picks which power-of-two "bucket" you're in. The mantissa picks a point inside that bucket, using \(2^M\) evenly spaced slots.</p>
+  <p class="why"><b>Why it matters</b>Precision is <em>relative</em>: gaps between neighbouring values grow with the magnitude. Integers are the opposite, with equal gaps everywhere, so you need a scale factor to use them.</p>
+</div>
+
+<figure class="fig wide"><div id="fig-bits"></div>
+<figcaption>Bit layouts of common formats. bf16 keeps fp32's 8 exponent bits, so it covers the same range (about \(10^{\pm38}\)) and gives up precision instead. That's why it replaced fp16 for training, where fp16's narrow range overflowed or underflowed gradients and needed loss scaling.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Format</th><th class="num">Bits</th><th class="num">Exp / mant</th><th class="num">Max value</th><th class="num">Relative step</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>fp32</td><td class="num">32</td><td class="num">8 / 23</td><td class="num">3.4e38</td><td class="num">~1e-7</td><td>Optimizer states, master weights, reductions</td></tr>
+    <tr><td>bf16</td><td class="num">16</td><td class="num">8 / 7</td><td class="num">3.4e38</td><td class="num">~8e-3</td><td>Default training &amp; inference dtype</td></tr>
+    <tr><td>fp16</td><td class="num">16</td><td class="num">5 / 10</td><td class="num">65,504</td><td class="num">~1e-3</td><td>Inference, older GPUs; training needs loss scaling</td></tr>
+    <tr><td>fp8 E4M3</td><td class="num">8</td><td class="num">4 / 3</td><td class="num">448</td><td class="num">~0.125</td><td>H100+/Blackwell matmuls, weights &amp; activations</td></tr>
+    <tr><td>fp8 E5M2</td><td class="num">8</td><td class="num">5 / 2</td><td class="num">57,344</td><td class="num">~0.25</td><td>Gradients (need range more than precision)</td></tr>
+    <tr><td>int8</td><td class="num">8</td><td class="num">n/a</td><td class="num">127 × scale</td><td class="num">uniform</td><td>Weights (and activations in W8A8)</td></tr>
+    <tr><td>int4 / NF4</td><td class="num">4</td><td class="num">n/a</td><td class="num">7 × scale</td><td class="num">uniform / quantile</td><td>Weight-only inference, QLoRA</td></tr>
+  </tbody>
+</table>
+
+<div id="w-float"></div>
+
+<details class="think"><summary>Think first: why does 0.1 look slightly wrong in every format?</summary>
+<div>0.1 in binary is 0.0001100110011… repeating forever, the same way 1/3 repeats in decimal. Every format cuts it off somewhere, and fewer mantissa bits means an earlier cut. In bf16, 0.1 is stored as 0.10009765625. Your model weights carry rounding like that all the time, and it's mostly harmless because networks tolerate noise.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="int">Integer quantization: scale and zero point</h2>
+
+<p>Integers are cheap to store and fast to multiply, but they have a fixed grid: int8 can only say −128…127. To represent a weight like −0.0371, we choose a <strong>scale</strong> \(s\) and store \(q = \text{round}(x/s)\). To read it back we compute \(\hat{x} = s\cdot q\). The whole game is choosing \(s\) well.</p>
+
+<h3>Symmetric (absmax) quantization</h3>
+<div class="formula" data-name="Absmax quantization">
+  <div class="tex">$$\htmlClass{t1}{s} = \frac{\max_i |\htmlClass{t2}{x_i}|}{2^{\htmlClass{t3}{b}-1}-1}, \qquad \htmlClass{t4}{q_i} = \text{clamp}\!\left(\text{round}\!\left(\frac{\htmlClass{t2}{x_i}}{\htmlClass{t1}{s}}\right),\, -2^{\htmlClass{t3}{b}-1}+1,\; 2^{\htmlClass{t3}{b}-1}-1\right), \qquad \htmlClass{t5}{\hat{x}_i} = \htmlClass{t1}{s}\cdot \htmlClass{t4}{q_i}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(s\)</dt><dd><b>scale</b>: real-number size of one integer step. Stored in fp16 alongside the ints</dd></div>
+    <div data-t="t2"><dt>\(x_i\)</dt><dd>original weights in this block</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bit width. 8-bit: \(2^7-1=127\) levels each side. 4-bit: 7</dd></div>
+    <div data-t="t4"><dt>\(q_i\)</dt><dd>the stored integer</dd></div>
+    <div data-t="t5"><dt>\(\hat{x}_i\)</dt><dd>dequantized value used at compute time. Error is \(x_i-\hat{x}_i\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Stretch the integer grid so its end lands exactly on the largest weight, then snap every weight to the nearest grid point.</p>
+  <p class="why"><b>Why it matters</b>The biggest value sets the step size for <em>everyone</em>. One huge outlier makes the steps coarse, and all the small weights round to 0.</p>
+</div>
+
+<h3>Asymmetric (zero-point / affine) quantization</h3>
+<div class="formula" data-name="Zero-point quantization">
+  <div class="tex">$$\htmlClass{t1}{s} = \frac{\max(\htmlClass{t2}{x}) - \min(\htmlClass{t2}{x})}{2^{\htmlClass{t3}{b}}-1}, \qquad \htmlClass{t6}{z} = \text{round}\!\left(-\frac{\min(\htmlClass{t2}{x})}{\htmlClass{t1}{s}}\right), \qquad \htmlClass{t4}{q_i}=\text{clamp}\!\left(\text{round}\!\left(\tfrac{\htmlClass{t2}{x_i}}{\htmlClass{t1}{s}}\right)+\htmlClass{t6}{z},\,0,\,2^{\htmlClass{t3}{b}}-1\right), \qquad \hat{x}_i = \htmlClass{t1}{s}\,(\htmlClass{t4}{q_i}-\htmlClass{t6}{z})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(s\)</dt><dd>scale: the [min, max] range divided into \(2^b-1\) steps</dd></div>
+    <div data-t="t6"><dt>\(z\)</dt><dd><b>zero point</b>: which integer represents real 0, which shifts the grid</dd></div>
+    <div data-t="t2"><dt>\(x\)</dt><dd>values in the block</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bit width. Uses all \(2^b\) levels, unsigned</dd></div>
+    <div data-t="t4"><dt>\(q_i\)</dt><dd>unsigned stored integer</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Instead of centring the grid on zero, slide it to cover exactly the range the data occupies.</p>
+  <p class="why"><b>Why it matters</b>For lopsided data (activations after ReLU/GELU are mostly positive), absmax wastes half its levels on values that never occur. A zero point recovers them, at the cost of storing \(z\) and doing a subtraction.</p>
+</div>
+
+<div id="w-quant"></div>
+
+<div class="def"><b>Definition · SNR</b>
+<p>Signal-to-noise ratio in decibels: \(\text{SNR} = 10\log_{10}\frac{\sum x_i^2}{\sum (x_i-\hat x_i)^2}\). Every extra bit adds about 6 dB, because it halves the step size, and the error power then drops by 4×. Use it as a quick sanity check when you write your own quantizer.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="granularity">Outliers and granularity</h2>
+
+<p>The widget above shows the central problem: <strong>one outlier sets the scale for its whole block</strong>. Real LLM weights and activations have exactly this problem. A few channels carry values 10–100× larger than the rest. The standard fix is to give smaller blocks their own scales.</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">Per-tensor</div><h4>One scale per matrix</h4><p>Cheapest. A single outlier anywhere ruins precision everywhere. Fine for int8 on well-behaved tensors, bad for 4-bit.</p></div>
+  <div class="card"><div class="k">Per-channel</div><h4>One scale per row</h4><p>Each output channel gets its own range. The standard for int8 weights. The overhead is negligible: one fp16 per row of thousands.</p></div>
+  <div class="card"><div class="k">Per-group</div><h4>One scale per 32–128 weights</h4><p>Required for good 4-bit. Outliers only damage their own small group. Costs extra bits: a 16-bit scale per 32 weights is +0.5 bits/weight.</p></div>
+</div>
+
+<div class="formula" data-name="Effective bits per weight">
+  <div class="tex">$$\htmlClass{t1}{b_{\text{eff}}} = \htmlClass{t2}{b} + \frac{\htmlClass{t3}{b_s} + \htmlClass{t4}{b_z}}{\htmlClass{t5}{g}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(b_{\text{eff}}\)</dt><dd>real storage cost per weight</dd></div>
+    <div data-t="t2"><dt>\(b\)</dt><dd>bits for the integer itself (e.g. 4)</dd></div>
+    <div data-t="t3"><dt>\(b_s\)</dt><dd>bits for each group's scale (fp16 → 16)</dd></div>
+    <div data-t="t4"><dt>\(b_z\)</dt><dd>bits for each group's zero point or min (0 if symmetric)</dd></div>
+    <div data-t="t5"><dt>\(g\)</dt><dd>group size: how many weights share one scale</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Smaller groups give better accuracy but more metadata. 4-bit with an fp16 scale and bias per 64 weights (MLX's default) costs 4 + 32/64 = 4.5 bits.</p>
+</div>
+
+<div id="w-gran"></div>
+
+<h3>Activation outliers: LLM.int8() and SmoothQuant</h3>
+<p>Weights are easy because they're fixed, so you can inspect them offline. <strong>Activations</strong> change with every input, and in models above a few billion parameters, a handful of hidden dimensions systematically produce huge values (Dettmers et al., 2022). Two classic responses:</p>
+<ul>
+  <li><strong>LLM.int8()</strong> splits the matmul. The few outlier columns run in fp16 and the remaining 99.9% run in int8. Accurate, but the split slows it down.</li>
+  <li><strong>SmoothQuant</strong> moves the difficulty from activations to weights with an exact rescaling. Divide each activation channel by \(s_j\) and multiply the matching weight row by \(s_j\), and the product is unchanged.</li>
+</ul>
+
+<div class="formula" data-name="SmoothQuant migration">
+  <div class="tex">$$\mathbf{Y} = \big(\htmlClass{t1}{\mathbf{X}}\,\mathrm{diag}(\htmlClass{t2}{\mathbf{s}})^{-1}\big)\big(\mathrm{diag}(\htmlClass{t2}{\mathbf{s}})\,\htmlClass{t3}{\mathbf{W}}\big), \qquad \htmlClass{t2}{s_j} = \frac{\max|\htmlClass{t1}{\mathbf{X}_j}|^{\htmlClass{t4}{\alpha}}}{\max|\htmlClass{t3}{\mathbf{W}_j}|^{1-\htmlClass{t4}{\alpha}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{X}\)</dt><dd>activations; column \(j\) may be an outlier channel</dd></div>
+    <div data-t="t2"><dt>\(s_j\)</dt><dd>per-channel smoothing factor</dd></div>
+    <div data-t="t3"><dt>\(\mathbf{W}\)</dt><dd>weights; row \(j\) absorbs the scale</dd></div>
+    <div data-t="t4"><dt>\(\alpha\)</dt><dd>migration strength, typically 0.5: split the difficulty evenly</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Mathematically a no-op, but it flattens the spiky activations so both sides quantize cleanly to int8.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="smart">Smarter quantizers: NF4, GPTQ, AWQ</h2>
+
+<p>Rounding each weight to its nearest grid point ("round-to-nearest", RTN) is the baseline. Everything in this section tries to beat it at the same bit budget, either with a smarter grid or by choosing roundings that cancel each other's error.</p>
+
+<h3>NF4: put the levels where the weights are</h3>
+<p>Trained weights are roughly normally distributed: lots near zero, few in the tails. A uniform int4 grid spends as many levels on the empty tails as on the crowded centre. <strong>NormalFloat-4</strong> (from the QLoRA paper) places its 16 levels at quantiles of a normal distribution, so each level gets about the same share of weights.</p>
+
+<figure class="fig"><div id="fig-nf4"></div>
+<figcaption>Normalized weight distribution (curve) with the 16 NF4 levels (green, top row) against the uniform int4 levels (brick, bottom row). NF4 packs levels densely near zero, where most weights sit. QLoRA then applies <em>double quantization</em>: the per-block fp32 scales are themselves quantized to 8 bits, saving roughly 0.37 bits per weight.</figcaption></figure>
+
+<h3>GPTQ: let later columns fix earlier mistakes</h3>
+<p>RTN treats every weight independently. But what matters isn't the error in the weights, it's the error in the layer's <em>output</em> on real inputs. GPTQ (Frantar et al., 2022) solves that problem, one layer at a time:</p>
+
+<div class="formula" data-name="Layer-wise reconstruction objective">
+  <div class="tex">$$\htmlClass{t1}{\widehat{\mathbf{W}}} = \arg\min_{\widehat{\mathbf{W}} \in \text{grid}} \big\lVert \htmlClass{t2}{\mathbf{W}}\htmlClass{t3}{\mathbf{X}} - \htmlClass{t1}{\widehat{\mathbf{W}}}\htmlClass{t3}{\mathbf{X}} \big\rVert_F^2, \qquad \htmlClass{t4}{\mathbf{H}} = 2\,\htmlClass{t3}{\mathbf{X}}\htmlClass{t3}{\mathbf{X}}^{\top}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\widehat{\mathbf{W}}\)</dt><dd>quantized weights, restricted to representable values</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{W}\)</dt><dd>original full-precision layer weights</dd></div>
+    <div data-t="t3"><dt>\(\mathbf{X}\)</dt><dd>layer inputs collected from a few hundred <b>calibration</b> samples</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{H}\)</dt><dd>Hessian of that loss: which input directions the output is sensitive to</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Make the quantized layer produce the same outputs as the original on realistic inputs, even if individual weights end up farther from their originals.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 760 250" id="fig-gptq"></svg>
+<figcaption>GPTQ sweeps through the columns. It quantizes column \(j\), measures the rounding error, and uses \(\mathbf{H}^{-1}\) to adjust the not-yet-quantized columns so they compensate. That way errors cancel instead of piling up. It runs in minutes to hours on one GPU, even for large models.</figcaption></figure>
+
+<h3>AWQ: protect the weights that matter</h3>
+<p>Activation-aware Weight Quantization (Lin et al., 2023) observes that roughly 1% of weight channels matter far more than the rest: the ones multiplied by large activations. Instead of keeping them in fp16 (awkward for kernels), AWQ <strong>scales those channels up before quantizing</strong> and scales the matching activations down, the same trick as SmoothQuant. The salient weights then get relatively finer steps. AWQ needs no backprop and only a small calibration set, which makes it fast and robust.</p>
+
+<div class="flag"><b>Calibration caveat</b>
+<p>GPTQ and AWQ fit to calibration data. If you calibrate on generic English web text and then deploy on code or another language, you may lose more quality than RTN would have. Calibrate on data that looks like your workload.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="formats">Formats you'll meet in the wild</h2>
+
+<p>Every inference stack has its own on-disk format. Here's how to decode the names. Bits-per-weight figures include scale overhead and are approximate for mixed formats.</p>
+
+<table class="t">
+  <thead><tr><th>Name</th><th>Where</th><th class="num">≈ bits/wt</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td>Q8_0</td><td>llama.cpp (GGUF)</td><td class="num">8.5</td><td>Blocks of 32 int8 weights + one fp16 scale. Effectively lossless.</td></tr>
+    <tr><td>Q6_K</td><td>llama.cpp</td><td class="num">6.56</td><td>"K-quant": super-blocks of 256 split into sub-blocks with their own quantized scales.</td></tr>
+    <tr><td>Q5_K_M</td><td>llama.cpp</td><td class="num">~5.7</td><td>Mostly 5-bit K-quant; the <code>_M</code> ("medium") mix bumps sensitive tensors to higher precision.</td></tr>
+    <tr><td>Q4_K_M</td><td>llama.cpp</td><td class="num">~4.8</td><td>Mostly Q4_K (4.5 bpw) with some tensors such as <code>attn_v</code> and parts of <code>ffn_down</code> in Q6_K. The popular default.</td></tr>
+    <tr><td>Q3_K_M / Q2_K</td><td>llama.cpp</td><td class="num">~3.9 / ~2.6–3.0</td><td>Aggressive. Usable mainly for very large models.</td></tr>
+    <tr><td>IQ4_XS, IQ3_M…</td><td>llama.cpp</td><td class="num">varies</td><td>"i-quants": non-uniform codebooks plus an importance matrix from calibration data.</td></tr>
+    <tr><td>MLX 4-bit</td><td>Apple MLX</td><td class="num">4.5</td><td>Affine: 4-bit ints, fp16 scale + bias per group of 64.</td></tr>
+    <tr><td>GPTQ / AWQ</td><td>vLLM, TGI, HF</td><td class="num">~4.1–4.25</td><td>4-bit, group size 128, safetensors. Fast GPU kernels (Marlin, ExLlama).</td></tr>
+    <tr><td>bnb NF4</td><td>bitsandbytes / HF</td><td class="num">~4.13</td><td>NF4 with double-quantized scales. The basis of QLoRA training.</td></tr>
+    <tr><td>FP8 (E4M3)</td><td>vLLM, TensorRT-LLM</td><td class="num">8</td><td>Native on H100/Blackwell tensor cores. Weights and activations (W8A8).</td></tr>
+    <tr><td>MXFP4</td><td>OCP microscaling</td><td class="num">4.25</td><td>fp4 (E2M1) values in blocks of 32 sharing an 8-bit power-of-two scale. Native on Blackwell.</td></tr>
+  </tbody>
+</table>
+
+<h3>Weight-only vs weights + activations</h3>
+<div class="grid2">
+  <div class="card"><div class="k">W4A16 · weight-only</div><h4>Shrink storage, compute in 16-bit</h4><p>Weights are dequantized on the fly inside the kernel, then multiplied in bf16/fp16. Big win for <b>decode</b>, which is bandwidth-bound. Little or no win for <b>prefill</b>, which is compute-bound, and the dequant overhead can even slow it down.</p></div>
+  <div class="card blue"><div class="k">W8A8 · weights + activations</div><h4>Do the math in low precision too</h4><p>Both operands in int8/fp8, using low-precision tensor cores at roughly 2× the bf16 throughput. Helps compute-bound workloads such as prefill and large-batch serving. Needs activation-outlier handling (SmoothQuant, per-token scales).</p></div>
+</div>
+
+<div class="mle"><b>MLE angle · KV cache quantization</b>
+<p>At long contexts the KV cache can outgrow the weights (Module 08: about 128 KB/token for Llama-3-8B in fp16, so 1 GB per 8K tokens). Quantizing the cache to 8-bit halves that, and engines expose it as a flag (vLLM <code>--kv-cache-dtype fp8</code>, llama.cpp <code>--cache-type-k q8_0</code>). Keys tend to have channel outliers, so they're more sensitive than values.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="quality">Measuring the damage</h2>
+
+<p>Never trust "4-bit is fine" blindly. Measure it on <em>your</em> model and task. Three levels of evidence, from cheapest to most meaningful:</p>
+<ol>
+  <li><strong>Perplexity</strong> on held-out text (Module 03). Cheap and sensitive, but small perplexity changes don't map cleanly to task quality.</li>
+  <li><strong>KL divergence to the full-precision model</strong>: run both on the same text and measure how far the quantized next-token distribution drifts. <code>llama-perplexity --kl-divergence</code> does exactly this. It's better than perplexity because it catches changes that average out.</li>
+  <li><strong>Task evals</strong>: your real prompts, scored the same way you score production (Module 13). Reasoning, math, code, and long context usually degrade first.</li>
+</ol>
+
+<figure class="fig"><svg viewBox="0 0 760 210" id="fig-ladder"></svg>
+<figcaption>Rules of thumb for weight-only quantization of modern 7B–70B models. These are community experience, not guarantees: smaller models and reasoning-heavy tasks degrade sooner, and good methods (K-quants, AWQ, i-quants) shift the bands to the left.</figcaption></figure>
+
+<div class="intuition"><b>The rule that surprises people</b>
+<p>At a fixed memory budget, a <em>larger</em> model at 4-bit usually beats a <em>smaller</em> model at 16-bit. A 14B model at Q4 (~8.5 GB) generally outperforms a 4B model in bf16 (~8 GB). Parameters carry more capability than the last few bits of precision.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="qat">Post-training vs quantization-aware training</h2>
+
+<p>Everything so far has been <strong>post-training quantization (PTQ)</strong>: train in high precision, compress afterwards. <strong>Quantization-aware training (QAT)</strong> simulates quantization <em>during</em> training (or a short fine-tune), so the weights settle into spots that survive rounding. Google's QAT releases of Gemma and the MXFP4-native gpt-oss models work this way.</p>
+
+<div class="formula" data-name="Straight-through estimator">
+  <div class="tex">$$\text{forward: } \htmlClass{t1}{\hat{w}} = s\cdot\text{round}(\htmlClass{t2}{w}/s) \qquad\quad \text{backward: } \frac{\partial \mathcal{L}}{\partial \htmlClass{t2}{w}} \approx \frac{\partial \mathcal{L}}{\partial \htmlClass{t1}{\hat{w}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat{w}\)</dt><dd>"fake-quantized" weight used in the forward pass</dd></div>
+    <div data-t="t2"><dt>\(w\)</dt><dd>latent full-precision weight that the optimizer actually updates</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Rounding has zero gradient almost everywhere, which would stop learning cold. So we pretend it's the identity function on the way back and pass the gradient straight through.</p>
+  <p class="why"><b>Why it matters</b>This hack is how every QAT method and every binary or ternary network (e.g. BitNet) trains at all.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="choose">Choosing a quantization</h2>
+
+<figure class="fig"><svg viewBox="0 0 860 330" id="fig-decide"></svg>
+<figcaption>A practical decision path. Start from where the model will run, because the runtime decides which formats are even available.</figcaption></figure>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Write your own group-wise quantizer (do this first)</h3>
+<p>Thirty lines of NumPy will teach you more than any paper. Then try group sizes 32/64/128/full row and bit widths 8/4/3/2 on a real weight matrix, and check that the SNR changes match what the widgets above predict.</p>
+<div class="code" data-lang="python" data-title="quantize.py"><pre><code>
+import numpy as np
+
+def quantize_groupwise(w, bits=4, group=64):
+    """Symmetric absmax quantization with one fp16 scale per group."""
+    rows, cols = w.shape
+    assert cols % group == 0
+    g = w.reshape(rows, cols // group, group)            # (rows, n_groups, group)
+    qmax = 2 ** (bits - 1) - 1                            # 7 for int4
+    scale = np.abs(g).max(axis=-1, keepdims=True) / qmax  # one scale per group
+    scale = np.where(scale == 0, 1e-8, scale).astype(np.float16)
+    q = np.clip(np.round(g / scale), -qmax, qmax).astype(np.int8)
+    return q, scale
+
+def dequantize(q, scale, shape):
+    return (q.astype(np.float32) * scale.astype(np.float32)).reshape(shape)
+
+def snr_db(w, w_hat):
+    return 10 * np.log10((w ** 2).sum() / ((w - w_hat) ** 2).sum())
+
+rng = np.random.default_rng(0)
+w = rng.normal(0, 0.02, size=(4096, 4096)).astype(np.float32)
+w[:, 7] *= 40                                             # inject an outlier channel
+
+for group in (32, 64, 128, 4096):
+    q, s = quantize_groupwise(w, bits=4, group=group)
+    eff_bits = 4 + 16 / group
+    print(f"group={group:5d}  bits/wt={eff_bits:.3f}  SNR={snr_db(w, dequantize(q, s, w.shape)):.1f} dB")
+</code></pre></div>
+
+<h3>2. Quantize and measure with llama.cpp</h3>
+<div class="code" data-lang="bash" data-title="llama.cpp"><pre><code>
+# convert a Hugging Face checkpoint to a 16-bit GGUF
+python convert_hf_to_gguf.py ./Llama-3.2-3B-Instruct --outtype bf16 --outfile model-bf16.gguf
+
+# make several quantized variants
+for q in Q8_0 Q6_K Q4_K_M Q3_K_M Q2_K; do
+  llama-quantize model-bf16.gguf model-$q.gguf $q
+done
+
+# quality: save base logits once, then KL-divergence of each quant against them
+llama-perplexity -m model-bf16.gguf -f wiki.test.raw --kl-divergence-base base.kld
+llama-perplexity -m model-Q4_K_M.gguf --kl-divergence-base base.kld --kl-divergence
+
+# speed: prompt processing (pp) and token generation (tg) throughput
+llama-bench -m model-bf16.gguf -m model-Q4_K_M.gguf -p 512 -n 128
+</code></pre></div>
+
+<h3>3. On a Mac with MLX</h3>
+<div class="code" data-lang="bash" data-title="mlx-lm"><pre><code>
+pip install mlx-lm
+# 4-bit, group size 64 (=> 4.5 bits/weight)
+mlx_lm.convert --hf-path Qwen/Qwen2.5-7B-Instruct -q --q-bits 4 --q-group-size 64 --mlx-path qwen7b-4bit
+mlx_lm.generate --model qwen7b-4bit --prompt "Explain KV caching in one paragraph." --max-tokens 200
+</code></pre></div>
+
+<h3>4. In PyTorch with bitsandbytes (the QLoRA setup)</h3>
+<div class="code" data-lang="python" data-title="transformers + bitsandbytes"><pre><code>
+import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",            # NormalFloat-4 levels
+    bnb_4bit_use_double_quant=True,       # quantize the scales too
+    bnb_4bit_compute_dtype=torch.bfloat16 # dequantize to bf16 for the matmul
+)
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B", quantization_config=bnb, device_map="auto")
+print(model.get_memory_footprint() / 1e9, "GB")
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have a table for one model with columns <em>quant · file size · bits/wt · KL-div vs bf16 · tg tok/s · pp tok/s</em>, and you can explain every row from the formulas in this module. In particular: why tg speeds up much more than pp.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="09-main" data-title="Check yourself · Quantization">
+  <div class="q" data-answer="2"><p>A 70B model in Q4_K_M (~4.8 bits/weight). Roughly how much memory do the weights need?</p>
+    <ol><li>~17.5 GB</li><li>~35 GB</li><li>~42 GB</li><li>~140 GB</li></ol>
+    <div class="explain">70×10⁹ × 4.8 / 8 ≈ 42×10⁹ bytes ≈ 39 GiB. 35 GB would be exactly 4.0 bits with no scale overhead. 140 GB is bf16.</div></div>
+  <div class="q" data-answer="1"><p>Why did bf16 replace fp16 as the default training format?</p>
+    <ol><li>It has more mantissa bits, so it's more precise</li><li>It has fp32's exponent range, so gradients don't overflow or underflow</li><li>It uses less memory than fp16</li><li>GPUs can't multiply fp16</li></ol>
+    <div class="explain">bf16 has 8 exponent bits like fp32 but only 7 mantissa bits, so it's <em>less</em> precise than fp16 (10). Range turned out to matter more for training stability, and it removes the need for loss scaling.</div></div>
+  <div class="q" data-answer="3"><p>You absmax-quantize a block of 64 weights to int4. One weight is 30× larger than the others. What happens?</p>
+    <ol><li>The outlier gets clipped and everything else is fine</li><li>Nothing, int4 has enough levels</li><li>The outlier is stored with high error</li><li>The scale becomes huge, so most small weights round to 0</li></ol>
+    <div class="explain">Absmax sets the scale from the largest value, so the outlier is represented almost exactly and everyone else loses resolution. That's why group size and outlier handling matter so much at 4 bits.</div></div>
+  <div class="q" data-answer="0"><p>Weight-only int4 quantization makes token generation (decode) much faster but barely changes prompt processing (prefill). Why?</p>
+    <ol><li>Decode is memory-bandwidth-bound; prefill is compute-bound and still multiplies in 16-bit</li><li>Prefill doesn't use the weights</li><li>Prefill weights are cached in fp32</li><li>int4 is only supported during decode</li></ol>
+    <div class="explain">Decode reads every weight for one token, so fewer bytes means faster. Prefill processes thousands of tokens per weight read, so arithmetic dominates, and W4A16 kernels still do that arithmetic in bf16, plus dequant overhead.</div></div>
+  <div class="q" data-answer="2"><p>What does GPTQ optimize that plain round-to-nearest ignores?</p>
+    <ol><li>The number of bits per weight</li><li>The size of the calibration set</li><li>The error in the layer's outputs on real inputs, letting later weights compensate for earlier rounding</li><li>The training loss on the full dataset</li></ol>
+    <div class="explain">GPTQ minimizes ‖WX − ŴX‖² using second-order (Hessian) information from calibration activations. When one column is rounded, the remaining columns are adjusted to cancel the error.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, heatmap, widget, fmtNum, fmtBytes, rng, palette, clamp } = C;
+
+  /* ---------------------------------------------------------- size & speed calculator */
+  (function () {
+    const w = widget("w-size", { title: "How big, how fast?", kicker: "Calculator", note: "Ceiling = bandwidth ÷ weight bytes, batch 1, dense model, short context. Real engines usually reach 60–85% of it. Mixture-of-experts models only read their <em>active</em> parameters per token, so they decode faster than their total size suggests." });
+    const devices = [
+      { v: "air", l: "MacBook Air M3 · 16 GB · 100 GB/s", mem: 16, bw: 100 },
+      { v: "max", l: "MacBook Pro M4 Max · 64 GB · 546 GB/s", mem: 64, bw: 546 },
+      { v: "ultra", l: "Mac Studio M2 Ultra · 192 GB · 800 GB/s", mem: 192, bw: 800 },
+      { v: "4090", l: "RTX 4090 · 24 GB · 1008 GB/s", mem: 24, bw: 1008 },
+      { v: "h100", l: "H100 SXM · 80 GB · 3350 GB/s", mem: 80, bw: 3350 }
+    ];
+    const fmts = [["fp32", 32], ["bf16", 16], ["Q8_0", 8.5], ["Q6_K", 6.56], ["Q5_K_M", 5.7], ["Q4_K_M", 4.85], ["Q3_K_M", 3.9], ["Q2_K", 2.8]];
+    let dev = devices[1];
+    const SIZES = [0.5, 1, 1.5, 3, 4, 7, 8, 12, 14, 24, 27, 32, 70, 110, 235, 405]; // billions, common open-model sizes
+    const toN = i => SIZES[i];
+    const ps = slider(w.controls, { label: "Parameters", min: 0, max: SIZES.length - 1, step: 1, value: SIZES.indexOf(8), fmt: i => SIZES[i] + "B", onInput: draw });
+    select(w.controls, { label: "Device", options: devices.map(d => ({ value: d.v, label: d.l })), value: "max", onChange: v => { dev = devices.find(d => d.v === v); draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 300, horizontal: true, labelWidth: 80 });
+    const set = stats(w.body, [{ key: "bf16", label: "bf16 weights" }, { key: "q4", label: "Q4_K_M weights" }, { key: "tps16", label: "bf16 ceiling" }, { key: "tps4", label: "Q4_K_M ceiling" }]);
+    function draw() {
+      const N = toN(ps.value) * 1e9;
+      const gb = fmts.map(([, b]) => N * b / 8 / 1e9);
+      const usable = dev.mem * 0.75; // leave room for OS, KV cache, activations
+      B.draw(fmts.map(f => f[0]), gb, {
+        max: Math.max(...gb, dev.mem),
+        colors: gb.map(g => g <= usable ? palette.green : g <= dev.mem ? palette.gold : palette.brick),
+        fmt: v => fmtNum(v, v < 10 ? 1 : 0) + " GB · " + (v <= dev.mem ? fmtNum(dev.bw / v, dev.bw / v < 10 ? 1 : 0) + " tok/s max" : "doesn't fit")
+      });
+      set("bf16", fmtNum(gb[1], 1) + " GB", gb[1] <= usable ? "good" : "bad", gb[1] <= dev.mem ? "fits in " + dev.mem + " GB" : "exceeds " + dev.mem + " GB");
+      set("q4", fmtNum(gb[5], 1) + " GB", gb[5] <= usable ? "good" : "bad", fmtNum(16 / 4.85, 1) + "× smaller than bf16");
+      set("tps16", gb[1] <= dev.mem ? fmtNum(dev.bw / gb[1], 0) + " tok/s" : "—", gb[1] <= dev.mem ? "" : "bad", "upper bound");
+      set("tps4", gb[5] <= dev.mem ? fmtNum(dev.bw / gb[5], 0) + " tok/s" : "—", gb[5] <= dev.mem ? "good" : "bad", "upper bound");
+    }
+    draw();
+    w.body.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 0" }, html: "Bar colours: <b style='color:#1a7a52'>green</b> fits with headroom (≤75% of memory), <b style='color:#9a7b22'>gold</b> technically fits, <b style='color:#b0432e'>brick</b> doesn't fit." }));
+  })();
+
+  /* ---------------------------------------------------------- minifloat encoder */
+  const FORMATS = [
+    { id: "fp32", E: 8, Mb: 23, label: "fp32" },
+    { id: "fp16", E: 5, Mb: 10, label: "fp16", max: 65504 },
+    { id: "bf16", E: 8, Mb: 7, label: "bf16" },
+    { id: "e4m3", E: 4, Mb: 3, label: "fp8 E4M3", max: 448 },
+    { id: "e5m2", E: 5, Mb: 2, label: "fp8 E5M2", max: 57344 }
+  ];
+  function encode(x, f) {
+    const bias = 2 ** (f.E - 1) - 1, emin = 1 - bias;
+    const max = f.max || (2 - 2 ** -f.Mb) * 2 ** ((2 ** f.E - 2) - bias);
+    const sign = x < 0 || Object.is(x, -0) ? 1 : 0;
+    let a = Math.abs(x), q;
+    if (f.id === "fp32") q = Math.abs(Math.fround(a));
+    else if (a === 0) q = 0;
+    else {
+      let e = Math.floor(Math.log2(a));
+      const step = e < emin ? 2 ** (emin - f.Mb) : 2 ** (e - f.Mb);
+      q = Math.round(a / step) * step;
+    }
+    let overflow = false;
+    if (q > max) { q = max; overflow = true; }
+    let expField = 0, mant = 0;
+    if (q !== 0) {
+      const e = Math.floor(Math.log2(q));
+      if (e < emin) { expField = 0; mant = Math.round(q / 2 ** (emin - f.Mb)); }
+      else { expField = e + bias; mant = Math.round((q / 2 ** e - 1) * 2 ** f.Mb); }
+    }
+    const bits = [sign, ...expField.toString(2).padStart(f.E, "0").split("").map(Number), ...mant.toString(2).padStart(f.Mb, "0").split("").map(Number)];
+    return { value: sign ? -q : q, bits, overflow, subnormal: q !== 0 && expField === 0 };
+  }
+
+  /* ---------------------------------------------------------- bit layout figure */
+  (function () {
+    const host = document.getElementById("fig-bits");
+    const rows = [["fp32", 1, 8, 23], ["bf16", 1, 8, 7], ["fp16", 1, 5, 10], ["fp8 E4M3", 1, 4, 3], ["fp8 E5M2", 1, 5, 2], ["int8", 0, 0, 8], ["int4", 0, 0, 4]];
+    const cw = 20, lw = 92, rh = 34;
+    const s = svg("svg", { viewBox: `0 0 ${lw + 32 * cw + 10} ${rows.length * rh + 40}` });
+    rows.forEach(([name, sb, eb, mb], i) => {
+      const y = 8 + i * rh;
+      s.appendChild(svg("text", { x: lw - 10, y: y + 18, "text-anchor": "end", "font-size": 13, class: "mono", fill: palette.ink, text: name }));
+      let x = lw;
+      const add = (n, fill, stroke) => { for (let k = 0; k < n; k++) { s.appendChild(svg("rect", { x: x + 1, y, width: cw - 2, height: 24, rx: 3, fill, stroke, "stroke-width": 1 })); x += cw; } };
+      if (name.startsWith("int")) add(mb, "rgba(47,93,138,.18)", "rgba(47,93,138,.5)");
+      else { add(sb, "rgba(28,27,25,.75)", "none"); add(eb, "rgba(176,67,46,.22)", "rgba(176,67,46,.55)"); add(mb, "rgba(26,122,82,.18)", "rgba(26,122,82,.5)"); }
+    });
+    const ly = rows.length * rh + 24;
+    [["sign", "rgba(28,27,25,.75)"], ["exponent (range)", "rgba(176,67,46,.35)"], ["mantissa (precision)", "rgba(26,122,82,.3)"], ["integer bits (needs external scale)", "rgba(47,93,138,.3)"]].forEach(([t, c], i) => {
+      const x = lw + i * 150;
+      s.appendChild(svg("rect", { x, y: ly - 10, width: 12, height: 12, rx: 2, fill: c }));
+      s.appendChild(svg("text", { x: x + 18, y: ly, "font-size": 12, fill: palette.muted, text: t }));
+    });
+    host.appendChild(s);
+  })();
+
+  /* ---------------------------------------------------------- float explorer widget */
+  (function () {
+    const w = widget("w-float", { title: "Float explorer: what actually gets stored", kicker: "Interactive", note: "Rounding uses round-half-to-even by scale step. E4M3 follows the OCP convention (max 448, no infinities). Values beyond a format's max saturate here; in IEEE fp16 they would become ∞." });
+    const inp = el("input", { type: "text", value: "0.1" });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Type a number" })), inp]));
+    const presets = el("div", { class: "btnrow" });
+    ["0.1", "3.14159265", "0.00001", "70000", "448.5", "-1.7e-6", "1e38"].forEach(p => presets.appendChild(el("button", { class: "btn", text: p, onclick: () => { inp.value = p; draw(); } })));
+    w.controls.appendChild(presets);
+    const out = el("div"); w.body.appendChild(out);
+    inp.addEventListener("input", draw);
+    function draw() {
+      const x = parseFloat(inp.value);
+      out.innerHTML = "";
+      if (!isFinite(x)) { out.textContent = "Enter a finite number."; return; }
+      const table = el("table", { class: "t", style: { margin: "0" } });
+      table.appendChild(el("thead", null, el("tr", null, ["Format", "Bits", "Stored value", "Rel. error"].map((h, i) => el("th", { class: i > 1 ? "num" : "", text: h })))));
+      const tb = el("tbody"); table.appendChild(tb);
+      FORMATS.forEach(f => {
+        const r = encode(x, f);
+        const rel = x === 0 ? 0 : Math.abs(r.value - x) / Math.abs(x);
+        const bitsEl = el("span", { style: { fontFamily: "var(--mono)", fontSize: "12px", letterSpacing: ".5px", whiteSpace: "nowrap" } });
+        r.bits.forEach((b, i) => bitsEl.appendChild(el("span", { text: b, style: { color: i === 0 ? palette.ink : i <= f.E ? palette.brick : palette.green, fontWeight: i === 0 ? 700 : 500 } })));
+        const note = r.overflow ? " · saturated" : r.subnormal ? " · subnormal" : "";
+        tb.appendChild(el("tr", null, [
+          el("td", { text: f.label }),
+          el("td", null, bitsEl),
+          el("td", { class: "num", text: (Math.abs(r.value) >= 1e5 || (Math.abs(r.value) < 1e-3 && r.value !== 0) ? r.value.toExponential(6) : String(+r.value.toPrecision(10))) + note }),
+          el("td", { class: "num", html: `<span style="color:${rel > 0.05 ? palette.brick : rel > 1e-3 ? palette.gold : palette.green}">${rel === 0 ? "exact" : rel.toExponential(2)}</span>` })
+        ]));
+      });
+      out.appendChild(el("div", { style: { overflowX: "auto" } }, table));
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- integer quantization widget */
+  (function () {
+    const w = widget("w-quant", { title: "Quantize 16 weights by hand", kicker: "Interactive", note: "Top row: original weights (circles). Bottom row: where they land after quantization (squares). Grey ticks are every value the integer grid can represent. Push the outlier up and watch the grid get coarser while the small weights collapse onto 0." });
+    const R = rng(7);
+    const base = Array.from({ length: 16 }, () => R.normal() * 0.4);
+    let bitsV = 4, method = "absmax";
+    const ctlBits = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Bits" })));
+    seg(ctlBits, { options: [{ value: 8, label: "8" }, { value: 4, label: "4" }, { value: 3, label: "3" }, { value: 2, label: "2" }], value: 4, onChange: v => { bitsV = v; draw(); } });
+    w.controls.appendChild(ctlBits);
+    const ctlM = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Scheme" })));
+    seg(ctlM, { options: [{ value: "absmax", label: "absmax (symmetric)" }, { value: "zp", label: "zero-point (affine)" }], value: "absmax", onChange: v => { method = v; draw(); } });
+    w.controls.appendChild(ctlM);
+    const out = slider(w.controls, { label: "Outlier (weight #6)", min: 0.4, max: 8, step: 0.05, value: 0.9, fmt: v => v.toFixed(2), onInput: draw });
+    const shift = slider(w.controls, { label: "Shift all weights", min: -1, max: 1, step: 0.02, value: 0, fmt: v => (v >= 0 ? "+" : "") + v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 190" }); wrap.appendChild(s);
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const errB = bars(wrap2, { width: 760, height: 150 });
+    const set = stats(w.body, [{ key: "scale", label: "Scale s" }, { key: "levels", label: "Distinct levels used" }, { key: "zero", label: "Weights → 0" }, { key: "snr", label: "SNR" }]);
+    function quant(x, b, m) {
+      if (m === "absmax") {
+        const qmax = 2 ** (b - 1) - 1, s_ = Math.max(...x.map(Math.abs)) / qmax;
+        const q = x.map(v => clamp(Math.round(v / s_), -qmax, qmax));
+        return { s: s_, q, xh: q.map(v => v * s_), grid: Array.from({ length: 2 * qmax + 1 }, (_, i) => (i - qmax) * s_), z: 0 };
+      }
+      const mn = Math.min(...x), mx = Math.max(...x), L = 2 ** b - 1, s_ = (mx - mn) / L, z = Math.round(-mn / s_);
+      const q = x.map(v => clamp(Math.round(v / s_) + z, 0, L));
+      return { s: s_, q, xh: q.map(v => (v - z) * s_), grid: Array.from({ length: L + 1 }, (_, i) => (i - z) * s_), z };
+    }
+    function draw() {
+      const x = base.map((v, i) => (i === 5 ? out.value : v) + shift.value);
+      const r = quant(x, bitsV, method);
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const lo = Math.min(...x, ...r.grid) * 1.08 - 0.05, hi = Math.max(...x, ...r.grid) * 1.08 + 0.05;
+      const sx = v => 30 + (v - lo) / (hi - lo) * 700;
+      s.appendChild(svg("line", { x1: 30, x2: 730, y1: 95, y2: 95, stroke: palette.ink }));
+      if (r.grid.length <= 64) r.grid.forEach(g => s.appendChild(svg("line", { x1: sx(g), x2: sx(g), y1: 82, y2: 108, stroke: palette.faint, "stroke-width": 1 })));
+      else s.appendChild(svg("rect", { x: sx(r.grid[0]), y: 88, width: sx(r.grid[r.grid.length - 1]) - sx(r.grid[0]), height: 14, fill: "rgba(118,115,107,.18)" }));
+      s.appendChild(svg("line", { x1: sx(0), x2: sx(0), y1: 70, y2: 120, stroke: palette.ink, "stroke-width": 1.5 }));
+      s.appendChild(svg("text", { x: sx(0), y: 134, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.ink, text: "0" }));
+      x.forEach((v, i) => {
+        const col = i === 5 ? palette.brick : palette.green;
+        s.appendChild(svg("line", { x1: sx(v), y1: 40, x2: sx(r.xh[i]), y2: 150, stroke: col, "stroke-width": 0.8, opacity: 0.5 }));
+        s.appendChild(svg("circle", { cx: sx(v), cy: 40, r: 5, fill: col, opacity: 0.85 }));
+        s.appendChild(svg("rect", { x: sx(r.xh[i]) - 4.5, y: 145.5, width: 9, height: 9, fill: col, opacity: 0.85 }));
+      });
+      s.appendChild(svg("text", { x: 30, y: 20, "font-size": 11.5, class: "mono", fill: palette.muted, text: "original x" }));
+      s.appendChild(svg("text", { x: 30, y: 178, "font-size": 11.5, class: "mono", fill: palette.muted, text: "dequantized x̂ = s·(q − z)" }));
+      s.appendChild(svg("text", { x: 730, y: 20, "text-anchor": "end", "font-size": 11.5, class: "mono", fill: palette.muted, text: `${r.grid.length} representable levels` }));
+      const err = x.map((v, i) => v - r.xh[i]);
+      errB.draw(x.map((_, i) => "#" + (i + 1)), err, { max: Math.max(r.s / 2, ...err.map(Math.abs)), colors: err.map((_, i) => i === 5 ? palette.brick : palette.blue), fmt: v => v.toFixed(3) });
+      const sig = x.reduce((a, v) => a + v * v, 0), noise = err.reduce((a, v) => a + v * v, 0);
+      const snr = noise === 0 ? Infinity : 10 * Math.log10(sig / noise);
+      const zeroed = r.xh.filter((v, i) => Math.abs(v) < 1e-12 && Math.abs(x[i]) > 1e-12).length;
+      set("scale", r.s.toFixed(4), null, method === "zp" ? "zero point z = " + r.z : "one step on the grid");
+      set("levels", new Set(r.q).size + " / " + r.grid.length, null, "how much of the grid we use");
+      set("zero", zeroed + " of 16", zeroed > 4 ? "bad" : zeroed > 1 ? "warn" : "good", "information destroyed");
+      set("snr", isFinite(snr) ? snr.toFixed(1) + " dB" : "∞", snr > 25 ? "good" : snr > 12 ? "warn" : "bad", "≈ 6 dB per bit");
+    }
+    draw();
+    w.body.insertBefore(el("p", { class: "small muted", style: { margin: "4px 0 6px" }, text: "Per-weight error  x − x̂  (never larger than s/2 unless clipped):" }), wrap2);
+  })();
+
+  /* ---------------------------------------------------------- granularity widget */
+  (function () {
+    const w = widget("w-gran", { title: "Per-tensor vs per-channel vs per-group", kicker: "Interactive", note: "A synthetic 8×64 weight matrix: rows have different natural scales, and a few individual weights are outliers. Darker cells mean larger absolute quantization error. Symmetric quantization with an fp16 scale per block." });
+    const R = rng(11);
+    const rows = 8, cols = 64;
+    const rowScale = Array.from({ length: rows }, () => Math.exp(R.normal() * 0.7));
+    const W0 = Array.from({ length: rows }, (_, i) => Array.from({ length: cols }, () => R.normal() * 0.02 * rowScale[i]));
+    const outlierPos = [[1, 9], [3, 40], [3, 41], [6, 22], [0, 57]];
+    let gran = "group", bitsV = 4;
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Granularity" })));
+    seg(c1, { options: [{ value: "tensor", label: "per-tensor" }, { value: "channel", label: "per-channel" }, { value: "group", label: "per-group" }], value: "group", onChange: v => { gran = v; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Bits" })));
+    seg(c2, { options: [{ value: 8, label: "8" }, { value: 4, label: "4" }, { value: 3, label: "3" }], value: 4, onChange: v => { bitsV = v; draw(); } });
+    w.controls.appendChild(c2);
+    const gs = slider(w.controls, { label: "Group size", min: 3, max: 6, step: 1, value: 4, fmt: v => String(2 ** v), onInput: draw });
+    const os = slider(w.controls, { label: "Outlier strength", min: 1, max: 40, step: 1, value: 15, fmt: v => v + "×", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap", style: { padding: "10px" } }); w.body.appendChild(wrap);
+    const H = heatmap(wrap, { cell: 11, showValues: false, maxWidth: 760 });
+    const set = stats(w.body, [{ key: "scales", label: "Scales stored" }, { key: "bpw", label: "Effective bits/weight" }, { key: "snr", label: "SNR" }, { key: "worst", label: "Worst row SNR" }]);
+    function draw() {
+      const Wm = W0.map(r => r.slice());
+      outlierPos.forEach(([i, j]) => Wm[i][j] = 0.02 * rowScale[i] * os.value * (j % 2 ? -1 : 1));
+      const qmax = 2 ** (bitsV - 1) - 1, g = 2 ** gs.value;
+      const blocks = [];
+      if (gran === "tensor") blocks.push(Wm.flatMap((r, i) => r.map((_, j) => [i, j])));
+      else if (gran === "channel") Wm.forEach((r, i) => blocks.push(r.map((_, j) => [i, j])));
+      else Wm.forEach((r, i) => { for (let j0 = 0; j0 < cols; j0 += g) blocks.push(Array.from({ length: g }, (_, k) => [i, j0 + k])); });
+      const E = Wm.map(r => r.map(() => 0));
+      blocks.forEach(b => {
+        const s_ = Math.max(...b.map(([i, j]) => Math.abs(Wm[i][j]))) / qmax || 1e-12;
+        b.forEach(([i, j]) => { const q = clamp(Math.round(Wm[i][j] / s_), -qmax, qmax); E[i][j] = Wm[i][j] - q * s_; });
+      });
+      const absE = E.map(r => r.map(Math.abs));
+      H.draw(absE, { max: Math.max(...absE.flat()) * 0.6 || 1, hue: "brick" });
+      const snrOf = (idx) => { let a = 0, b = 0; idx.forEach(([i, j]) => { a += Wm[i][j] ** 2; b += E[i][j] ** 2; }); return 10 * Math.log10(a / b); };
+      const all = Wm.flatMap((r, i) => r.map((_, j) => [i, j]));
+      const snr = snrOf(all);
+      const worst = Math.min(...Wm.map((r, i) => snrOf(r.map((_, j) => [i, j]))));
+      set("scales", String(blocks.length), null, `for ${rows * cols} weights`);
+      set("bpw", (bitsV + 16 * blocks.length / (rows * cols)).toFixed(3), null, `${bitsV} + 16 × ${blocks.length}/${rows * cols}`);
+      set("snr", snr.toFixed(1) + " dB", snr > 20 ? "good" : snr > 12 ? "warn" : "bad", "whole matrix");
+      set("worst", worst.toFixed(1) + " dB", worst > 18 ? "good" : worst > 8 ? "warn" : "bad", "the row that suffers most");
+      gs.wrap.style.opacity = gran === "group" ? 1 : 0.4;
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- NF4 figure */
+  (function () {
+    const nf4 = [-1, -0.6961928, -0.5250731, -0.3949175, -0.2844414, -0.1847734, -0.0910500, 0, 0.0795803, 0.1609302, 0.2461123, 0.3379152, 0.4407098, 0.5626170, 0.7229568, 1];
+    const uni = Array.from({ length: 15 }, (_, i) => (i - 7) / 7);
+    const host = document.getElementById("fig-nf4");
+    const sigma = 0.33;
+    const pdf = x => Math.exp(-x * x / (2 * sigma * sigma));
+    const P = plot(host, { width: 760, height: 280, x: [-1.08, 1.08], y: [-0.25, 1.25], xlabel: "normalized weight value (w / absmax)", yticks: [], margin: { l: 20, b: 40 } });
+    const layers = [{ fn: pdf, color: palette.muted, width: 2, area: true, areaOpacity: 0.08 }];
+    nf4.forEach(v => layers.push({ marker: [v, 1.1], color: palette.green, r: 5 }));
+    uni.forEach(v => layers.push({ marker: [v, -0.12], color: palette.brick, r: 5 }));
+    layers.push({ text: [-1.04, 1.18], label: "NF4 · 16 quantile levels", color: palette.green });
+    layers.push({ text: [-1.04, -0.02], label: "int4 absmax · 15 uniform levels", color: palette.brick });
+    P.draw(layers);
+  })();
+
+  /* ---------------------------------------------------------- GPTQ figure */
+  (function () {
+    const s = document.getElementById("fig-gptq");
+    const cols = 16, rowsN = 6, cw = 30, ch = 22, x0 = 40, y0 = 40, cur = 6;
+    for (let j = 0; j < cols; j++) for (let i = 0; i < rowsN; i++) {
+      const fill = j < cur ? "rgba(26,122,82,.55)" : j === cur ? "rgba(176,67,46,.7)" : "rgba(154,123,34,.22)";
+      s.appendChild(svg("rect", { x: x0 + j * cw, y: y0 + i * ch, width: cw - 3, height: ch - 3, rx: 3, fill }));
+    }
+    const lab = (x, y, t, c, a) => s.appendChild(svg("text", { x, y, "font-size": 12.5, fill: c, "text-anchor": a || "middle", class: "mono", text: t }));
+    lab(x0 + cur * cw / 2, 28, "already quantized (frozen)", palette.green);
+    lab(x0 + cur * cw + cw / 2 - 1, 28, "j", palette.brick);
+    lab(x0 + (cur + 1) * cw + (cols - cur - 1) * cw / 2, 28, "not yet quantized: get updated", palette.gold);
+    const ay = y0 + rowsN * ch + 26;
+    s.appendChild(svg("path", { d: `M${x0 + cur * cw + 14},${y0 + rowsN * ch + 4} C ${x0 + cur * cw + 14},${ay + 18} ${x0 + 12 * cw},${ay + 18} ${x0 + 12 * cw},${y0 + rowsN * ch + 6}`, fill: "none", stroke: palette.ink, "stroke-width": 1.4, "marker-end": "url(#arr)" }));
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arr", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.ink }))); s.appendChild(defs);
+    lab(x0 + 9 * cw, ay + 34, "error δ = w_j − ŵ_j  is spread into the remaining columns using H⁻¹", palette.ink);
+    const tx = x0 + cols * cw + 26;
+    [["1", "Quantize column j (RTN)"], ["2", "Error δ_j = (w_j − ŵ_j) / [H⁻¹]_jj"], ["3", "W_{:, >j} −= δ_j · [H⁻¹]_{j, >j}"], ["4", "Move to j+1 (in blocks, lazily)"]].forEach(([n, t], i) => {
+      s.appendChild(svg("circle", { cx: tx + 9, cy: y0 + 6 + i * 34, r: 9, fill: palette.ink }));
+      s.appendChild(svg("text", { x: tx + 9, y: y0 + 10 + i * 34, "text-anchor": "middle", "font-size": 11, fill: "#fff", class: "mono", text: n }));
+      s.appendChild(svg("text", { x: tx + 26, y: y0 + 10 + i * 34, "font-size": 12.5, fill: palette.ink, text: t }));
+    });
+  })();
+
+  /* ---------------------------------------------------------- quality ladder */
+  (function () {
+    const s = document.getElementById("fig-ladder");
+    const x = b => 40 + (b - 2) / (16 - 2) * 680;
+    const bands = [[2, 3, "rgba(176,67,46,.30)", "2–3 bits", "large drop; only for very big models"], [3, 4, "rgba(176,67,46,.14)", "3–4 bits", "noticeable; fine for chat on 70B+"], [4, 5, "rgba(154,123,34,.20)", "4–5 bits", "sweet spot: small, often invisible loss"], [5, 8.5, "rgba(26,122,82,.16)", "5–8 bits", "near-lossless"], [8.5, 16, "rgba(26,122,82,.07)", "16 bits", "reference"]];
+    bands.forEach(([a, b, c, t1, t2], i) => {
+      s.appendChild(svg("rect", { x: x(a), y: 40, width: x(b) - x(a) - 2, height: 70, rx: 6, fill: c }));
+      s.appendChild(svg("text", { x: (x(a) + x(b)) / 2, y: 70, "text-anchor": "middle", "font-size": 12.5, fill: palette.ink, "font-weight": 600, text: t1 }));
+      const words = t2.split("; ");
+      words.forEach((wd, k) => s.appendChild(svg("text", { x: (x(a) + x(b)) / 2, y: 88 + k * 13, "text-anchor": "middle", "font-size": 10.5, fill: palette.muted, text: wd })));
+    });
+    s.appendChild(svg("line", { x1: 40, x2: 720, y1: 130, y2: 130, stroke: palette.ink }));
+    [2, 3, 4, 5, 6, 8, 12, 16].forEach(b => { s.appendChild(svg("line", { x1: x(b), x2: x(b), y1: 126, y2: 134, stroke: palette.ink })); s.appendChild(svg("text", { x: x(b), y: 150, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.muted, text: b })); });
+    s.appendChild(svg("text", { x: 380, y: 172, "text-anchor": "middle", "font-size": 12, fill: palette.ink, text: "effective bits per weight" }));
+    [["Q2_K", 2.8], ["Q3_K_M", 3.9], ["Q4_K_M", 4.85], ["Q6_K", 6.56], ["Q8_0", 8.5], ["bf16", 16]].forEach(([n, b]) => {
+      s.appendChild(svg("path", { d: `M${x(b)},18 l-4,-7 h8 z`, fill: palette.ink }));
+      s.appendChild(svg("text", { x: x(b), y: 32, "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.ink, text: n }));
+    });
+    s.appendChild(svg("text", { x: 40, y: 200, "font-size": 11, fill: palette.faint, text: "Rule-of-thumb bands, not measurements. Always check KL-divergence and task evals on your own model." }));
+  })();
+
+  /* ---------------------------------------------------------- decision flowchart */
+  (function () {
+    const s = document.getElementById("fig-decide");
+    const box = (x, y, w, h, title, sub, kind) => {
+      const fill = kind === "q" ? "#fbfaf7" : kind === "a" ? "rgba(26,122,82,.08)" : "#fff";
+      const stroke = kind === "a" ? "rgba(26,122,82,.55)" : "rgba(28,27,25,.25)";
+      s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 10, fill, stroke, "stroke-width": 1.2 }));
+      s.appendChild(svg("text", { x: x + w / 2, y: y + (sub ? h / 2 - 3 : h / 2 + 4), "text-anchor": "middle", "font-size": 13, "font-weight": 600, fill: palette.ink, text: title }));
+      if (sub) sub.split("|").forEach((t, i) => s.appendChild(svg("text", { x: x + w / 2, y: y + h / 2 + 13 + i * 13, "text-anchor": "middle", "font-size": 11, fill: palette.muted, text: t })));
+    };
+    const line = (x1, y1, x2, y2, label) => {
+      s.appendChild(svg("path", { d: `M${x1},${y1} C ${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2 - 4}`, fill: "none", stroke: palette.muted, "stroke-width": 1.2, "marker-end": "url(#arr2)" }));
+      if (label) s.appendChild(svg("text", { x: (x1 + x2) / 2 + (x2 > x1 ? 8 : -8), y: (y1 + y2) / 2 - 2, "text-anchor": x2 > x1 ? "start" : "end", "font-size": 11, class: "mono", fill: palette.muted, text: label }));
+    };
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arr2", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.muted }))); s.appendChild(defs);
+    box(330, 10, 200, 44, "Where does it run?", null, "q");
+    box(20, 100, 220, 56, "Mac / laptop / CPU", "llama.cpp, Ollama, MLX", "q");
+    box(320, 100, 220, 56, "Single consumer GPU", "llama.cpp, ExLlamaV2, vLLM", "q");
+    box(620, 100, 220, 56, "Datacenter GPUs, serving", "vLLM, SGLang, TensorRT-LLM", "q");
+    line(400, 54, 130, 100); line(430, 54, 430, 100); line(460, 54, 730, 100);
+    box(20, 200, 220, 70, "GGUF Q4_K_M or MLX 4-bit", "Q5/Q6 if memory allows|Q8_0 when quality is critical", "a");
+    box(320, 200, 220, 70, "AWQ / GPTQ 4-bit (Marlin)", "or GGUF Q4–Q6 / EXL2 with|bits chosen to fill VRAM", "a");
+    box(620, 200, 220, 70, "FP8 W8A8 (H100+)", "AWQ/GPTQ W4A16 for latency at|low batch; FP8 KV cache", "a");
+    line(130, 156, 130, 200); line(430, 156, 430, 200); line(730, 156, 730, 200);
+    s.appendChild(svg("text", { x: 430, y: 305, "text-anchor": "middle", "font-size": 12, fill: palette.ink, text: "Then, always: measure KL-divergence and run your task eval against the 16-bit model before shipping." }));
+  })();
+})();
+</script>
+</body>
+</html>

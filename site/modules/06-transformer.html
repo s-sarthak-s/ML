@@ -1,0 +1,1250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · The transformer — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .w-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  @media (max-width:760px){.w-split{grid-template-columns:1fr}}
+  .w-warn{color:var(--brick);font-size:13px;margin:8px 0 0}
+  #w-attn svg rect.cellbtn{cursor:pointer}
+</style>
+</head>
+<body data-module="06">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 06 · How models work</p>
+<h1 class="title">The <span class="it">transformer</span>, one block at a time</h1>
+<p class="lede">Llama, Qwen, Mistral, Gemma and GPT-2 are all the same machine: an embedding table, one block repeated anywhere from a dozen to more than a hundred times, and a projection back to the vocabulary. Once you can draw that block and count what's inside it, a model card stops being a list of magic numbers. You can read "32 layers, 8 KV heads, d_ff 14336" and know the parameter count, the KV cache size, and where the FLOPs go.</p>
+<div class="meta"><span class="tag">~3.5 hours</span><span class="tag n">prereqs: 01, 03, 04, 05</span><span class="tag g">hands-on: PyTorch</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Draw a decoder-only block from memory and say what each piece reads from and writes to the residual stream.</li>
+    <li>Compute attention by hand: the shapes of Q, K, V and the score matrix, the causal mask, and why scores are divided by \(\sqrt{d_k}\).</li>
+    <li>Explain multi-head attention, and how grouped-query attention shrinks the KV cache without shrinking the model.</li>
+    <li>Show why RoPE makes attention scores depend only on the distance between two tokens.</li>
+    <li>Count a model's parameters and per-token FLOPs from its config to within a fraction of a percent.</li>
+    <li>Write a causal attention block in PyTorch and check it against <code>F.scaled_dot_product_attention</code>.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="stack" data-short="The decoder-only stack">The decoder-only stack</h2>
+
+<p>A decoder-only transformer does one job. Given tokens \(t_1, \dots, t_T\), it produces, <em>at every position</em>, a probability distribution over the next token. Position 5's output is a guess for token 6. During training all \(T\) guesses are scored at once; during generation you only use the last one.</p>
+
+<p>The pipeline is short. Token ids become vectors by looking up rows of an embedding table (Module 05). Those vectors then pass through \(N\) identical <strong>blocks</strong>. Each block has two sub-layers, and each sub-layer follows the same recipe: normalize a copy of the input, compute something, add the result back. After the last block, one more normalization and a matrix multiply turn each vector into \(V\) logits, one per vocabulary entry.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 660" id="fig-stack"></svg>
+<figcaption>A Llama-style decoder-only transformer, read bottom to top. The vertical line on the left is the residual stream: a \([B, T, d]\) tensor that every sub-layer reads from (through an RMSNorm) and adds back into. Attention is the only place where positions exchange information; the MLP works on each position separately. Parameter counts on the right are for Llama-3-8B.</figcaption></figure>
+
+<div class="grid2">
+  <div class="card blue"><div class="k">Attention · communication</div><h4>Tokens read from each other</h4><p>Each position builds a weighted average of information from earlier positions. This is how "it" finds out which noun it refers to. It's the only operation in the network whose output at position \(t\) depends on other positions.</p></div>
+  <div class="card"><div class="k">MLP · computation</div><h4>Each token thinks alone</h4><p>A two-layer network applied independently to every position. It holds most of the parameters (about 70% in Llama-3-8B) and is where much of the model's stored knowledge appears to live.</p></div>
+</div>
+
+<div class="def"><b>Definition · decoder-only</b>
+<p>The original Transformer (Vaswani et al., 2017) was built for translation: an <em>encoder</em> read the source sentence with full bidirectional attention, and a <em>decoder</em> generated the target while also attending to the encoder's output. GPT-style language models keep only the decoder stack, drop that cross-attention, and keep the causal mask so each position sees only its past. "Transformer" in this course means this decoder-only variant.</p>
+</div>
+
+<details class="think"><summary>Think first: in Llama-3-8B, which component holds the most parameters?</summary>
+<div>The MLPs. Each layer's SwiGLU MLP has \(3 \times 4096 \times 14336 \approx 176\)M parameters against about 42M for attention, so across 32 layers the MLPs hold 5.64B of the 8.03B total. Embeddings and the LM head together are 1.05B, and attention is only 1.34B. You'll verify every one of those numbers with the calculator in §06.11.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="residual" data-short="The residual stream">The residual stream</h2>
+
+<p>Look again at the figure and follow the left-hand line. The input to block 1 is the embedding. Its output is the embedding <em>plus</em> whatever attention added, <em>plus</em> whatever the MLP added. Block 2 starts from that sum. Nothing ever replaces the vector; each sub-layer only adds a correction to it.</p>
+
+<div class="formula" data-name="Pre-norm block update">
+  <div class="tex">$$\htmlClass{t2}{x'} = \htmlClass{t1}{x} + \htmlClass{t3}{\text{Attn}}\big(\htmlClass{t5}{\text{Norm}_1}(\htmlClass{t1}{x})\big), \qquad \htmlClass{t6}{x''} = \htmlClass{t2}{x'} + \htmlClass{t4}{\text{MLP}}\big(\htmlClass{t5}{\text{Norm}_2}(\htmlClass{t2}{x'})\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(x\)</dt><dd>residual stream entering the block, shape \([B, T, d]\)</dd></div>
+    <div data-t="t2"><dt>\(x'\)</dt><dd>stream after the attention sub-layer has added its output</dd></div>
+    <div data-t="t3"><dt>Attn</dt><dd>causal multi-head self-attention (§06.3 to §06.7)</dd></div>
+    <div data-t="t4"><dt>MLP</dt><dd>position-wise feed-forward network (§06.10)</dd></div>
+    <div data-t="t5"><dt>Norm</dt><dd>RMSNorm (or LayerNorm), each with its own learned gain \(\gamma\)</dd></div>
+    <div data-t="t6"><dt>\(x''\)</dt><dd>block output, which is the next block's \(x\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each sub-layer looks at a normalized copy of the stream, computes a change, and adds the change back. The stream itself is never normalized or overwritten inside the block.</p>
+  <p class="why"><b>Why it matters</b>The plain \(x +\) path means the derivative of the output with respect to the input always contains an identity term. Gradients reach layer 1 of a 100-layer model without being squeezed through 120 nonlinearities, which is why these networks train at all.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 860 250" id="fig-residual"></svg>
+<figcaption>The residual-stream view (Elhage et al., 2021). Think of the stream as a shared scratchpad of \(d\) numbers per position, 4,096 in Llama-3-8B. The embedding writes the first draft. Each attention and MLP sub-layer reads a normalized copy and adds an edit. The LM head reads only the final state. Because writes are additive, an early layer's contribution stays visible to every later layer unless someone actively subtracts it.</figcaption></figure>
+
+<p>This view explains several things you'll see in practice:</p>
+<ul>
+  <li>The <strong>logit lens</strong> works: applying the final norm and LM head to the stream after an intermediate layer often gives sensible next-token guesses that sharpen with depth. The stream is in roughly the same "language" throughout.</li>
+  <li>Dropping or skipping individual middle layers usually degrades a model gracefully instead of breaking it. That's the basis for layer pruning and early-exit experiments.</li>
+  <li>The stream has a fixed width \(d\). Every feature the model wants to carry between layers has to share those 4,096 dimensions, which is one reason interpretability researchers find features stored in overlapping directions rather than one per dimension.</li>
+</ul>
+
+<div class="intuition"><b>Intuition</b>
+<p>Picture a whiteboard per token. Attention lets a token copy notes from other tokens' whiteboards onto its own. The MLP lets it think about what's on its whiteboard and jot down conclusions. No one ever erases the board; they just keep writing.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="attention" data-short="Queries, keys, values">Self-attention: queries, keys, values</h2>
+
+<p>Take the sentence "The cat sat on the mat because it was tired." To predict what comes after "it", the model needs to know that "it" means the cat. That information sits at another position. Attention is the mechanism that fetches it.</p>
+
+<figure class="fig"><svg viewBox="0 0 860 240" id="fig-attn-intuition"></svg>
+<figcaption>One query position ("it") attending to every position up to and including itself. Arc thickness is the attention weight; the weights in each row sum to 1. The numbers are illustrative, not measured from a real model. "was" and "tired" are in the future and invisible to "it" (§06.5).</figcaption></figure>
+
+<p>Each token's stream vector is projected three ways:</p>
+<ul>
+  <li>a <strong>query</strong> \(q\), roughly "what am I looking for?" (for "it": a singular, animate noun earlier in the sentence);</li>
+  <li>a <strong>key</strong> \(k\), "what can I be found by?" (for "cat": I'm a singular animate noun);</li>
+  <li>a <strong>value</strong> \(v\), "what I hand over if you pick me" (for "cat": the features that say what a cat is).</li>
+</ul>
+<p>The query is compared with every key by a dot product. High score, high weight. The output is the weighted average of the values. It's a dictionary lookup where the match is soft: instead of returning the one entry whose key equals the query, it returns a blend of all entries, weighted by similarity.</p>
+
+<div class="formula" data-name="Query, key and value projections">
+  <div class="tex">$$\htmlClass{t1}{Q} = \htmlClass{t4}{X}\,\htmlClass{t5}{W_Q}, \qquad \htmlClass{t2}{K} = \htmlClass{t4}{X}\,\htmlClass{t5}{W_K}, \qquad \htmlClass{t3}{V} = \htmlClass{t4}{X}\,\htmlClass{t5}{W_V}$$</div>
+  <dl class="legend">
+    <div data-t="t4"><dt>\(X\)</dt><dd>normalized residual stream for one sequence, shape \([T \times d]\): one row per token</dd></div>
+    <div data-t="t5"><dt>\(W_Q, W_K, W_V\)</dt><dd>learned matrices, \([d \times d_k]\) for Q and K and \([d \times d_v]\) for V. The same matrices are used at every position</dd></div>
+    <div data-t="t1"><dt>\(Q\)</dt><dd>queries, \([T \times d_k]\): row \(i\) is what token \(i\) is looking for</dd></div>
+    <div data-t="t2"><dt>\(K\)</dt><dd>keys, \([T \times d_k]\): row \(j\) is how token \(j\) can be found</dd></div>
+    <div data-t="t3"><dt>\(V\)</dt><dd>values, \([T \times d_v]\): row \(j\) is what token \(j\) contributes when attended to</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Three ordinary matrix multiplies turn each token's vector into a question, a label, and a payload.</p>
+  <p class="why"><b>Why it matters</b>Keys and values depend only on their own token and position, never on the query. So during generation you can compute them once per token and keep them: that's the KV cache (Module 08). Queries are needed only for the newest token.</p>
+</div>
+
+<div class="def"><b>Definition · self- vs cross-attention</b>
+<p><em>Self</em>-attention takes Q, K and V from the same sequence. <em>Cross</em>-attention takes Q from one sequence and K, V from another, as in encoder-decoder translation models or some vision-language models where text queries attend to image features. Decoder-only LLMs use self-attention only.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="sdpa" data-short="Scaled dot-product attention">Scaled dot-product attention</h2>
+
+<p>Stack all queries and all keys and the comparisons become one matrix multiply. Here is the whole operation, the single most important formula in this course:</p>
+
+<div class="formula" data-name="Scaled dot-product attention">
+  <div class="tex">$$\text{Attention}(\htmlClass{t1}{Q},\htmlClass{t2}{K},\htmlClass{t3}{V}) = \htmlClass{t6}{\text{softmax}}\!\left(\frac{\htmlClass{t1}{Q}\,\htmlClass{t2}{K}^{\top}}{\sqrt{\htmlClass{t4}{d_k}}} + \htmlClass{t5}{M}\right)\htmlClass{t3}{V}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(Q\)</dt><dd>queries \([T \times d_k]\)</dd></div>
+    <div data-t="t2"><dt>\(K^{\top}\)</dt><dd>keys transposed \([d_k \times T]\). \(QK^{\top}\) is \([T \times T]\): entry \((i, j)\) is \(q_i \cdot k_j\), how well token \(i\)'s query matches token \(j\)'s key</dd></div>
+    <div data-t="t4"><dt>\(d_k\)</dt><dd>query/key dimension (the head dimension, 128 in most current models). Dividing by \(\sqrt{d_k}\) keeps the scores at unit scale</dd></div>
+    <div data-t="t5"><dt>\(M\)</dt><dd>mask \([T \times T]\): 0 where attention is allowed, \(-\infty\) where it isn't (§06.5)</dd></div>
+    <div data-t="t6"><dt>softmax</dt><dd>applied to each <em>row</em> separately, so each query's weights over the keys are positive and sum to 1</dd></div>
+    <div data-t="t3"><dt>\(V\)</dt><dd>values \([T \times d_v]\). Weights \([T \times T]\) times \(V\) gives the output \([T \times d_v]\): one blended value per query</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Score every query against every key, scale the scores down, block the forbidden ones, turn each row into probabilities, and use those probabilities to average the values.</p>
+  <p class="why"><b>Why it matters</b>The \([T \times T]\) score matrix is why attention's cost grows quadratically with context length, while everything else in the block grows linearly.</p>
+</div>
+
+<h3>Why divide by \(\sqrt{d_k}\)</h3>
+<p>Suppose the entries of \(q\) and \(k\) are independent with mean 0 and variance 1, which is roughly the situation at initialization. A dot product is a sum of \(d_k\) such products, and variances of independent terms add:</p>
+
+<div class="formula" data-name="Variance of a dot product">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{q}}\cdot\htmlClass{t2}{\mathbf{k}} = \sum_{i=1}^{\htmlClass{t3}{d_k}} q_i\,k_i, \qquad \mathbb{E}[\mathbf{q}\cdot\mathbf{k}] = 0, \qquad \operatorname{Var}[\mathbf{q}\cdot\mathbf{k}] = \htmlClass{t3}{d_k}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{q}\)</dt><dd>a query vector, entries assumed mean 0, variance 1</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{k}\)</dt><dd>a key vector, independent of \(\mathbf{q}\), same assumption</dd></div>
+    <div data-t="t3"><dt>\(d_k\)</dt><dd>number of terms in the sum. Each \(q_i k_i\) has variance 1, so the sum has variance \(d_k\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The typical size of a raw score grows like \(\sqrt{d_k}\). With \(d_k = 128\) that's about 11. Dividing by \(\sqrt{d_k}\) brings the standard deviation back to 1, whatever the head size.</p>
+  <p class="why"><b>Why it matters</b>Softmax only cares about <em>differences</em> between scores. If scores differ by 20, \(e^{20}\) makes one weight about 1 and the rest about 0. A saturated softmax has gradient \(\partial p_i/\partial z_j = p_i(\delta_{ij} - p_j) \approx 0\), so attention stops learning before it starts.</p>
+</div>
+
+<div id="w-scale"></div>
+
+<details class="think"><summary>Think first: softmax is shift-invariant. Is it scale-invariant?</summary>
+<div>No. Adding a constant to every score changes nothing, because it cancels in the ratio \(e^{z_i}/\sum_j e^{z_j}\). Multiplying every score by a constant is the same as changing the softmax temperature: multiply by 10 and a gentle preference becomes a hard choice. That's why the \(1/\sqrt{d_k}\) factor matters and why you can't just leave it out and hope the network compensates.</div>
+</details>
+
+<div class="pitfall"><b>Pitfall</b>
+<p>Writing your own attention and scaling by \(1/d_k\) instead of \(1/\sqrt{d_k}\), or forgetting the scale, produces a model that trains, just badly, so the bug can hide for days. Some families deliberately use a different constant (μP-style parameterizations use \(1/d_k\); a few models set it in the config). When porting weights, take the scale from the reference implementation, not from memory.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="causal" data-short="Causal masking">Causal masking</h2>
+
+<p>Training feeds the model a whole sequence and asks for a next-token prediction at every position at once. If position 7 could attend to position 8, it could simply read the answer. The mask forbids that:</p>
+
+<div class="formula" data-name="Causal mask">
+  <div class="tex">$$\htmlClass{t1}{M_{ij}} = 0 \;\text{ if }\; \htmlClass{t3}{j} \le \htmlClass{t2}{i}, \qquad \htmlClass{t1}{M_{ij}} = -\infty \;\text{ if }\; \htmlClass{t3}{j} \gt \htmlClass{t2}{i}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{ij}\)</dt><dd>value added to score \((i, j)\) before the softmax</dd></div>
+    <div data-t="t2"><dt>\(i\)</dt><dd>query position: the row, the token doing the looking</dd></div>
+    <div data-t="t3"><dt>\(j\)</dt><dd>key position: the column, the token being looked at</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Upper triangle (the future) gets \(-\infty\), so \(e^{-\infty} = 0\) and those weights vanish. The diagonal and everything below stay as computed.</p>
+  <p class="why"><b>Why it matters</b>The mask is what makes training parallel. One forward pass over a 4,096-token sequence yields 4,096 honest next-token predictions, each computed exactly as it would be at generation time.</p>
+</div>
+
+<div id="w-attn"></div>
+
+<details class="think"><summary>Think first: during generation with a KV cache, the newest token's query is scored against all cached keys. Do you still need a mask?</summary>
+<div>Not for that step. Every cached key is from an earlier position, so the single row of the mask is all zeros. The mask matters during training and <strong>prefill</strong>, when many query positions are processed at once, and for padding when sequences of different lengths share a batch. Inference engines exploit this: decode kernels typically skip the mask entirely.</div>
+</details>
+
+<div class="pitfall"><b>Pitfall · padding and NaN</b>
+<p>If a row is masked <em>everywhere</em> (a padding query whose keys are all padding), softmax computes \(0/0\) and returns NaN, which then spreads through the batch. Use a large finite negative number instead of \(-\infty\), or make sure every query can see at least one key, usually itself. Also check padding side: decoder-only models generating in batches want <em>left</em> padding so the last position is a real token.</p>
+</div>
+
+<div class="mle"><b>MLE angle · the \(T \times T\) matrix is never stored</b>
+<p>For Llama-3-8B at \(T = 8192\), one layer's score tensor is \(32 \times 8192 \times 8192 \approx 2.1\)B numbers, about 4 GiB in bf16. FlashAttention (Dao et al., 2022) computes attention in tiles that fit in on-chip SRAM, keeping a running max and sum for the softmax, so the full matrix never touches GPU memory. The math is identical; the extra memory drops from quadratic to linear in \(T\), and reads and writes to GPU memory fall several-fold. <code>F.scaled_dot_product_attention</code> dispatches to a fused kernel like this when it can.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="multihead" data-short="Multi-head attention">Multi-head attention</h2>
+
+<p>One softmax gives each query one weighting over the past. But a token usually needs several things at once: "it" wants its antecedent, the previous word, and maybe the verb it belongs to. Multi-head attention runs \(h\) smaller attentions in parallel, each with its own projections, and concatenates the results.</p>
+
+<div class="formula" data-name="Multi-head attention">
+  <div class="tex">$$\text{MultiHead}(\htmlClass{t1}{X}) = \text{Concat}(\htmlClass{t2}{\text{head}_1},\dots,\htmlClass{t2}{\text{head}_{h}})\,\htmlClass{t3}{W_O}, \qquad \htmlClass{t2}{\text{head}_i} = \text{Attention}\big(\htmlClass{t1}{X}W_Q^{(i)},\; \htmlClass{t1}{X}W_K^{(i)},\; \htmlClass{t1}{X}W_V^{(i)}\big), \qquad \htmlClass{t4}{d_{\text{head}}} = d / \htmlClass{t5}{h}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(X\)</dt><dd>normalized stream \([T \times d]\)</dd></div>
+    <div data-t="t2"><dt>\(\text{head}_i\)</dt><dd>output of the \(i\)-th attention, \([T \times d_{\text{head}}]\), with its own \([d \times d_{\text{head}}]\) projections</dd></div>
+    <div data-t="t3"><dt>\(W_O\)</dt><dd>output projection \([h\,d_{\text{head}} \times d]\): mixes the heads' results and writes them back into the stream</dd></div>
+    <div data-t="t4"><dt>\(d_{\text{head}}\)</dt><dd>per-head dimension. Llama-3-8B: \(4096 / 32 = 128\)</dd></div>
+    <div data-t="t5"><dt>\(h\)</dt><dd>number of heads</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Cut the model width into \(h\) slices, run attention separately in each slice, glue the slices back together, and mix them with one more matrix.</p>
+  <p class="why"><b>Why it matters</b>It costs nothing extra. In practice \(W_Q\) is a single \([d \times d]\) matrix whose output is reshaped into \(h\) pieces, so parameters and matmul FLOPs are the same as one big head. You get \(h\) independent attention patterns for free.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 860 300" id="fig-heads"></svg>
+<figcaption>Splitting \(d\) into heads (drawn with \(h = 4\) and 16 dimensions for legibility). One projection produces the full query vector, which is reshaped into \(h\) chunks of \(d_{\text{head}}\). Each chunk attends with its own softmax. The outputs are concatenated back to width \(d\) and \(W_O\) mixes them before the result is added to the stream.</figcaption></figure>
+
+<h3>What attention heads end up doing</h3>
+<p>Nobody assigns heads their jobs, but some recognisable ones appear reliably. <strong>Previous-token heads</strong> put almost all their weight on position \(i-1\). Many heads in many models dump most of their weight on the first token whatever it is; this "attention sink" seems to act as a no-op default when a head has nothing useful to fetch (Xiao et al., 2023). The best-studied circuit is the <strong>induction head</strong>.</p>
+
+<figure class="fig"><svg viewBox="0 0 860 210" id="fig-induction"></svg>
+<figcaption>An induction circuit completing a repeated pattern [A][B] … [A] → [B]. An earlier-layer previous-token head copies "my previous token was Mr" into the stream at "Dursley". A later induction head at the second "Mr" queries for exactly that and finds "Dursley", then copies it forward as the prediction. It only works because the two heads communicate through the residual stream.</figcaption></figure>
+
+<p>Elhage et al. (2021) found induction heads in small attention-only models, and Olsson et al. (2022) argued that they account for a large share of in-context learning in bigger ones. They form fairly abruptly early in training, visible as a bump in the loss curve, and their appearance coincides with the model getting much better at using earlier context. Treat the specific story with some care: plenty of heads don't have a clean description, and Michel et al. (2019) showed that many heads can be pruned at test time with little loss.</p>
+
+<!-- ================================================================== -->
+<h2 id="gqa" data-short="MQA and GQA">Sharing keys and values: MQA and GQA</h2>
+
+<p>Standard multi-head attention (MHA) gives every query head its own key and value heads. During generation, every past token's K and V for every head and layer sit in the KV cache, and every decode step reads all of it. At long contexts that cache, not the weights, becomes the memory and bandwidth bottleneck.</p>
+
+<p>The fix is to let several query heads share one K/V head. <strong>Multi-query attention</strong> (MQA, Shazeer, 2019) shares a single K/V head across all query heads. <strong>Grouped-query attention</strong> (GQA, Ainslie et al., 2023) is the compromise most current models use: query heads are split into groups, and each group shares a K/V head.</p>
+
+<figure class="fig"><svg viewBox="0 0 860 250" id="fig-gqa"></svg>
+<figcaption>Eight query heads with eight, two, or one key/value heads. Only K/V heads are cached, so the cache shrinks by the ratio of query heads to KV heads. Query heads are untouched: every head still computes its own attention pattern, it just reads shared keys and values. Llama-3-8B uses 32 query heads and 8 KV heads (groups of 4).</figcaption></figure>
+
+<div class="formula" data-name="KV cache bytes per token">
+  <div class="tex">$$\htmlClass{t1}{\text{KV bytes/token}} = 2 \times \htmlClass{t2}{L} \times \htmlClass{t3}{n_{kv}} \times \htmlClass{t4}{d_{\text{head}}} \times \htmlClass{t5}{b}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>KV bytes/token</dt><dd>cache memory added by every token of context. The leading 2 is one K plus one V</dd></div>
+    <div data-t="t2"><dt>\(L\)</dt><dd>number of layers; each layer has its own cache</dd></div>
+    <div data-t="t3"><dt>\(n_{kv}\)</dt><dd>number of KV heads: \(h\) for MHA, \(h/g\) for GQA with groups of \(g\), 1 for MQA</dd></div>
+    <div data-t="t4"><dt>\(d_{\text{head}}\)</dt><dd>head dimension</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per number: 2 for bf16, 1 for an fp8 cache</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Llama-3-8B: \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes, 128 KiB per token, so 1 GiB per 8K tokens of context. With full MHA (32 KV heads) it would be 512 KiB per token, four times as much.</p>
+  <p class="why"><b>Why it matters</b>GQA barely changes parameter count (\(W_K\) and \(W_V\) shrink from \([d \times d]\) to \([d \times n_{kv} d_{\text{head}}]\)) but cuts the dominant cost of long-context serving. Module 08 builds on this formula.</p>
+</div>
+
+<p>On quality: Ainslie et al. reported GQA close to MHA quality at close to MQA speed, and showed that an existing MHA checkpoint can be "uptrained" into GQA by mean-pooling its K/V heads and continuing training briefly. MQA saves more but tends to cost more quality, and it complicates tensor parallelism because one K/V head can't be split across GPUs. DeepSeek-V2 (2024) went further with multi-head latent attention, which caches a compressed latent vector per token and reconstructs K and V from it.</p>
+
+<div class="pitfall"><b>Pitfall · which query heads share a KV head?</b>
+<p>Conventionally query heads \(0..g-1\) share KV head 0, the next \(g\) share KV head 1, and so on. In PyTorch that's <code>k.repeat_interleave(g, dim=1)</code>. Using <code>k.repeat(1, g, 1, 1)</code> instead tiles the heads in the wrong order, and a pretrained model will produce fluent-looking garbage. Recent PyTorch versions (2.5+) also accept <code>enable_gqa=True</code> in <code>F.scaled_dot_product_attention</code>, which handles it without materializing the copies.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="position" data-short="Positions: sinusoids, RoPE">Where position comes from: sinusoids and RoPE</h2>
+
+<p>Nothing in attention so far knows about order. Scores are dot products between vectors, and a weighted sum doesn't care which slot an item came from. Shuffle the input tokens and, apart from the causal mask, every output shuffles the same way. "Dog bites man" and "man bites dog" would get the same representations. Position information has to be injected.</p>
+
+<h3>Absolute positions: sinusoidal and learned</h3>
+<p>The original Transformer added a fixed vector to each token's embedding depending on its position:</p>
+
+<div class="formula" data-name="Sinusoidal positional encoding">
+  <div class="tex">$$\htmlClass{t1}{PE}_{(\htmlClass{t2}{p},\,2i)} = \sin\!\left(\frac{\htmlClass{t2}{p}}{10000^{\,2\htmlClass{t3}{i}/\htmlClass{t4}{d}}}\right), \qquad \htmlClass{t1}{PE}_{(\htmlClass{t2}{p},\,2i+1)} = \cos\!\left(\frac{\htmlClass{t2}{p}}{10000^{\,2\htmlClass{t3}{i}/\htmlClass{t4}{d}}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(PE\)</dt><dd>positional vector added to the token embedding at the input</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>position of the token in the sequence: 0, 1, 2, …</dd></div>
+    <div data-t="t3"><dt>\(i\)</dt><dd>index of the sin/cos pair, \(0 \le i \lt d/2\). Low \(i\) means a fast oscillation, high \(i\) a slow one</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>model width</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each pair of dimensions is a clock hand turning at its own speed. The fastest completes a cycle every \(2\pi \approx 6\) positions, the slowest every \(2\pi \times 10000\). Together the hands give every position a unique fingerprint, like reading hours, minutes and seconds.</p>
+</div>
+
+<p>GPT-2 instead learned a table of 1,024 position vectors (786K parameters for \(d = 768\)). Learned tables work well but can't represent position 1,025 at all. Both schemes are <em>absolute</em>: they tell the model "you are at position 517", while language mostly cares about "that word was 3 tokens ago".</p>
+
+<h3>Rotary position embedding (RoPE)</h3>
+<p>RoPE (Su et al., 2021), used by Llama, Qwen, Mistral, Gemma and most other open models, doesn't add anything to the embedding. Instead, inside every attention layer, it <em>rotates</em> each query and key by an angle proportional to its position, just before the dot product. The head dimension is treated as \(d/2\) pairs, and each pair is rotated like a 2D vector:</p>
+
+<div class="formula" data-name="RoPE rotation for pair i at position m">
+  <div class="tex">$$\htmlClass{t1}{\tilde q}_{2i} = \htmlClass{t2}{q}_{2i}\cos(\htmlClass{t3}{m}\htmlClass{t4}{\theta_i}) - \htmlClass{t2}{q}_{2i+1}\sin(\htmlClass{t3}{m}\htmlClass{t4}{\theta_i}), \qquad \htmlClass{t1}{\tilde q}_{2i+1} = \htmlClass{t2}{q}_{2i}\sin(\htmlClass{t3}{m}\htmlClass{t4}{\theta_i}) + \htmlClass{t2}{q}_{2i+1}\cos(\htmlClass{t3}{m}\htmlClass{t4}{\theta_i})$$
+  $$\htmlClass{t4}{\theta_i} = \htmlClass{t5}{\text{base}}^{-2i/\htmlClass{t6}{d}}, \qquad i = 0, 1, \dots, d/2 - 1$$</div>
+  <dl class="legend">
+    <div data-t="t2"><dt>\(q\)</dt><dd>query (or key) for one head, before rotation</dd></div>
+    <div data-t="t1"><dt>\(\tilde q\)</dt><dd>rotated query; keys get exactly the same treatment with their own position</dd></div>
+    <div data-t="t3"><dt>\(m\)</dt><dd>the token's position</dd></div>
+    <div data-t="t4"><dt>\(\theta_i\)</dt><dd>rotation speed of pair \(i\), radians per position: 1 for \(i = 0\), tiny for the last pair</dd></div>
+    <div data-t="t5"><dt>base</dt><dd>10,000 in the original paper and Llama 2; 500,000 in Llama 3. A larger base slows every clock, which helps long context</dd></div>
+    <div data-t="t6"><dt>\(d\)</dt><dd>here the <em>head</em> dimension (128 for Llama-3-8B), since RoPE is applied per head</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Rotate pair \(i\) of the vector by \(m\theta_i\). It's the same set of clock speeds as the sinusoidal encoding, but used to turn the vector rather than added to it.</p>
+</div>
+
+<p>The payoff comes when a rotated query meets a rotated key. Writing \(R_m\) for "rotate every pair by \(m\theta_i\)":</p>
+
+<div class="formula" data-name="RoPE depends only on relative position">
+  <div class="tex">$$\big\langle \htmlClass{t1}{R_m}\htmlClass{t3}{q},\; \htmlClass{t2}{R_n}\htmlClass{t4}{k} \big\rangle = \htmlClass{t3}{q}^{\top}\htmlClass{t1}{R_m}^{\top}\htmlClass{t2}{R_n}\,\htmlClass{t4}{k} = \htmlClass{t3}{q}^{\top}\htmlClass{t5}{R_{n-m}}\,\htmlClass{t4}{k}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(R_m\)</dt><dd>rotation for the query's position \(m\). Rotations are orthogonal, so \(R_m^{\top} = R_{-m}\)</dd></div>
+    <div data-t="t2"><dt>\(R_n\)</dt><dd>rotation for the key's position \(n\)</dd></div>
+    <div data-t="t3"><dt>\(q\)</dt><dd>query content</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>key content</dd></div>
+    <div data-t="t5"><dt>\(R_{n-m}\)</dt><dd>rotating by \(-m\) then \(+n\) is one rotation by \(n - m\): only the offset survives</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Turn the query by its position and the key by its position, and the angle between them depends only on how far apart they are. Positions 10 and 3 give exactly the same score as 1,010 and 1,003.</p>
+  <p class="why"><b>Why it matters</b>Attention scores become a function of content and <em>relative</em> distance, with no learned parameters. Values are not rotated, so position steers <em>where</em> a head looks without changing <em>what</em> it copies.</p>
+</div>
+
+<div id="w-rope"></div>
+
+<div class="flag"><b>Two RoPE layouts</b>
+<p>The formula pairs adjacent dimensions \((2i, 2i{+}1)\), as in Meta's original Llama code. Hugging Face and GPT-NeoX pair dimension \(i\) with \(i + d/2\) ("rotate half"). The two are equivalent if the \(W_Q\) and \(W_K\) columns are permuted to match, which is exactly what the HF Llama conversion script does. Mix a checkpoint from one convention with code from the other and the model loads without error and outputs nonsense.</p>
+</div>
+
+<p>Long-context extensions mostly work by changing the clocks: raising the base, or scaling down the angles for the slow pairs so that positions beyond the training length map onto angles the model has seen (position interpolation, NTK-aware scaling, YaRN). Module 08 covers them. Other relative schemes exist, such as ALiBi (Press et al., 2021), which adds a distance-proportional penalty to the scores, but RoPE is the default today.</p>
+
+<!-- ================================================================== -->
+<h2 id="norms" data-short="LayerNorm vs RMSNorm">Normalization: LayerNorm, RMSNorm, and where they sit</h2>
+
+<p>Each sub-layer reads a <em>normalized</em> copy of the stream. Normalization is per token, across that token's \(d\) features. It has nothing to do with the batch, unlike BatchNorm in vision models. It keeps the scale of what a sub-layer sees roughly fixed, whatever has accumulated in the stream so far.</p>
+
+<div class="formula" data-name="LayerNorm">
+  <div class="tex">$$\text{LN}(\htmlClass{t1}{x}) = \htmlClass{t4}{\gamma} \odot \frac{\htmlClass{t1}{x} - \htmlClass{t2}{\mu}}{\sqrt{\htmlClass{t3}{\sigma^2} + \htmlClass{t6}{\epsilon}}} + \htmlClass{t5}{\beta}, \qquad \htmlClass{t2}{\mu} = \tfrac{1}{d}\textstyle\sum_j x_j, \qquad \htmlClass{t3}{\sigma^2} = \tfrac{1}{d}\textstyle\sum_j (x_j - \mu)^2$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(x\)</dt><dd>one token's vector, \(d\) numbers</dd></div>
+    <div data-t="t2"><dt>\(\mu\)</dt><dd>mean of its features</dd></div>
+    <div data-t="t3"><dt>\(\sigma^2\)</dt><dd>variance of its features</dd></div>
+    <div data-t="t4"><dt>\(\gamma\)</dt><dd>learned per-feature gain, \(d\) parameters</dd></div>
+    <div data-t="t5"><dt>\(\beta\)</dt><dd>learned per-feature bias, \(d\) parameters</dd></div>
+    <div data-t="t6"><dt>\(\epsilon\)</dt><dd>small constant (around \(10^{-5}\)) to avoid division by zero</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Shift the vector to mean 0, scale it to variance 1, then let the model choose its own scale and offset per feature.</p>
+</div>
+
+<div class="formula" data-name="RMSNorm">
+  <div class="tex">$$\text{RMSNorm}(\htmlClass{t1}{x}) = \htmlClass{t4}{\gamma} \odot \frac{\htmlClass{t1}{x}}{\htmlClass{t2}{\text{RMS}(x)}}, \qquad \htmlClass{t2}{\text{RMS}(x)} = \sqrt{\tfrac{1}{d}\textstyle\sum_{j=1}^{d} x_j^2 + \htmlClass{t3}{\epsilon}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(x\)</dt><dd>one token's vector</dd></div>
+    <div data-t="t2"><dt>\(\text{RMS}(x)\)</dt><dd>root-mean-square: the vector's typical magnitude, with no mean subtracted</dd></div>
+    <div data-t="t3"><dt>\(\epsilon\)</dt><dd>stability constant (Llama 3 uses \(10^{-5}\))</dd></div>
+    <div data-t="t4"><dt>\(\gamma\)</dt><dd>learned gain; there's no \(\beta\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Just rescale the vector to unit RMS. No centring, no bias.</p>
+  <p class="why"><b>Why it matters</b>Zhang &amp; Sennrich (2019) found the re-centring contributes little. RMSNorm needs one reduction instead of two and half the parameters, and almost every recent LLM uses it.</p>
+</div>
+
+<h3>Pre-norm vs post-norm</h3>
+<p>Where the norm sits matters more than which norm it is. The 2017 Transformer put it <em>after</em> the residual add. GPT-2 moved it to the <em>input</em> of each sub-layer and added one final norm at the end of the stack. Nearly everything since has followed.</p>
+
+<figure class="fig"><svg viewBox="0 0 860 300" id="fig-norms"></svg>
+<figcaption>Post-norm (left) normalizes the stream itself after every add, so the path from output back to input passes through \(2N\) normalizations. Pre-norm (right) normalizes only the copy fed into the sub-layer and leaves an untouched identity path. That's why pre-norm models need the extra final norm before the LM head: the stream's magnitude grows layer by layer and nothing else rescales it.</figcaption></figure>
+
+<p>Xiong et al. (2020) showed that post-norm transformers have large gradients near the output at initialization and need a careful learning-rate warmup to train, while pre-norm ones are well behaved. Post-norm can reach slightly better quality when it does train, which is why some recent models add a norm on the <em>sub-layer output</em> before it is added back (Gemma 2 and OLMo 2 do variants of this) while keeping the residual path itself clean.</p>
+
+<div class="pitfall"><b>Pitfall · compute norms in fp32</b>
+<p>The sum of squares over 4,096 or 8,192 features can lose precision or overflow in fp16. Reference implementations upcast to fp32 inside the norm and cast back afterwards. The code at the end of this module does the same.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="mlp" data-short="GELU and SwiGLU MLPs">The MLP: GELU and SwiGLU</h2>
+
+<p>The MLP is applied to each position independently: same weights, no communication. The classic version (GPT-2, BERT) expands the vector to \(d_{ff} = 4d\), applies a nonlinearity, and projects back: \(\text{MLP}(x) = \text{GELU}(xW_1 + b_1)\,W_2 + b_2\), where \(\text{GELU}(z) = z\,\Phi(z)\) is a smooth ReLU (Hendrycks &amp; Gimpel, 2016). That's \(2 \times d \times 4d = 8d^2\) parameters per layer, twice what attention has.</p>
+
+<p>Geva et al. (2021) offered a useful picture: rows of \(W_1\) act like keys that detect patterns in the input, and the matching rows of \(W_2\) are values written to the stream when the pattern fires. A big share of factual recall seems to happen in these layers.</p>
+
+<p>Modern models use a <strong>gated</strong> MLP instead. One projection is passed through an activation and used to gate a second projection, elementwise:</p>
+
+<div class="formula" data-name="SwiGLU MLP">
+  <div class="tex">$$\text{SwiGLU}(\htmlClass{t1}{x}) = \big(\htmlClass{t5}{\text{SiLU}}(\htmlClass{t1}{x}\,\htmlClass{t2}{W_1}) \odot \htmlClass{t1}{x}\,\htmlClass{t3}{W_3}\big)\,\htmlClass{t4}{W_2}, \qquad \htmlClass{t5}{\text{SiLU}}(z) = z\,\sigma(z), \qquad \htmlClass{t6}{d_{ff}} \approx \tfrac{8}{3}\,d$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(x\)</dt><dd>normalized stream vector \([d]\)</dd></div>
+    <div data-t="t2"><dt>\(W_1\)</dt><dd>"gate" projection \([d \times d_{ff}]\) (<code>gate_proj</code> in HF)</dd></div>
+    <div data-t="t3"><dt>\(W_3\)</dt><dd>"up" projection \([d \times d_{ff}]\) (<code>up_proj</code>)</dd></div>
+    <div data-t="t4"><dt>\(W_2\)</dt><dd>"down" projection \([d_{ff} \times d]\) (<code>down_proj</code>)</dd></div>
+    <div data-t="t5"><dt>SiLU</dt><dd>also called Swish: \(z\) times its sigmoid. Smooth, slightly negative for small negative \(z\)</dd></div>
+    <div data-t="t6"><dt>\(d_{ff}\)</dt><dd>hidden width. \(8/3\) keeps the parameter count equal to a \(4d\) GELU MLP: \(3 \times d \times \tfrac{8}{3}d = 8d^2\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Compute two \(d_{ff}\)-wide projections, squash one of them, multiply the two elementwise so one acts as a learned per-dimension on/off switch for the other, then project back to \(d\).</p>
+  <p class="why"><b>Why it matters</b>Shazeer (2020) found GLU variants gave better quality than plain GELU/ReLU MLPs at equal parameters and compute. The 3 matrices are why parameter formulas for Llama-style models have \(3\,d\,d_{ff}\) rather than \(2\,d\,d_{ff}\).</p>
+</div>
+
+<p>The \(8/3\) rule is a starting point, not law. Llama 1 7B used \(d_{ff} = 11008 \approx 2.69d\) (\(8/3 \times 4096\) rounded up to a multiple of 256). Llama-3-8B uses 14,336, which is \(3.5d\), and Llama-3-70B uses \(28672 = 3.5 \times 8192\). Always read \(d_{ff}\) from the config.</p>
+
+<details class="think"><summary>Think first: why is the MLP applied per position instead of mixing positions like attention?</summary>
+<div>Because it doesn't need to. Attention already moved whatever information this position needs onto its stream. Keeping the MLP per-position means its cost is linear in \(T\), it parallelizes perfectly across tokens, and the same weights work at any sequence length. The split is clean: attention moves information, the MLP processes it.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="params" data-short="Parameters &amp; FLOPs">Counting parameters and FLOPs</h2>
+
+<p>You now know every matrix in the model, so you can count them. Start with the classic GPT-style block (MHA, \(4d\) GELU MLP, biases ignored):</p>
+
+<div class="formula" data-name="Classic parameter estimate">
+  <div class="tex">$$\htmlClass{t1}{N} \approx \htmlClass{t2}{L}\,\big(\underbrace{\htmlClass{t3}{4d^2}}_{\text{attention}} + \underbrace{\htmlClass{t4}{8d^2}}_{\text{MLP}}\big) = 12\,\htmlClass{t2}{L}\,\htmlClass{t5}{d}^2$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(N\)</dt><dd>non-embedding parameters</dd></div>
+    <div data-t="t2"><dt>\(L\)</dt><dd>number of layers</dd></div>
+    <div data-t="t3"><dt>\(4d^2\)</dt><dd>\(W_Q, W_K, W_V, W_O\), each \([d \times d]\)</dd></div>
+    <div data-t="t4"><dt>\(8d^2\)</dt><dd>\(W_1\) \([d \times 4d]\) plus \(W_2\) \([4d \times d]\)</dd></div>
+    <div data-t="t5"><dt>\(d\)</dt><dd>model width</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each layer costs about twelve \(d \times d\) matrices. GPT-2 small: \(12 \times 12 \times 768^2 = 84.9\)M, against an exact non-embedding count of 85.1M.</p>
+</div>
+
+<p>Modern models break the "4" and the "8": GQA shrinks \(W_K\) and \(W_V\), and SwiGLU has three matrices with a non-standard \(d_{ff}\). The exact count for a Llama-style layer (RMSNorm, no biases, \(h \cdot d_{\text{head}} = d\)) is:</p>
+
+<div class="formula" data-name="Exact count, Llama-style (GQA + SwiGLU)">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{layer}}} = \underbrace{2d^2 + 2\,d\,\htmlClass{t2}{n_{kv}}\,\htmlClass{t3}{d_{\text{head}}}}_{W_Q,\,W_O \;+\; W_K,\,W_V} + \underbrace{3\,d\,\htmlClass{t4}{d_{ff}}}_{\text{SwiGLU}} + \underbrace{2d}_{\text{norms}}, \qquad \htmlClass{t5}{N_{\text{total}}} = L \cdot \htmlClass{t1}{P_{\text{layer}}} + \underbrace{\htmlClass{t6}{V}\,d}_{\text{embedding}} + \underbrace{\htmlClass{t6}{V}\,d}_{\text{LM head if untied}} + d$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{layer}}\)</dt><dd>parameters in one block</dd></div>
+    <div data-t="t2"><dt>\(n_{kv}\)</dt><dd>KV heads (8 for Llama-3-8B and -70B)</dd></div>
+    <div data-t="t3"><dt>\(d_{\text{head}}\)</dt><dd>head dimension, so \(W_K\) and \(W_V\) are \([d \times n_{kv} d_{\text{head}}]\)</dd></div>
+    <div data-t="t4"><dt>\(d_{ff}\)</dt><dd>MLP hidden width</dd></div>
+    <div data-t="t5"><dt>\(N_{\text{total}}\)</dt><dd>everything, including the final norm's \(d\)</dd></div>
+    <div data-t="t6"><dt>\(V\)</dt><dd>vocabulary size. With tied embeddings the LM head reuses the embedding matrix and adds nothing</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Llama-3-8B: \(2(4096^2) + 2(4096)(8)(128) + 3(4096)(14336) + 8192 = 218{,}112{,}000\) per layer. Times 32 is 6.98B; add \(2 \times 128256 \times 4096 = 1.05\)B for the embedding and LM head and you get 8,030,261,248, which matches the published model exactly.</p>
+</div>
+
+<div id="w-params"></div>
+
+<h3>FLOPs per token</h3>
+<p>Every weight in a matmul is used once per token for one multiply and one add. That gives the most useful rule of thumb in LLM systems, plus a correction for attention over the context:</p>
+
+<div class="formula" data-name="Forward FLOPs per token">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{fwd}}} \approx 2\,\htmlClass{t2}{N} + 4\,\htmlClass{t3}{L}\,\htmlClass{t4}{T}\,\htmlClass{t5}{d}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{fwd}}\)</dt><dd>floating-point operations to run one token forward</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameters that take part in matmuls: all layers plus the LM head. The input embedding is a lookup and costs nothing</dd></div>
+    <div data-t="t3"><dt>\(L\)</dt><dd>layers</dd></div>
+    <div data-t="t4"><dt>\(T\)</dt><dd>number of earlier tokens this token attends to (its context length)</dd></div>
+    <div data-t="t5"><dt>\(d\)</dt><dd>total query width \(h \cdot d_{\text{head}}\), usually equal to \(d\). GQA does <em>not</em> reduce this term</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>2 FLOPs per parameter, plus, in each layer, \(2Td\) for \(q \cdot K^{\top}\) and \(2Td\) for weights \(\times V\).</p>
+  <p class="why"><b>Why it matters</b>For short contexts the \(2N\) term dominates. Averaged over a causal training sequence of length \(T\), each token sees about \(T/2\) others, giving the \(2LTd\) term in Kaplan et al. (2020). Training costs about 3× forward (a backward pass is about twice a forward), which is where \(6N\) FLOPs per token comes from (Module 07).</p>
+</div>
+
+<div id="w-flops"></div>
+
+<h3>Shapes through one block</h3>
+<p>Tensor shapes are the fastest way to debug a transformer. Here's one Llama-3-8B block with batch \(B = 1\) and a 4,096-token sequence.</p>
+
+<table class="t">
+  <thead><tr><th>Step</th><th>Operation</th><th>Shape</th><th>Llama-3-8B, B = 1, T = 4096</th></tr></thead>
+  <tbody>
+    <tr><td>Input</td><td>residual stream \(x\)</td><td class="mono">[B, T, d]</td><td class="mono">[1, 4096, 4096]</td></tr>
+    <tr><td>Norm 1</td><td>RMSNorm\((x)\)</td><td class="mono">[B, T, d]</td><td class="mono">[1, 4096, 4096]</td></tr>
+    <tr><td>Q</td><td>\(\cdot W_Q\), split heads, transpose</td><td class="mono">[B, h, T, d_head]</td><td class="mono">[1, 32, 4096, 128]</td></tr>
+    <tr><td>K, V</td><td>\(\cdot W_K\), \(\cdot W_V\), split, transpose</td><td class="mono">[B, n_kv, T, d_head]</td><td class="mono">[1, 8, 4096, 128] each</td></tr>
+    <tr><td>RoPE</td><td>rotate Q and K by position</td><td class="mono">unchanged</td><td class="mono">unchanged</td></tr>
+    <tr><td>GQA expand</td><td>repeat each KV head \(h/n_{kv}\) times</td><td class="mono">[B, h, T, d_head]</td><td class="mono">[1, 32, 4096, 128] (a view in fused kernels)</td></tr>
+    <tr><td>Scores</td><td>\(QK^{\top}/\sqrt{d_{\text{head}}} + M\)</td><td class="mono">[B, h, T, T]</td><td class="mono">[1, 32, 4096, 4096]: 537M numbers</td></tr>
+    <tr><td>Weights</td><td>softmax over the last axis</td><td class="mono">[B, h, T, T]</td><td class="mono">each row sums to 1</td></tr>
+    <tr><td>Mix</td><td>weights \(\cdot V\)</td><td class="mono">[B, h, T, d_head]</td><td class="mono">[1, 32, 4096, 128]</td></tr>
+    <tr><td>Merge heads</td><td>transpose, reshape</td><td class="mono">[B, T, h·d_head]</td><td class="mono">[1, 4096, 4096]</td></tr>
+    <tr><td>Out + add</td><td>\(x + (\cdot)W_O\)</td><td class="mono">[B, T, d]</td><td class="mono">[1, 4096, 4096]</td></tr>
+    <tr><td>Norm 2, up</td><td>\(\cdot W_1\) and \(\cdot W_3\)</td><td class="mono">[B, T, d_ff]</td><td class="mono">[1, 4096, 14336] each</td></tr>
+    <tr><td>Gate</td><td>SiLU\((a) \odot b\)</td><td class="mono">[B, T, d_ff]</td><td class="mono">[1, 4096, 14336]</td></tr>
+    <tr><td>Down + add</td><td>\(x + (\cdot)W_2\)</td><td class="mono">[B, T, d]</td><td class="mono">[1, 4096, 4096]</td></tr>
+    <tr><td>After N blocks</td><td>final norm, LM head</td><td class="mono">[B, T, V]</td><td class="mono">[1, 4096, 128256]</td></tr>
+  </tbody>
+</table>
+
+<div class="mle"><b>MLE angle · the logits tensor is huge too</b>
+<p>The last row is \(4096 \times 128{,}256 \approx 525\)M numbers, about 2.1 GB in fp32, for a single sequence. Training code computes the loss in chunks or fuses the LM head with cross-entropy for this reason, and generation only computes logits for the final position. When you see an out-of-memory error at the very end of a forward pass, check this tensor first.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="moe" data-short="Mixture of experts">Mixture of experts</h2>
+
+<p>A mixture-of-experts (MoE) layer replaces the single MLP with \(E\) parallel MLPs, the <em>experts</em>, and a small <strong>router</strong> that picks \(k\) of them for each token. Attention stays the same. The model gets many more parameters, but each token only pays compute for \(k\) experts.</p>
+
+<div class="formula" data-name="Top-k router">
+  <div class="tex">$$\htmlClass{t1}{g}(x) = \text{softmax}\big(\text{TopK}(\htmlClass{t2}{x\,W_r},\; \htmlClass{t3}{k})\big), \qquad \htmlClass{t4}{y} = \sum_{i \in \text{TopK}} \htmlClass{t1}{g_i}(x)\; \htmlClass{t5}{E_i}(x)$$</div>
+  <dl class="legend">
+    <div data-t="t2"><dt>\(x W_r\)</dt><dd>router logits: one score per expert from a tiny \([d \times E]\) matrix</dd></div>
+    <div data-t="t3"><dt>\(k\)</dt><dd>experts used per token (2 in Mixtral; 8 of 256 routed experts in DeepSeek-V3)</dd></div>
+    <div data-t="t1"><dt>\(g\)</dt><dd>gate weights: TopK sets every score outside the top \(k\) to \(-\infty\), so the softmax spreads weight over the chosen \(k\) only</dd></div>
+    <div data-t="t5"><dt>\(E_i\)</dt><dd>expert \(i\), usually a SwiGLU MLP of the usual shape</dd></div>
+    <div data-t="t4"><dt>\(y\)</dt><dd>layer output, added to the residual stream like a normal MLP's</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Score all experts, keep the best \(k\), run only those, and blend their outputs by the renormalized scores.</p>
+  <p class="why"><b>Why it matters</b>Parameters and compute come apart. Mixtral 8x7B (Jiang et al., 2024) has about 46.7B parameters but uses about 12.9B per token. DeepSeek-V3 has 671B and activates 37B.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 860 300" id="fig-moe"></svg>
+<figcaption>One token through a top-2 MoE layer with 8 experts. The router scores every expert, the two highest (experts 2 and 6) run, and their outputs are mixed with weights \(0.62\) and \(0.38\), the softmax of their two scores. The other six experts do no work for this token, though other tokens in the batch may pick them.</figcaption></figure>
+
+<ul>
+  <li><strong>Memory follows total parameters.</strong> Every expert has to be resident, since the next token may want any of them. Mixtral needs memory for 46.7B weights.</li>
+  <li><strong>Compute follows active parameters.</strong> FLOPs per token are about \(2 \times\) active parameters, like a 13B dense model.</li>
+  <li><strong>Bandwidth is in between.</strong> At batch 1, decode reads only the chosen experts' weights. At large batch, tokens spread over all experts and you're back to reading nearly everything every step.</li>
+  <li><strong>Routers need balancing.</strong> Left alone, routers collapse onto a few favourite experts. Training adds a load-balancing loss (Shazeer et al., 2017; Fedus et al., 2021 for Switch Transformer) or a bias-adjustment scheme, and serving spreads experts across GPUs (expert parallelism).</li>
+</ul>
+
+<div class="flag"><b>Softmax before or after top-k</b>
+<p>The formula takes the softmax over the top-\(k\) logits. Hugging Face's Mixtral code takes the softmax over all experts, picks the top \(k\), then renormalizes. That gives the same weights. Other designs differ for real: Switch Transformer uses \(k = 1\) and doesn't renormalize, and DeepSeek-V3 uses sigmoid scores plus an always-on shared expert. Read the modelling code before assuming.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson" data-short="Hands-on">Hands-on: build a block in PyTorch</h2>
+
+<h3>1. RoPE, causal attention with GQA, and a Llama-style block</h3>
+<p>About 60 lines contain a real Llama-style block. The attention module has two paths: a manual one that spells out the formula from §06.4, and the fused <code>F.scaled_dot_product_attention</code>. Your first test is checking that they agree.</p>
+<div class="code" data-lang="python" data-title="block.py"><pre><code>
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def rope_cache(T, head_dim, base=10000.0, device=None):
+    inv_freq = base ** (-torch.arange(0, head_dim, 2, device=device).float() / head_dim)  # theta_i, [hd/2]
+    ang = torch.outer(torch.arange(T, device=device).float(), inv_freq)                   # [T, hd/2]: m * theta_i
+    ang = torch.cat([ang, ang], dim=-1)                                                  # [T, hd] (rotate-half layout)
+    return ang.cos(), ang.sin()
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)              # pairs dim i with dim i + hd/2 (HF / NeoX convention)
+    return torch.cat([-x2, x1], dim=-1)
+
+def apply_rope(x, cos, sin):                 # x: [B, heads, T, hd]
+    T = x.shape[-2]
+    return (x * cos[:T] + rotate_half(x) * sin[:T]).type_as(x)
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.eps, self.weight = eps, nn.Parameter(torch.ones(d))
+    def forward(self, x):
+        xf = x.float()                       # norm in fp32, then cast back
+        return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x) * self.weight
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d, n_heads, n_kv_heads):
+        super().__init__()
+        self.h, self.kv, self.hd = n_heads, n_kv_heads, d // n_heads
+        self.wq = nn.Linear(d, n_heads * self.hd, bias=False)
+        self.wk = nn.Linear(d, n_kv_heads * self.hd, bias=False)
+        self.wv = nn.Linear(d, n_kv_heads * self.hd, bias=False)
+        self.wo = nn.Linear(n_heads * self.hd, d, bias=False)
+
+    def forward(self, x, cos, sin, manual=False):
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.h, self.hd).transpose(1, 2)    # [B, h, T, hd]
+        k = self.wk(x).view(B, T, self.kv, self.hd).transpose(1, 2)   # [B, kv, T, hd]
+        v = self.wv(x).view(B, T, self.kv, self.hd).transpose(1, 2)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)       # position enters here, not in V
+        g = self.h // self.kv                                         # GQA: each KV head serves g query heads
+        k, v = k.repeat_interleave(g, dim=1), v.repeat_interleave(g, dim=1)
+        if manual:
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)      # [B, h, T, T]
+            future = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)
+            att = att.masked_fill(future, float("-inf")).softmax(dim=-1)
+            y = att @ v                                               # [B, h, T, hd]
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.wo(y.transpose(1, 2).reshape(B, T, self.h * self.hd))
+
+class SwiGLU(nn.Module):
+    def __init__(self, d, d_ff):
+        super().__init__()
+        self.w1 = nn.Linear(d, d_ff, bias=False)   # gate_proj
+        self.w3 = nn.Linear(d, d_ff, bias=False)   # up_proj
+        self.w2 = nn.Linear(d_ff, d, bias=False)   # down_proj
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+class Block(nn.Module):
+    def __init__(self, d, n_heads, n_kv_heads, d_ff):
+        super().__init__()
+        self.norm1, self.norm2 = RMSNorm(d), RMSNorm(d)
+        self.attn = CausalSelfAttention(d, n_heads, n_kv_heads)
+        self.mlp = SwiGLU(d, d_ff)
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.norm1(x), cos, sin)   # pre-norm, residual add
+        return x + self.mlp(self.norm2(x))
+</code></pre></div>
+
+<h3>2. Check it</h3>
+<div class="code" data-lang="python" data-title="test_block.py"><pre><code>
+import torch
+from block import Block, rope_cache, rotate_half
+
+torch.manual_seed(0)
+d, h, kv, d_ff, T = 256, 8, 2, 688, 16
+blk = Block(d, h, kv, d_ff)
+x = torch.randn(2, T, d)
+cos, sin = rope_cache(T, d // h)
+
+# 1. fused and manual attention agree
+hn = blk.norm1(x)
+fast, slow = blk.attn(hn, cos, sin), blk.attn(hn, cos, sin, manual=True)
+print("sdpa == manual:", torch.allclose(fast, slow, atol=1e-5))            # True
+
+# 2. causality: changing a future token must not change earlier outputs
+x2 = x.clone(); x2[:, -1] += 1.0
+print("causal:", torch.allclose(blk(x, cos, sin)[:, :-1], blk(x2, cos, sin)[:, :-1], atol=1e-5))  # True
+
+# 3. RoPE scores depend only on m - n
+cos_l, sin_l = rope_cache(2048, 64)
+q, k = torch.randn(64), torch.randn(64)
+rot = lambda v, p: v * cos_l[p] + rotate_half(v) * sin_l[p]
+print(float(rot(q, 10) @ rot(k, 3)), float(rot(q, 1010) @ rot(k, 1003)))  # equal up to float error
+
+# 4. parameter count of one block: 2*d*d + 2*d*kv*(d//h) + 3*d*d_ff + 2*d
+print(sum(p.numel() for p in blk.parameters()), 2*d*d + 2*d*kv*(d//h) + 3*d*d_ff + 2*d)
+</code></pre></div>
+
+<h3>3. Count a real model without downloading it</h3>
+<p>The <code>meta</code> device builds a model's structure with no memory behind the tensors, so you can count a 70B model on a laptop. You need only the config file (the Llama repos are gated, so log in with <code>huggingface-cli login</code> first).</p>
+<div class="code" data-lang="python" data-title="count_params.py"><pre><code>
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM
+
+cfg = AutoConfig.from_pretrained("meta-llama/Meta-Llama-3-8B")
+print(cfg.hidden_size, cfg.num_hidden_layers, cfg.num_attention_heads,
+      cfg.num_key_value_heads, cfg.intermediate_size, cfg.vocab_size, cfg.rope_theta)
+with torch.device("meta"):
+    model = AutoModelForCausalLM.from_config(cfg)
+print(f"{sum(p.numel() for p in model.parameters()):,}")   # 8,030,261,248
+print(model.model.layers[0])                               # see q_proj / k_proj / gate_proj shapes
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when all four checks in <code>test_block.py</code> print matching values, your <code>count_params.py</code> output for Llama-3-8B and one other model you pick (say Qwen2.5-7B, which has attention biases) matches the calculator in §06.11 to the parameter, and you can explain from the shape table why the score tensor, not the weights, limits how long a sequence you can train on without FlashAttention.</p>
+</div>
+
+<h3>Further reading</h3>
+<ul>
+  <li>Vaswani et al., 2017, <a href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a>.</li>
+  <li>Elhage et al., 2021, <a href="https://transformer-circuits.pub/2021/framework/index.html">A Mathematical Framework for Transformer Circuits</a>, the source of the residual-stream view.</li>
+  <li>Olsson et al., 2022, <a href="https://arxiv.org/abs/2209.11895">In-context Learning and Induction Heads</a>.</li>
+  <li>Su et al., 2021, <a href="https://arxiv.org/abs/2104.09864">RoFormer: Enhanced Transformer with Rotary Position Embedding</a>.</li>
+  <li>Ainslie et al., 2023, <a href="https://arxiv.org/abs/2305.13245">GQA</a>, and Shazeer, 2019, <a href="https://arxiv.org/abs/1911.02150">Fast Transformer Decoding: One Write-Head is All You Need</a>.</li>
+  <li>Shazeer, 2020, <a href="https://arxiv.org/abs/2002.05202">GLU Variants Improve Transformer</a>; Zhang &amp; Sennrich, 2019, <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Layer Normalization</a>; Xiong et al., 2020, <a href="https://arxiv.org/abs/2002.04745">On Layer Normalization in the Transformer Architecture</a>.</li>
+  <li>Dao et al., 2022, <a href="https://arxiv.org/abs/2205.14135">FlashAttention</a>; Fedus et al., 2021, <a href="https://arxiv.org/abs/2101.03961">Switch Transformers</a>; Jiang et al., 2024, <a href="https://arxiv.org/abs/2401.04088">Mixtral of Experts</a>.</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="06-main" data-title="Check yourself · The transformer">
+  <div class="q" data-answer="2"><p>A batch of 2 sequences, 8 heads, 512 tokens, head dimension 64. What is the shape of the attention score tensor \(QK^{\top}\)?</p>
+    <ol><li>[2, 512, 64]</li><li>[2, 8, 512, 64]</li><li>[2, 8, 512, 512]</li><li>[2, 512, 512, 64]</li></ol>
+    <div class="explain">Each head scores every query against every key: [B, h, T, d_head] @ [B, h, d_head, T] = [B, h, T, T]. The head dimension is summed away in the dot product. [2, 8, 512, 64] is the shape of Q, K, V and the attention output.</div></div>
+  <div class="q" data-answer="0"><p>You remove the \(1/\sqrt{d_k}\) factor from a model with \(d_k = 128\). What goes wrong at initialization?</p>
+    <ol><li>Raw scores have standard deviation around 11, so softmax saturates to nearly one-hot and its gradients nearly vanish</li><li>Scores shrink toward 0, so attention becomes uniform</li><li>Nothing: softmax is scale-invariant</li><li>The matmul overflows bf16</li></ol>
+    <div class="explain">A sum of 128 unit-variance products has variance 128, so std \(\sqrt{128} \approx 11.3\). Gaps of 20+ between scores make softmax pick one key, and \(p_i(\delta_{ij} - p_j) \approx 0\). Softmax is shift-invariant, not scale-invariant. bf16's range is fine; the problem is the softmax, not overflow.</div></div>
+  <div class="q" data-answer="1"><p>A classic GPT-style model (MHA, \(4d\) GELU MLP) has \(d = 2048\) and \(L = 24\). Roughly how many non-embedding parameters does it have?</p>
+    <ol><li>~0.6B</li><li>~1.2B</li><li>~2.4B</li><li>~4.8B</li></ol>
+    <div class="explain">\(12 L d^2 = 12 \times 24 \times 2048^2 = 12 \times 24 \times 4.19\text{M} \approx 1.21\)B. Attention contributes \(4d^2\) and the MLP \(8d^2\) per layer. 0.6B would forget the MLP's second matrix or half the layers.</div></div>
+  <div class="q" data-answer="3"><p>Llama-3-70B: 80 layers, 64 query heads, 8 KV heads, head dimension 128, bf16 cache. How much KV cache does each token add, and how does that compare with full MHA?</p>
+    <ol><li>2.5 MiB, the same as MHA</li><li>160 KiB, 16× smaller</li><li>640 KiB, 4× smaller</li><li>320 KiB, 8× smaller</li></ol>
+    <div class="explain">\(2 \times 80 \times 8 \times 128 \times 2 = 327{,}680\) bytes = 320 KiB. MHA would use 64 KV heads: 2.5 MiB per token. The saving is \(64/8 = 8\times\). A 32K-token context costs 10 GiB of cache instead of 80 GiB.</div></div>
+  <div class="q" data-answer="1"><p>With RoPE, a query with content \(q\) at position 100 attending to a key with content \(k\) at position 90 produces score \(s\). The same \(q\) and \(k\) at positions 1,010 and 1,000?</p>
+    <ol><li>A larger score, because the angles are larger</li><li>Exactly \(s\), up to floating-point rounding</li><li>A smaller score, because rotations accumulate error</li><li>\(-s\)</li></ol>
+    <div class="explain">\(\langle R_m q, R_n k\rangle = q^{\top} R_{n-m} k\). Only \(n - m = -10\) matters, and it's the same in both cases. (Very large positions do lose some float precision in the angles, which is why implementations compute them in fp32.)</div></div>
+  <div class="q" data-answer="2"><p>Why do SwiGLU models use \(d_{ff} \approx \tfrac{8}{3}d\) instead of the classic \(4d\)?</p>
+    <ol><li>SiLU is more expensive to compute than GELU</li><li>It makes \(d_{ff}\) a power of two</li><li>SwiGLU has three matrices, and \(3 \times d \times \tfrac{8}{3}d = 8d^2\) matches the \(2 \times d \times 4d\) of a GELU MLP</li><li>Gating halves the number of activations that need storing</li></ol>
+    <div class="explain">Adding a third matrix at the same width would cost 50% more parameters and FLOPs. Shrinking \(d_{ff}\) by 2/3 makes the comparison fair, which is how Shazeer (2020) compared variants. Real models then round to hardware-friendly sizes, and some go wider (Llama 3 uses 3.5d).</div></div>
+  <div class="q" data-answer="0"><p>Mixtral 8x7B has about 46.7B parameters and uses about 12.9B per token (top-2 of 8 experts). Serving it at batch 1, which is true?</p>
+    <ol><li>You need memory for all ~46.7B parameters, but per-token compute is like a ~13B dense model</li><li>You only need memory for the ~12.9B active parameters</li><li>Per-token compute is like a 46.7B dense model, but memory is like 13B</li><li>It runs 8 separate 7B models and takes a vote</li></ol>
+    <div class="explain">Any token may route to any expert, so all experts stay resident. Each token runs attention plus only 2 expert MLPs per layer, so FLOPs are about \(2 \times 12.9\)B. "8x7B" is a name, not 8 full models: attention and embeddings are shared, which is why the total is 46.7B rather than 56B.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, heatmap, widget, fmtNum, fmtSI, fmtBytes, rng, softmax, palette, clamp } = C;
+  const P = palette;
+
+  /* ---------------------------------------------------------- shared SVG helpers */
+  function arrowDefs(s, id, color, size) {
+    const d = svg("defs"), m = size || 7;
+    d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: m, markerHeight: m, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color || P.ink })));
+    s.appendChild(d);
+  }
+  function rbox(s, x, y, w, h, title, sub, o) {
+    o = o || {};
+    s.appendChild(svg("rect", { x, y, width: w, height: h, rx: o.rx != null ? o.rx : 8, fill: o.fill || "#fff", stroke: o.stroke || "rgba(28,27,25,.32)", "stroke-width": o.sw || 1.2, "stroke-dasharray": o.dash || null, opacity: o.op || null }));
+    const lines = sub ? sub.split("|") : [];
+    const blockH = 13 + lines.length * 12.5;
+    const top = y + (h - blockH) / 2;
+    if (title) s.appendChild(svg("text", { x: x + w / 2, y: top + 11, "text-anchor": "middle", "font-size": o.fs || 13, "font-weight": 600, fill: o.color || P.ink, opacity: o.op || null, text: title }));
+    lines.forEach((tline, i) => s.appendChild(svg("text", { x: x + w / 2, y: top + 13 + (i + 1) * 12.5 - 1, "text-anchor": "middle", "font-size": 10.5, fill: P.muted, class: "mono", opacity: o.op || null, text: tline })));
+  }
+  function txt(s, x, y, text, o) {
+    o = o || {};
+    s.appendChild(svg("text", { x, y, "font-size": o.fs || 11.5, fill: o.color || P.ink, "text-anchor": o.anchor || "start", class: o.mono === false ? null : "mono", "font-weight": o.fw || null, opacity: o.op || null, text }));
+  }
+  function path(s, d, o) {
+    o = o || {};
+    s.appendChild(svg("path", { d, fill: "none", stroke: o.color || P.ink, "stroke-width": o.w || 1.4, "stroke-dasharray": o.dash || null, "marker-end": o.arrow ? `url(#${o.arrow})` : null, opacity: o.op || null, "stroke-linecap": "round" }));
+  }
+  function plus(s, cx, cy, r) {
+    s.appendChild(svg("circle", { cx, cy, r, fill: "#fff", stroke: P.ink, "stroke-width": 1.4 }));
+    s.appendChild(svg("path", { d: `M${cx - r * 0.55},${cy} H${cx + r * 0.55} M${cx},${cy - r * 0.55} V${cy + r * 0.55}`, stroke: P.ink, "stroke-width": 1.6 }));
+  }
+  const tint = { blue: "rgba(47,93,138,.10)", green: "rgba(26,122,82,.10)", gold: "rgba(154,123,34,.12)", plum: "rgba(122,63,110,.10)", brick: "rgba(176,67,46,.10)", paper: "#fbfaf7" };
+  const tintStroke = { blue: "rgba(47,93,138,.55)", green: "rgba(26,122,82,.55)", gold: "rgba(154,123,34,.6)", plum: "rgba(122,63,110,.55)", brick: "rgba(176,67,46,.55)" };
+
+  /* ---------------------------------------------------------- parameter counting (shared) */
+  function countParams(c) {
+    const hd = c.d / c.h, kvd = c.kv * hd;
+    const swiglu = c.mlp === "swiglu";
+    const attnL = 2 * c.d * c.d + 2 * c.d * kvd + (c.bias ? c.d + 2 * kvd + c.d : 0);
+    const mlpL = (swiglu ? 3 : 2) * c.d * c.dff + (c.bias ? (swiglu ? 2 * c.dff : c.dff) + c.d : 0);
+    const normL = 2 * (c.ln ? 2 * c.d : c.d);
+    const layer = attnL + mlpL + normL;
+    const emb = c.V * c.d, head = c.tied ? 0 : c.V * c.d, pos = (c.P || 0) * c.d, fin = c.ln ? 2 * c.d : c.d;
+    const total = c.L * layer + emb + head + pos + fin;
+    return { hd, attn: c.L * attnL, mlp: c.L * mlpL, norms: c.L * normL + fin, emb, head, pos, layer, total, attnL, mlpL,
+      kvBytes: 2 * c.L * kvd * 2, approx: 12 * c.L * c.d * c.d, nonEmb: c.L * layer + fin,
+      nMat: c.L * (attnL + mlpL) + c.V * c.d };
+  }
+  const PRESETS = {
+    l8: { label: "Llama-3-8B", d: 4096, L: 32, h: 32, kv: 8, dff: 14336, V: 128256, tied: false, mlp: "swiglu", ln: false, bias: false, P: 0 },
+    l70: { label: "Llama-3-70B", d: 8192, L: 80, h: 64, kv: 8, dff: 28672, V: 128256, tied: false, mlp: "swiglu", ln: false, bias: false, P: 0 },
+    g2: { label: "GPT-2 small", d: 768, L: 12, h: 12, kv: 12, dff: 3072, V: 50257, tied: true, mlp: "gelu", ln: true, bias: true, P: 1024 }
+  };
+
+  /* ---------------------------------------------------------- Fig: decoder-only stack */
+  (function () {
+    const s = document.getElementById("fig-stack");
+    arrowDefs(s, "arr-stack", P.ink);
+    arrowDefs(s, "arr-stack-b", P.blue, 4.2);
+    const SX = 250, BX = 430, A = { arrow: "arr-stack" }, AB = { arrow: "arr-stack-b", color: P.blue, w: 2.4 };
+    // block frame
+    s.appendChild(svg("rect", { x: 64, y: 178, width: 506, height: 346, rx: 14, fill: "rgba(47,93,138,.035)", stroke: "rgba(47,93,138,.5)", "stroke-dasharray": "6 4", "stroke-width": 1.2 }));
+    txt(s, 76, 286, "transformer block", { color: P.blue, fw: 600, fs: 11 });
+    txt(s, 76, 301, "repeated N times", { color: P.blue, fs: 10.5 });
+    txt(s, 76, 316, "(Llama-3-8B: N = 32)", { color: P.muted, fs: 10.5 });
+    txt(s, 236, 430, "residual", { anchor: "end", color: P.blue, fs: 10.5 });
+    txt(s, 236, 444, "stream", { anchor: "end", color: P.blue, fs: 10.5 });
+    txt(s, 236, 458, "[B, T, d]", { anchor: "end", color: P.blue, fs: 10.5 });
+    // bottom: ids and embedding
+    rbox(s, SX - 100, 606, 200, 40, "token ids", "[B, T] integers", { fill: tint.paper });
+    path(s, `M${SX},606 L${SX},589`, A);
+    rbox(s, SX - 115, 540, 230, 46, "Token embedding  W_E", "row lookup in a [V × d] table", { fill: tint.gold, stroke: tintStroke.gold });
+    // residual spine through block
+    path(s, `M${SX},540 L${SX},373`, AB);
+    path(s, `M${SX},349 L${SX},213`, AB);
+    // attention sub-layer
+    path(s, `M${SX},505 L${BX},505 L${BX},496`, A);
+    rbox(s, BX - 70, 465, 140, 28, "RMSNorm", null, { fill: tint.paper });
+    path(s, `M${BX},465 L${BX},443`, A);
+    rbox(s, BX - 100, 385, 200, 55, "Causal self-attention", "multi-head · W_Q W_K W_V W_O", { fill: tint.blue, stroke: tintStroke.blue });
+    path(s, `M${BX},385 L${BX},360 L${SX + 14},360`, A);
+    plus(s, SX, 360, 11);
+    // MLP sub-layer
+    path(s, `M${SX},335 L${BX},335 L${BX},326`, A);
+    rbox(s, BX - 70, 295, 140, 28, "RMSNorm", null, { fill: tint.paper });
+    path(s, `M${BX},295 L${BX},273`, A);
+    rbox(s, BX - 100, 215, 200, 55, "SwiGLU MLP", "per position · W_1 W_3 W_2", { fill: tint.green, stroke: tintStroke.green });
+    path(s, `M${BX},215 L${BX},200 L${SX + 14},200`, A);
+    plus(s, SX, 200, 11);
+    // top: final norm, head, output
+    path(s, `M${SX},189 L${SX},156`, AB);
+    rbox(s, SX - 80, 127, 160, 28, "Final RMSNorm", null, { fill: tint.paper });
+    path(s, `M${SX},127 L${SX},109`, A);
+    rbox(s, SX - 115, 60, 230, 46, "LM head  W_U", "[d × V] matmul → logits", { fill: tint.plum, stroke: tintStroke.plum });
+    path(s, `M${SX},60 L${SX},42`, A);
+    txt(s, SX, 30, "logits [B, T, V]  →  softmax  →  p(next token)", { anchor: "middle", fs: 12 });
+    // right-hand annotations
+    const AX = 600;
+    const note = (y, lines, color) => lines.forEach((l, i) => txt(s, AX, y + i * 15, l, { fs: i === 0 ? 12 : 11, color: i === 0 ? (color || P.ink) : P.muted, fw: i === 0 ? 600 : null, mono: i !== 0 }));
+    note(398, ["Mixes information across positions", "token i reads tokens 0…i", "41.9M params per layer"], P.blue);
+    note(228, ["Transforms each position alone", "no token-to-token traffic", "176.2M params per layer (≈ 81%)"], P.green);
+    note(352, ["x ← x + Attn(Norm(x))"]);
+    note(192, ["x ← x + MLP(Norm(x))"]);
+    note(556, ["128,256 × 4,096 = 525M params", "vector for each token id"], P.gold);
+    note(76, ["another 128,256 × 4,096 = 525M", "untied from W_E in Llama-3-8B"], P.plum);
+    note(142, ["rescales the stream once"]);
+    s.appendChild(svg("line", { x1: 540, x2: 590, y1: 412, y2: 402, stroke: P.faint, "stroke-dasharray": "2 3" }));
+    s.appendChild(svg("line", { x1: 540, x2: 590, y1: 242, y2: 232, stroke: P.faint, "stroke-dasharray": "2 3" }));
+  })();
+
+  /* ---------------------------------------------------------- Fig: residual stream */
+  (function () {
+    const s = document.getElementById("fig-residual");
+    arrowDefs(s, "arr-res", P.ink);
+    arrowDefs(s, "arr-res-g", P.green);
+    s.appendChild(svg("rect", { x: 30, y: 150, width: 792, height: 26, rx: 4, fill: "rgba(47,93,138,.16)" }));
+    s.appendChild(svg("path", { d: "M822,140 L850,163 L822,186 Z", fill: "rgba(47,93,138,.16)" }));
+    txt(s, 430, 167, "residual stream x  ·  one d-vector per position  ·  only ever added to", { anchor: "middle", color: P.blue, fs: 11.5 });
+    txt(s, 430, 26, "x_{l+1} = x_l + F_l( Norm(x_l) )", { anchor: "middle", fs: 13 });
+    rbox(s, 40, 198, 110, 40, "embed", "writes x_0", { fill: tint.gold, stroke: tintStroke.gold });
+    path(s, "M95,198 L95,179", { arrow: "arr-res" });
+    rbox(s, 730, 198, 110, 40, "LM head", "reads x_N", { fill: tint.plum, stroke: tintStroke.plum });
+    path(s, "M785,177 L785,196", { arrow: "arr-res" });
+    const blocks = [[235, "Attn 1", "blue"], [345, "MLP 1", "green"], [455, "Attn 2", "blue"], [565, "MLP 2", "green"], [675, "… layer N", null]];
+    blocks.forEach(([cx, lab, k], i) => {
+      rbox(s, cx - 46, 58, 92, 42, lab, null, { fill: k ? tint[k] : tint.paper, stroke: k ? tintStroke[k] : null });
+      path(s, `M${cx - 20},149 L${cx - 20},102`, { arrow: "arr-res", color: P.ink, w: 1.2 });
+      path(s, `M${cx + 20},100 L${cx + 20},148`, { arrow: "arr-res-g", color: P.green, w: 1.8 });
+      if (i === 0) {
+        txt(s, cx - 25, 132, "read", { anchor: "end", fs: 10.5, color: P.muted });
+        txt(s, cx + 25, 132, "+ write", { fs: 10.5, color: P.green });
+      }
+    });
+    txt(s, 235, 48, "sees Norm(x), not x", { anchor: "middle", fs: 10, color: P.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: attention intuition */
+  (function () {
+    const s = document.getElementById("fig-attn-intuition");
+    const toks = ["The", "cat", "sat", "on", "the", "mat", "because", "it", "was", "tired"];
+    const wts = [0.08, 0.46, 0.05, 0.02, 0.03, 0.14, 0.07, 0.15];
+    const Q = 7, y0 = 150, bw = 72, gap = 82, x0 = 24;
+    const cx = i => x0 + i * gap + bw / 2;
+    // arcs: each lands on its own spot along the top of the query box
+    wts.forEach((wv, j) => {
+      if (j === Q) return;
+      const ex = cx(Q) - 28 + j * 8, c = (cx(j) + ex) / 2, cy = y0 - 30 - (Q - j) * 26;
+      s.appendChild(svg("path", { d: `M${cx(j)},${y0} Q ${c},${cy} ${ex},${y0}`, fill: "none", stroke: P.green, "stroke-width": 1 + 16 * wv, opacity: 0.25 + 0.75 * Math.min(1, wv * 2), "stroke-linecap": "round" }));
+    });
+    toks.forEach((tk, i) => {
+      const fut = i > Q, q = i === Q;
+      rbox(s, x0 + i * gap, y0, bw, 30, tk, null, { fill: q ? tint.brick : fut ? "#f3f2ed" : "#fff", stroke: q ? P.brick : fut ? "rgba(28,27,25,.2)" : null, dash: fut ? "3 3" : null, color: fut ? P.faint : q ? P.brick : P.ink, fs: 12.5 });
+      txt(s, cx(i), y0 + 48, fut ? "—" : wts[i].toFixed(2), { anchor: "middle", fs: 11.5, color: fut ? P.faint : wts[i] > 0.1 ? P.green : P.muted, fw: wts[i] > 0.3 ? 700 : null });
+    });
+    txt(s, x0 - 2, y0 + 48, "w", { anchor: "end", fs: 11, color: P.muted });
+    txt(s, cx(Q), y0 + 66, "query (self-weight)", { anchor: "middle", fs: 10.5, color: P.brick });
+    txt(s, (cx(8) + cx(9)) / 2, y0 + 66, "future: masked out", { anchor: "middle", fs: 10.5, color: P.faint });
+    txt(s, 24, 236, "The weights in the row under the tokens sum to 1. Output for \"it\" = Σ_j  w_j · v_j", { fs: 10.5, color: P.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: multi-head split */
+  (function () {
+    const s = document.getElementById("fig-heads");
+    arrowDefs(s, "arr-heads", P.muted);
+    const A = { arrow: "arr-heads", color: P.muted, w: 1.2 };
+    const cols = [P.green, P.blue, P.gold, P.plum];
+    const bar = (x, y0, n, ch, colorOf, op) => { for (let i = 0; i < n; i++) s.appendChild(svg("rect", { x, y: y0 + i * ch, width: 22, height: ch - 1.5, rx: 2, fill: colorOf(i), opacity: op || 0.8 })); };
+    // input
+    bar(30, 54, 16, 12, () => "rgba(28,27,25,.28)");
+    txt(s, 41, 44, "x", { anchor: "middle", fs: 12, fw: 600 });
+    txt(s, 41, 266, "[d]", { anchor: "middle", fs: 10.5, color: P.muted });
+    path(s, "M58,150 L116,150", A);
+    rbox(s, 120, 112, 112, 76, "W_Q W_K W_V", "one [d × d]|matmul each", { fill: tint.paper });
+    // split Q groups
+    const gy = g => 40 + g * 62;
+    for (let g = 0; g < 4; g++) {
+      path(s, `M232,150 C 248,150 248,${gy(g) + 20} 262,${gy(g) + 20}`, A);
+      bar(264, gy(g), 4, 10, () => cols[g]);
+      path(s, `M288,${gy(g) + 20} L314,${gy(g) + 20}`, A);
+      rbox(s, 316, gy(g), 210, 40, `head ${g + 1}`, "softmax(q_i K_iᵀ/√d_h) V_i", { fill: "#fff", stroke: cols[g], fs: 12 });
+      path(s, `M526,${gy(g) + 20} C 545,${gy(g) + 20} 545,${78 + g * 48} 558,${78 + g * 48}`, A);
+    }
+    txt(s, 275, 30, "split: h × d_head", { anchor: "middle", fs: 10.5, color: P.muted });
+    // concat
+    bar(560, 54, 16, 12, i => cols[Math.floor(i / 4)]);
+    txt(s, 571, 44, "concat", { anchor: "middle", fs: 11, fw: 600 });
+    txt(s, 571, 266, "[d]", { anchor: "middle", fs: 10.5, color: P.muted });
+    path(s, "M586,150 L628,150", A);
+    rbox(s, 632, 112, 92, 76, "W_O", "[d × d]|mixes heads", { fill: tint.paper });
+    path(s, "M724,150 L768,150", A);
+    bar(772, 54, 16, 12, () => "rgba(47,93,138,.5)");
+    txt(s, 783, 44, "out", { anchor: "middle", fs: 11, fw: 600 });
+    txt(s, 783, 266, "+ to stream", { anchor: "middle", fs: 10.5, color: P.blue });
+    txt(s, 430, 292, "Llama-3-8B: d = 4096 → h = 32 heads × d_head = 128. Same parameters and FLOPs as one 4096-wide head.", { anchor: "middle", fs: 11, color: P.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: induction head */
+  (function () {
+    const s = document.getElementById("fig-induction");
+    arrowDefs(s, "arr-ind-g", P.green, 4.5);
+    arrowDefs(s, "arr-ind-o", P.gold, 5);
+    const toks = ["Mr", "Dursley", "was", "proud", "to", "say", "…", "Mr", "?"];
+    const gap = 92, bw = 76, x0 = 18, y0 = 92;
+    const cx = i => x0 + i * gap + bw / 2;
+    toks.forEach((tk, i) => {
+      const last = i === 8;
+      rbox(s, x0 + i * gap, y0, bw, 32, tk, null, { fill: i === 7 ? tint.green : (i === 1 ? tint.gold : "#fff"), stroke: last ? P.green : null, dash: last ? "4 3" : null, color: last ? P.green : P.ink, fs: 12.5 });
+    });
+    // previous-token head (below): query at Dursley(1) attends key Mr(0)
+    path(s, `M${cx(1)},${y0 + 33} Q ${(cx(0) + cx(1)) / 2},${y0 + 78} ${cx(0) + 4},${y0 + 36}`, { arrow: "arr-ind-o", color: P.gold, w: 2 });
+    txt(s, 18, 184, "1 · previous-token head (earlier layer): at \"Dursley\", attend to the token before it", { fs: 10.5, color: P.gold });
+    txt(s, 18, 198, "    and write \"my previous token was Mr\" into Dursley's residual stream", { fs: 10.5, color: P.gold });
+    // induction head (above): query at Mr(7) attends Dursley(1)
+    path(s, `M${cx(7)},${y0 - 1} Q ${(cx(1) + cx(7)) / 2},${y0 - 88} ${cx(1) + 6},${y0 - 4}`, { arrow: "arr-ind-g", color: P.green, w: 2.4 });
+    txt(s, (cx(1) + cx(7)) / 2, 30, "2 · induction head (later layer): at the second \"Mr\", look for a token whose previous token was \"Mr\"", { anchor: "middle", fs: 10.5, color: P.green });
+    txt(s, (cx(1) + cx(7)) / 2, 44, "finds \"Dursley\" and copies its identity forward", { anchor: "middle", fs: 10.5, color: P.green });
+    txt(s, cx(8), y0 + 52, "→ \"Dursley\"", { anchor: "middle", fs: 12, color: P.green, fw: 700 });
+  })();
+
+  /* ---------------------------------------------------------- Fig: MHA / GQA / MQA */
+  (function () {
+    const s = document.getElementById("fig-gqa");
+    const panels = [["MHA · 8 KV heads", "Vaswani et al., 2017", 8, "KV cache ×1", P.brick], ["GQA · 2 KV heads", "Ainslie et al., 2023", 2, "KV cache ×1/4", P.green], ["MQA · 1 KV head", "Shazeer, 2019", 1, "KV cache ×1/8", P.gold]];
+    panels.forEach(([title, cite, nkv, cache, ccol], pi) => {
+      const px = 10 + pi * 285, sq = 24, gp = 7, start = px + (280 - (8 * (sq + gp) - gp)) / 2;
+      s.appendChild(svg("rect", { x: px, y: 6, width: 275, height: 238, rx: 10, fill: pi === 1 ? "rgba(26,122,82,.04)" : "none", stroke: P.line }));
+      txt(s, px + 137, 28, title, { anchor: "middle", fs: 12.5, fw: 600, mono: false });
+      txt(s, px + 137, 44, cite, { anchor: "middle", fs: 10, color: P.muted });
+      txt(s, px + 137, 64, "query heads", { anchor: "middle", fs: 10, color: P.blue });
+      const qx = i => start + i * (sq + gp) + sq / 2;
+      const grp = 8 / nkv;
+      const kvx = j => { let a = 0; for (let i = j * grp; i < (j + 1) * grp; i++) a += qx(i); return a / grp; };
+      for (let i = 0; i < 8; i++) {
+        const j = Math.floor(i / grp);
+        s.appendChild(svg("line", { x1: qx(i), y1: 96, x2: kvx(j), y2: 158, stroke: P.faint, "stroke-width": 1.1 }));
+      }
+      for (let i = 0; i < 8; i++) s.appendChild(svg("rect", { x: qx(i) - sq / 2, y: 72, width: sq, height: sq, rx: 4, fill: "rgba(47,93,138,.22)", stroke: "rgba(47,93,138,.6)" }));
+      for (let j = 0; j < nkv; j++) {
+        s.appendChild(svg("rect", { x: kvx(j) - sq / 2, y: 160, width: sq, height: sq, rx: 4, fill: "rgba(154,123,34,.28)", stroke: "rgba(154,123,34,.7)" }));
+      }
+      txt(s, px + 137, 204, "K/V heads (these are cached)", { anchor: "middle", fs: 10, color: P.gold });
+      txt(s, px + 137, 228, cache, { anchor: "middle", fs: 12, fw: 700, color: ccol });
+    });
+  })();
+
+  /* ---------------------------------------------------------- Fig: pre-norm vs post-norm */
+  (function () {
+    const s = document.getElementById("fig-norms");
+    arrowDefs(s, "arr-norm", P.ink);
+    arrowDefs(s, "arr-norm-g", P.green, 3.4);
+    const A = { arrow: "arr-norm" };
+    // post-norm
+    let sx = 160, bx = 290;
+    s.appendChild(svg("rect", { x: 10, y: 6, width: 410, height: 288, rx: 10, fill: "rgba(176,67,46,.03)", stroke: P.line }));
+    txt(s, 215, 26, "Post-norm · original Transformer, BERT", { anchor: "middle", fs: 12.5, fw: 600, mono: false, color: P.brick });
+    txt(s, sx, 284, "x", { anchor: "middle", fs: 13, fw: 600 });
+    path(s, `M${sx},272 L${sx},173`, A);
+    path(s, `M${sx},250 L${bx},250 L${bx},236`, A);
+    rbox(s, bx - 70, 188, 140, 46, "Sublayer", "Attn or MLP", { fill: "#fff" });
+    path(s, `M${bx},188 L${bx},160 L${sx + 14},160`, A);
+    plus(s, sx, 160, 11);
+    path(s, `M${sx},149 L${sx},120`, A);
+    rbox(s, sx - 60, 88, 120, 30, "LayerNorm", null, { fill: tint.brick, stroke: tintStroke.brick });
+    path(s, `M${sx},88 L${sx},62`, A);
+    txt(s, sx, 52, "out", { anchor: "middle", fs: 12, fw: 600 });
+    txt(s, 236, 100, "norm sits ON the residual path:", { fs: 10.5, color: P.brick });
+    txt(s, 236, 114, "gradients cross 2N norms", { fs: 10.5, color: P.brick });
+    // pre-norm
+    sx = 590; bx = 720;
+    s.appendChild(svg("rect", { x: 440, y: 6, width: 410, height: 288, rx: 10, fill: "rgba(26,122,82,.03)", stroke: P.line }));
+    txt(s, 645, 26, "Pre-norm · GPT-2 onward, Llama", { anchor: "middle", fs: 12.5, fw: 600, mono: false, color: P.green });
+    txt(s, sx, 284, "x", { anchor: "middle", fs: 13, fw: 600 });
+    s.appendChild(svg("path", { d: `M${sx},272 L${sx},113`, fill: "none", stroke: P.green, "stroke-width": 3, "marker-end": "url(#arr-norm-g)" }));
+    path(s, `M${sx},258 L${bx},258 L${bx},246`, A);
+    rbox(s, bx - 60, 214, 120, 30, "RMSNorm", null, { fill: tint.paper });
+    path(s, `M${bx},214 L${bx},196`, A);
+    rbox(s, bx - 70, 148, 140, 46, "Sublayer", "Attn or MLP", { fill: "#fff" });
+    path(s, `M${bx},148 L${bx},100 L${sx + 14},100`, A);
+    plus(s, sx, 100, 11);
+    path(s, `M${sx},89 L${sx},62`, A);
+    txt(s, sx, 52, "out", { anchor: "middle", fs: 12, fw: 600 });
+    txt(s, sx - 12, 200, "clean identity", { anchor: "end", fs: 10.5, color: P.green });
+    txt(s, sx - 12, 214, "path, input to output", { anchor: "end", fs: 10.5, color: P.green });
+  })();
+
+  /* ---------------------------------------------------------- Fig: MoE */
+  (function () {
+    const s = document.getElementById("fig-moe");
+    arrowDefs(s, "arr-moe", P.muted);
+    arrowDefs(s, "arr-moe-g", P.green);
+    const A = { arrow: "arr-moe", color: P.muted, w: 1.2 };
+    rbox(s, 16, 125, 86, 50, "h_t", "[d]", { fill: tint.paper });
+    path(s, "M102,150 L146,150", A);
+    rbox(s, 150, 118, 112, 64, "router", "h · W_r|[d × E] logits", { fill: tint.gold, stroke: tintStroke.gold });
+    const scores = [0.3, 2.1, -0.4, 0.5, -1.0, 1.6, 0.1, -0.6];
+    const top = [1, 5];
+    txt(s, 365, 96, "router scores", { anchor: "middle", fs: 10.5, color: P.muted });
+    scores.forEach((v, i) => {
+      const h = (v + 1.25) * 28, x = 298 + i * 17;
+      s.appendChild(svg("rect", { x, y: 196 - h, width: 12, height: h, rx: 2, fill: top.includes(i) ? P.green : P.faint, opacity: top.includes(i) ? 0.9 : 0.5 }));
+      txt(s, x + 6, 210, String(i + 1), { anchor: "middle", fs: 9.5, color: top.includes(i) ? P.green : P.muted });
+    });
+    path(s, "M262,150 L290,150", A);
+    txt(s, 365, 226, "top-2 kept", { anchor: "middle", fs: 10.5, color: P.green });
+    const ey = i => 18 + i * 34;
+    for (let i = 0; i < 8; i++) {
+      const on = top.includes(i);
+      rbox(s, 520, ey(i), 130, 26, `expert ${i + 1}`, null, { fill: on ? tint.green : "#fff", stroke: on ? P.green : "rgba(28,27,25,.18)", color: on ? P.green : P.faint, fs: 11.5 });
+      s.appendChild(svg("path", { d: `M440,150 C 480,150 480,${ey(i) + 13} 518,${ey(i) + 13}`, fill: "none", stroke: on ? P.green : P.faint, "stroke-width": on ? 1.8 : 0.8, "stroke-dasharray": on ? null : "3 3", "marker-end": on ? "url(#arr-moe-g)" : null, opacity: on ? 1 : 0.6 }));
+    }
+    plus(s, 720, 150, 12);
+    [[1, "0.62"], [5, "0.38"]].forEach(([i, g]) => {
+      s.appendChild(svg("path", { d: `M650,${ey(i) + 13} C 690,${ey(i) + 13} 690,150 706,150`, fill: "none", stroke: P.green, "stroke-width": 1.8, "marker-end": "url(#arr-moe-g)" }));
+      txt(s, 676, ey(i) + (i === 1 ? 6 : 28), "g = " + g, { fs: 10.5, color: P.green, fw: 600 });
+    });
+    path(s, "M732,150 L788,150", A);
+    txt(s, 796, 154, "y_t", { fs: 13, fw: 600 });
+    txt(s, 796, 170, "→ stream", { fs: 10, color: P.muted });
+    txt(s, 16, 290, "Mixtral 8x7B: 8 experts, top-2 · ≈46.7B total, ≈12.9B active per token", { fs: 10.5, color: P.muted });
+  })();
+
+  /* ---------------------------------------------------------- Widget: why sqrt(d_k) */
+  (function () {
+    const w = widget("w-scale", { title: "Why divide by √d_k", kicker: "Interactive", note: "Each setting draws one query and 8 keys with independent unit-variance entries, seeded per d_k so the demo is reproducible. Dots on the left are measured standard deviations over 600 random pairs. Trained Q and K aren't unit-variance, but the problem is worst at initialization: a saturated softmax has near-zero gradient, so a model that starts saturated may never learn its way out." });
+    let scaled = true;
+    const ds = slider(w.controls, { label: "Head dimension d_k", min: 0, max: 10, step: 1, value: 7, fmt: v => String(2 ** v), onInput: draw });
+    const c = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Scores" })));
+    seg(c, { options: [{ value: "on", label: "q·k / √d_k" }, { value: "off", label: "raw q·k" }], value: "on", onChange: v => { scaled = v === "on"; draw(); } });
+    w.controls.appendChild(c);
+    const emp = [];
+    for (let e = 0; e <= 10; e++) {
+      const d = 2 ** e, R = rng(500 + e), S = 600; let ss = 0;
+      for (let n = 0; n < S; n++) { let dot = 0; for (let i = 0; i < d; i++) dot += R.normal() * R.normal(); ss += dot * dot; }
+      emp.push(Math.sqrt(ss / S));
+    }
+    const split = el("div", { class: "w-split" }); w.body.appendChild(split);
+    const left = el("div", { class: "canvas-wrap" }), right = el("div", { class: "canvas-wrap" });
+    split.appendChild(left); split.appendChild(right);
+    const Pl = plot(left, { width: 380, height: 270, x: [1, 1024], y: [0.3, 60], logx: true, logy: true, xlabel: "d_k (log scale)", ylabel: "std of score", xticks: [1, 4, 16, 64, 256, 1024], yticks: [1, 10], margin: { l: 44, r: 12 } });
+    right.appendChild(el("div", { class: "small muted", style: { margin: "0 0 4px" }, text: "softmax weights for one query over 8 keys" }));
+    const Bc = bars(right, { width: 380, height: 244, max: 1, fmt: v => v.toFixed(2) });
+    const set = stats(w.body, [{ key: "std", label: "Std of raw q·k" }, { key: "spread", label: "Score range (max − min)" }, { key: "top", label: "Largest weight" }, { key: "ent", label: "Entropy" }, { key: "grad", label: "Largest ∂p/∂z" }]);
+    function draw() {
+      const e = ds.value, d = 2 ** e, R = rng(900 + e);
+      const q = Array.from({ length: d }, () => R.normal());
+      const raw = Array.from({ length: 8 }, () => { let s = 0; for (let i = 0; i < d; i++) s += q[i] * R.normal(); return s; });
+      const sc = raw.map(v => scaled ? v / Math.sqrt(d) : v);
+      const p = softmax(sc);
+      Pl.draw([
+        { fn: x => Math.sqrt(x), color: P.brick, label: "raw: std = √d_k" },
+        { fn: () => 1, color: P.green, label: "scaled: std = 1" },
+        { points: emp.map((sd, i) => [2 ** i, sd]), color: P.brick, dots: true, dotsOnly: true },
+        { points: emp.map((sd, i) => [2 ** i, sd / Math.sqrt(2 ** i)]), color: P.green, dots: true, dotsOnly: true },
+        { vline: d, color: P.ink, label: "d_k = " + d }
+      ]);
+      const imax = p.indexOf(Math.max(...p));
+      Bc.draw(p.map((_, i) => "k" + (i + 1)), p, { max: 1, colors: p.map((_, i) => i === imax ? (scaled ? P.green : P.brick) : P.blue) });
+      const H = -p.reduce((a, v) => a + (v > 0 ? v * Math.log2(v) : 0), 0);
+      const g = Math.max(...p.map(v => v * (1 - v)));
+      set("std", fmtNum(emp[e], 2), null, "√d_k = " + fmtNum(Math.sqrt(d), 2));
+      set("spread", fmtNum(Math.max(...sc) - Math.min(...sc), 2), Math.max(...sc) - Math.min(...sc) > 12 ? "bad" : "good", scaled ? "after ÷ √d_k" : "raw scores");
+      set("top", fmtNum(p[imax], 3), p[imax] > 0.95 ? "bad" : p[imax] > 0.7 ? "warn" : "good", p[imax] > 0.95 ? "effectively one-hot" : "a real blend");
+      set("ent", fmtNum(H, 2) + " bits", H < 0.3 ? "bad" : "good", "max log₂8 = 3 bits");
+      set("grad", g < 1e-3 ? g.toExponential(1) : fmtNum(g, 3), g < 0.02 ? "bad" : "good", "max p(1−p), ≤ 0.25");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: attention heatmap */
+  (function () {
+    const w = widget("w-attn", { title: "Attention over a sentence", kicker: "Interactive", note: "Toy queries and keys: hand-built features (sink, animate noun, noun, verb, determiner, state) plus seeded noise, d_k = 8. Real models learn these from data, but the mechanics are identical. Rows are query positions, columns are key positions; each row sums to 1. Click a row, or pick a token, to see its weights as bars. Turn the mask off to see how much weight would leak to future tokens." });
+    const toks = ["The", "cat", "sat", "on", "the", "mat", "because", "it", "was", "tired"];
+    const Kf = [[2, 0, 0, 0, 1, 0], [0, 2, 1.4, 0, 0, 0], [0, 0, 0, 2, 0, 0], [0, 0, 0, .6, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 1.4, 0, 0, 0], [0, 0, 0, .4, 0, 0], [0, .7, .6, 0, 0, 0], [0, 0, 0, 1.6, 0, 0], [0, 0, 0, 0, 0, 1.6]];
+    const Qf = [[1, 0, 0, 0, 0, 0], [.6, 0, 0, 0, 1.5, 0], [.4, 1.3, .9, 0, 0, 0], [.4, 0, 0, 1.3, 0, 0], [.8, 0, 0, .5, 0, 0], [.4, 0, 0, 0, 1.5, 0], [.6, 0, 0, 1.1, 0, 0], [.3, 1.7, .7, 0, 0, 0], [.4, .9, .5, 0, 0, .5], [.3, 1.4, 0, .7, 0, 0]];
+    const R = rng(3), G = 1.5, dk = 8;
+    const pad = v => [...v.map(x => x * G), 0, 0].map(x => x + R.normal() * 0.35);
+    const Qm = Qf.map(pad), Km = Kf.map(pad);
+    const raw = Qm.map(q => Km.map(k => k.reduce((a, v, j) => a + v * q[j], 0)));
+    let causal = true, scaleOn = true, sel = 7;
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Causal mask" })));
+    seg(c1, { options: [{ value: "on", label: "on" }, { value: "off", label: "off" }], value: "on", onChange: v => { causal = v === "on"; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Scale" })));
+    seg(c2, { options: [{ value: "on", label: "÷ √d_k" }, { value: "off", label: "none" }], value: "on", onChange: v => { scaleOn = v === "on"; draw(); } });
+    w.controls.appendChild(c2);
+    const temp = slider(w.controls, { label: "Temperature τ", min: 0.25, max: 4, step: 0.05, value: 1, fmt: v => v.toFixed(2), onInput: draw });
+    const pick = select(w.controls, { label: "Query token", options: toks.map((t, i) => ({ value: String(i), label: `${i} · ${t}` })), value: "7", onChange: v => { sel = +v; draw(); } });
+    const wrap = el("div", { class: "canvas-wrap", style: { display: "flex", justifyContent: "center" } }); w.body.appendChild(wrap);
+    const H = heatmap(wrap, { cell: 40, rowLabels: toks, colLabels: toks, labelWidth: 76, labelHeight: 62, fmt: v => v < 0.005 ? "0" : v.toFixed(2).replace(/^0/, ""), maxWidth: 520 });
+    w.body.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 4px" }, html: "Weights of the selected query over every key. <b style='color:#1a7a52'>green</b> past, <b style='color:#9a7b22'>gold</b> itself, <b style='color:#b0432e'>brick</b> future." }));
+    const wrap2 = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap2);
+    const Bw = bars(wrap2, { width: 760, height: 170, max: 1, fmt: v => v.toFixed(2) });
+    const set = stats(w.body, [{ key: "q", label: "Query" }, { key: "top", label: "Attends most to" }, { key: "ent", label: "Entropy" }, { key: "leak", label: "Weight on future" }]);
+    function draw() {
+      const T = toks.length, sc = scaleOn ? 1 / Math.sqrt(dk) : 1;
+      const Wt = raw.map((row, i) => softmax(row.map((v, j) => causal && j > i ? -Infinity : v * sc), temp.value));
+      H.draw(Wt, { min: 0, max: 1, hue: "green", mask: causal ? (i, j) => j > i : null });
+      const cells = H.svg.querySelectorAll("rect");
+      cells.forEach((r, k) => { r.classList.add("cellbtn"); r.addEventListener("click", () => { sel = Math.floor(k / T); pick.value = String(sel); draw(); }); });
+      const vb = H.svg.getAttribute("viewBox").split(" ").map(Number);
+      H.svg.appendChild(svg("rect", { x: 76 + 0.5, y: 62 + sel * 40 + 0.5, width: T * 40 - 1, height: 39, rx: 4, fill: "none", stroke: P.ink, "stroke-width": 2, "pointer-events": "none" }));
+      void vb;
+      const row = Wt[sel];
+      Bw.draw(toks, row, { max: 1, colors: row.map((_, j) => j > sel ? P.brick : j === sel ? P.gold : P.green) });
+      const jmax = row.indexOf(Math.max(...row));
+      const Hn = -row.reduce((a, v) => a + (v > 1e-12 ? v * Math.log2(v) : 0), 0);
+      const leak = row.reduce((a, v, j) => a + (j > sel ? v : 0), 0);
+      set("q", `"${toks[sel]}"`, null, "position " + sel);
+      set("top", `"${toks[jmax]}"`, null, "weight " + row[jmax].toFixed(2));
+      set("ent", fmtNum(Hn, 2) + " bits", null, `uniform over ${causal ? sel + 1 : T} keys = ${fmtNum(Math.log2(causal ? sel + 1 : T), 2)}`);
+      set("leak", leak.toFixed(2), leak > 0.01 ? "bad" : "good", leak > 0.01 ? "the model can peek at answers" : "nothing from the future");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: RoPE */
+  (function () {
+    const w = widget("w-rope", { title: "Rotate a query and a key", kicker: "Interactive", note: "Head dimension 64, so 32 rotating pairs. The circle shows one pair: dashed arrows are the unrotated query (green) and key (brick), solid arrows are after rotating by mθᵢ and nθᵢ. The plot on the right is the full 64-dimensional score q̃·k̃ as a function of m − n. Use the shift buttons: m and n both change, the arrows spin, and the score doesn't move." });
+    const D = 64, Rr = rng(21);
+    const q64 = Array.from({ length: D }, () => Rr.normal());
+    const k64 = q64.map(v => 0.8 * v + 0.6 * Rr.normal());
+    let base = 10000;
+    const ms = slider(w.controls, { label: "Query position m", min: 0, max: 64, step: 1, value: 12, onInput: draw });
+    const ns = slider(w.controls, { label: "Key position n", min: 0, max: 64, step: 1, value: 5, onInput: draw });
+    const ps = slider(w.controls, { label: "Pair i", min: 0, max: 31, step: 1, value: 2, fmt: v => v + " of 0–31", onInput: draw });
+    select(w.controls, { label: "Base", options: [{ value: "10000", label: "10,000 (RoPE paper, Llama 2)" }, { value: "500000", label: "500,000 (Llama 3)" }], value: "10000", onChange: v => { base = +v; draw(); } });
+    const br = el("div", { class: "btnrow" });
+    const shift = k => { const m = ms.value + k, n = ns.value + k; if (m < 0 || n < 0 || m > 64 || n > 64) return; ms.value = m; ns.value = n; draw(); };
+    br.appendChild(el("button", { class: "btn", text: "shift both −8", onclick: () => shift(-8) }));
+    br.appendChild(el("button", { class: "btn", text: "shift both +8", onclick: () => shift(8) }));
+    br.appendChild(el("button", { class: "btn", text: "shift both +1", onclick: () => shift(1) }));
+    w.controls.appendChild(br);
+    const split = el("div", { class: "w-split" }); w.body.appendChild(split);
+    const left = el("div", { class: "canvas-wrap" }), right = el("div", { class: "canvas-wrap" });
+    split.appendChild(left); split.appendChild(right);
+    const cs = svg("svg", { viewBox: "0 0 360 300" }); left.appendChild(cs);
+    const Pl = plot(right, { width: 380, height: 300, x: [-64, 64], y: [-1, 1.2], yticks: [-1, -0.5, 0, 0.5, 1], xlabel: "relative position m − n", ylabel: "score / max", margin: { l: 44, r: 12, t: 22 } });
+    const set = stats(w.body, [{ key: "th", label: "θᵢ (rad / position)" }, { key: "am", label: "query angle mθᵢ" }, { key: "an", label: "key angle nθᵢ" }, { key: "rel", label: "m − n" }, { key: "full", label: "Full 64-d score" }]);
+    const theta = i => Math.pow(base, -2 * i / D);
+    function rot(v, pos) {
+      const out = v.slice();
+      for (let i = 0; i < D / 2; i++) { const a = pos * theta(i), c = Math.cos(a), s = Math.sin(a); out[2 * i] = v[2 * i] * c - v[2 * i + 1] * s; out[2 * i + 1] = v[2 * i] * s + v[2 * i + 1] * c; }
+      return out;
+    }
+    const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+    const deg = a => { const x = ((a * 180 / Math.PI) % 360 + 360) % 360; return fmtNum(x, 1) + "°"; };
+    function draw() {
+      const m = ms.value, n = ns.value, i = ps.value;
+      const qr = rot(q64, m), kr = rot(k64, n);
+      const full = dot(qr, kr);
+      const norm0 = Math.max(...Array.from({ length: 129 }, (_, t) => Math.abs(dot(rot(q64, t - 64), k64))));
+      // circle panel
+      while (cs.firstChild) cs.removeChild(cs.firstChild);
+      arrowDefs(cs, "arr-rq", P.green); arrowDefs(cs, "arr-rk", P.brick);
+      arrowDefs(cs, "arr-rq0", "rgba(26,122,82,.45)"); arrowDefs(cs, "arr-rk0", "rgba(176,67,46,.45)");
+      const cx = 180, cy = 150, Rad = 112;
+      cs.appendChild(svg("circle", { cx, cy, r: Rad, fill: "none", stroke: P.line }));
+      cs.appendChild(svg("line", { x1: cx - Rad - 10, x2: cx + Rad + 10, y1: cy, y2: cy, stroke: P.line }));
+      cs.appendChild(svg("line", { y1: cy - Rad - 10, y2: cy + Rad + 10, x1: cx, x2: cx, stroke: P.line }));
+      const qp = [q64[2 * i], q64[2 * i + 1]], kp = [k64[2 * i], k64[2 * i + 1]];
+      const scl = Rad / Math.max(Math.hypot(...qp), Math.hypot(...kp));
+      const vec = (v, col, mk, dash, wd) => cs.appendChild(svg("line", { x1: cx, y1: cy, x2: cx + v[0] * scl, y2: cy - v[1] * scl, stroke: col, "stroke-width": wd, "stroke-dasharray": dash, "marker-end": `url(#${mk})` }));
+      vec(qp, "rgba(26,122,82,.45)", "arr-rq0", "4 3", 1.4);
+      vec(kp, "rgba(176,67,46,.45)", "arr-rk0", "4 3", 1.4);
+      const qrp = [qr[2 * i], qr[2 * i + 1]], krp = [kr[2 * i], kr[2 * i + 1]];
+      vec(qrp, P.green, "arr-rq", null, 2.6);
+      vec(krp, P.brick, "arr-rk", null, 2.6);
+      // angle arc between rotated vectors
+      const a1 = Math.atan2(qrp[1], qrp[0]), a2 = Math.atan2(krp[1], krp[0]);
+      let da = a1 - a2; while (da > Math.PI) da -= 2 * Math.PI; while (da < -Math.PI) da += 2 * Math.PI;
+      const r0 = 34, pa = a => [cx + r0 * Math.cos(a), cy - r0 * Math.sin(a)];
+      const [x1, y1] = pa(a2), [x2, y2] = pa(a2 + da);
+      cs.appendChild(svg("path", { d: `M${x1},${y1} A ${r0} ${r0} 0 0 ${da > 0 ? 0 : 1} ${x2},${y2}`, fill: "none", stroke: P.gold, "stroke-width": 2 }));
+      txt(cs, 10, 18, `pair ${i}: dims ${2 * i}, ${2 * i + 1}`, { fs: 11, color: P.muted });
+      txt(cs, 10, 290, "green q rotated by mθᵢ · brick k rotated by nθᵢ", { fs: 10, color: P.muted });
+      txt(cs, 350, 18, "angle between: " + fmtNum(Math.abs(da) * 180 / Math.PI, 1) + "°", { anchor: "end", fs: 11, color: P.gold });
+      // relative-position curve
+      Pl.draw([
+        { hline: 0, color: P.faint, dash: "2 3" },
+        { fn: t => dot(rot(q64, t), k64) / norm0, color: P.blue, width: 1.8, samples: 520 },
+        { marker: [m - n, full / norm0], color: P.brick, label: "now" }
+      ]);
+      set("th", theta(i) < 0.01 ? theta(i).toExponential(2) : fmtNum(theta(i), 3), null, `${base.toLocaleString("en-US")}^(−2·${i}/64)`);
+      set("am", deg(m * theta(i)), null, "m = " + m);
+      set("an", deg(n * theta(i)), null, "n = " + n);
+      set("rel", String(m - n), null, "the only thing that matters");
+      set("full", fmtNum(full, 3), null, "unchanged by shifting both");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: parameter calculator */
+  (function () {
+    const w = widget("w-params", { title: "Parameter calculator", kicker: "Calculator", note: "Llama presets: RMSNorm, no biases, RoPE (no position table), untied LM head. GPT-2 preset: LayerNorm with bias, biases on every linear layer, a learned 1,024-position table, and an LM head tied to the token embedding. Presets reproduce the published totals: 8,030,261,248 · 70,553,706,496 · 124,439,808. Assumes heads × head_dim = d." });
+    let key = "l8", cfg = Object.assign({}, PRESETS.l8);
+    select(w.controls, { label: "Preset", options: Object.entries(PRESETS).map(([k, p]) => ({ value: k, label: p.label })), value: "l8", onChange: v => { key = v; cfg = Object.assign({}, PRESETS[v]); sync(); draw(); } });
+    const fields = [["d", "d_model"], ["L", "layers L"], ["h", "query heads"], ["kv", "KV heads"], ["dff", "d_ff"], ["V", "vocab V"]];
+    const inputs = {};
+    fields.forEach(([k, lab]) => {
+      const inp = el("input", { type: "number", min: 1, step: 1, value: cfg[k], style: { width: "104px" } });
+      inp.addEventListener("input", () => { const v = parseInt(inp.value, 10); if (v > 0) { cfg[k] = v; draw(); } });
+      w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: lab })), inp]));
+      inputs[k] = inp;
+    });
+    const mOpts = [{ value: "swiglu", label: "SwiGLU · 3 mats" }, { value: "gelu", label: "GELU · 2 mats" }];
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "MLP" })));
+    const mSeg = seg(c1, { options: mOpts, value: cfg.mlp, onChange: v => { cfg.mlp = v; draw(); } });
+    w.controls.appendChild(c1);
+    const tOpts = [{ value: "untied", label: "untied" }, { value: "tied", label: "tied" }];
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "LM head" })));
+    const tSeg = seg(c2, { options: tOpts, value: cfg.tied ? "tied" : "untied", onChange: v => { cfg.tied = v === "tied"; draw(); } });
+    w.controls.appendChild(c2);
+    const setSeg = (sg, opts, val) => Array.from(sg.el.children).forEach((b, i) => b.classList.toggle("on", opts[i].value === val));
+    function sync() {
+      fields.forEach(([k]) => inputs[k].value = cfg[k]);
+      setSeg(mSeg, mOpts, cfg.mlp); setSeg(tSeg, tOpts, cfg.tied ? "tied" : "untied");
+    }
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 230, horizontal: true, labelWidth: 120 });
+    const warn = el("p", { class: "w-warn" }); w.body.appendChild(warn);
+    const set = stats(w.body, [{ key: "total", label: "Total parameters" }, { key: "layer", label: "Per layer" }, { key: "approx", label: "12·L·d² estimate" }, { key: "kv", label: "KV cache / token" }]);
+    const labels = ["attention", "MLP", "norms", "token embed", "LM head", "position table"];
+    function draw() {
+      const c = countParams(cfg);
+      const vals = [c.attn, c.mlp, c.norms, c.emb, c.head, c.pos];
+      B.draw(labels, vals, { max: Math.max(...vals) * 1.3, colors: [P.blue, P.green, P.faint, P.gold, P.plum, P.teal], fmt: v => v === 0 ? "0" : fmtSI(v, 2) + "  ·  " + fmtNum(100 * v / c.total, 1) + "%" });
+      const msgs = [];
+      if (cfg.d % cfg.h) msgs.push(`d = ${cfg.d} isn't divisible by ${cfg.h} heads.`);
+      if (cfg.h % cfg.kv) msgs.push(`${cfg.h} query heads can't be split evenly over ${cfg.kv} KV heads.`);
+      if (cfg.kv > cfg.h) msgs.push("More KV heads than query heads doesn't make sense.");
+      warn.textContent = msgs.join(" ");
+      set("total", fmtSI(c.total, 2), null, c.total.toLocaleString("en-US") + " · " + fmtNum(c.total * 2 / 1e9, 1) + " GB in bf16");
+      set("layer", fmtSI(c.layer, 2), null, `attn ${fmtSI(c.attnL, 1)} + MLP ${fmtSI(c.mlpL, 1)} (MLP ${fmtNum(100 * c.mlpL / c.layer, 0)}%)`);
+      const err = 100 * (c.approx - c.nonEmb) / c.nonEmb;
+      set("approx", fmtSI(c.approx, 2), Math.abs(err) < 5 ? "good" : "warn", `${err >= 0 ? "+" : ""}${fmtNum(err, 1)}% vs exact non-embedding ${fmtSI(c.nonEmb, 2)}`);
+      set("kv", fmtBytes(c.kvBytes), null, `bf16 · ${fmtBytes(c.kvBytes * 8192)} per 8K tokens`);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: FLOPs vs context */
+  (function () {
+    const w = widget("w-flops", { title: "Where the FLOPs go as context grows", kicker: "Interactive", note: "Forward FLOPs for one token that attends to T earlier tokens (a decode step at position T). Ignores softmax, norms and other elementwise work, which are small. The crossover is where the attention term 4·L·T·d equals the weight term 2N. FLOPs aren't the whole story: at decode, reading the KV cache from memory usually hurts before these FLOPs do (Module 08)." });
+    let cfg = PRESETS.l8;
+    select(w.controls, { label: "Model", options: Object.entries(PRESETS).map(([k, p]) => ({ value: k, label: p.label })), value: "l8", onChange: v => { cfg = PRESETS[v]; draw(); } });
+    const kfmt = t => t >= 1048576 ? (t / 1048576) + "M" : t >= 1024 ? (t / 1024) + "K" : String(t);
+    const ts = slider(w.controls, { label: "Context T (tokens)", min: 7, max: 20, step: 1, value: 13, fmt: v => kfmt(2 ** v), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const nice = x => Math.abs(x - Math.round(x)) < 0.05 || x >= 10 ? fmtNum(x, 0) : fmtNum(x, 1);
+    const ffmt = v => v >= 1e12 ? nice(v / 1e12) + "T" : v >= 1e9 ? nice(v / 1e9) + "G" : nice(v / 1e6) + "M";
+    const Pl = plot(wrap, { width: 760, height: 300, x: [128, 1048576], y: [1e8, 1e13], logx: true, logy: true, xlabel: "context length T (tokens, log scale)", ylabel: "FLOPs per token", xticks: [128, 1024, 8192, 65536, 524288], xfmt: kfmt, yfmt: ffmt, margin: { l: 56 } });
+    const set = stats(w.body, [{ key: "w", label: "Weight term 2N" }, { key: "a", label: "Attention term at T" }, { key: "tot", label: "Total per token" }, { key: "share", label: "Attention share" }]);
+    function draw() {
+      const c = countParams(cfg), T = 2 ** ts.value;
+      const W2 = 2 * c.nMat, att = t => 4 * cfg.L * t * cfg.d;
+      const lo = Math.min(W2, att(128)) / 3, hi = (W2 + att(1048576)) * 3;
+      Pl.y = [Math.pow(10, Math.floor(Math.log10(lo))), Math.pow(10, Math.ceil(Math.log10(hi)))];
+      const Tstar = W2 / (4 * cfg.L * cfg.d);
+      Pl.draw([
+        { fn: () => W2, color: P.green, dash: "6 4", label: "weights: 2N" },
+        { fn: att, color: P.brick, dash: "6 4", label: "attention: 4·L·T·d" },
+        { fn: t => W2 + att(t), color: P.ink, width: 2.6, label: "total" },
+        { vline: Tstar, color: P.gold, label: "equal at T ≈ " + fmtSI(Tstar, 0) },
+        { marker: [T, W2 + att(T)], color: P.blue }
+      ]);
+      const share = att(T) / (W2 + att(T));
+      set("w", ffmt(W2) + "FLOP", null, "N = " + fmtSI(c.nMat, 2) + " matmul params");
+      set("a", ffmt(att(T)) + "FLOP", null, "T = " + T.toLocaleString("en-US"));
+      set("tot", ffmt(W2 + att(T)) + "FLOP", null, "forward only; training ≈ 3×");
+      set("share", fmtNum(100 * share, 1) + "%", share > 0.5 ? "bad" : share > 0.2 ? "warn" : "good", share > 0.5 ? "attention dominates" : "weights dominate");
+    }
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>

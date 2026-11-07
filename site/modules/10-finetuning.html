@@ -1,0 +1,1352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Fine-tuning — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .tri{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  @media (max-width:760px){.tri{grid-template-columns:1fr}}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 10px}
+  .chips button{font-family:var(--mono);font-size:12px;min-width:54px;padding:6px 8px;border-radius:8px;border:1px solid rgba(28,27,25,.2);background:#fff;cursor:pointer}
+  .chips button.r1{background:rgba(26,122,82,.16);border-color:rgba(26,122,82,.55)}
+  .chips button.rh{background:rgba(154,123,34,.16);border-color:rgba(154,123,34,.55)}
+  .chips button.r0{background:rgba(176,67,46,.10);border-color:rgba(176,67,46,.45)}
+</style>
+</head>
+<body data-module="10">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 10 · Adapting models</p>
+<h1 class="title">Fine-tuning: teaching a model new <span class="it">habits</span></h1>
+<p class="lede">Full fine-tuning of an 8B model needs about 128 GB of GPU memory before a single activation is stored. A rank-16 LoRA adapter on every linear layer of the same model is 42 million parameters, an 84 MB file, and with QLoRA the whole job fits on one 24 GB card. This module covers what fine-tuning can and can't do, how to run it end to end, and how preference tuning (RLHF, DPO, GRPO) pushes a model past imitation.</p>
+<div class="meta"><span class="tag">~5 hours</span><span class="tag n">prereqs: 03, 07, 09</span><span class="tag g">hands-on: TRL, PEFT, MLX, vLLM</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Decide between prompting, RAG, and fine-tuning for a concrete problem, and say why fine-tuning is a poor way to add facts.</li>
+    <li>Write the SFT loss with a loss mask, build a JSONL chat dataset, and catch template, EOS, and train/serve drift bugs before they cost you a run.</li>
+    <li>Compute LoRA parameter counts and training memory for full fine-tuning, LoRA, and QLoRA on a given model and GPU.</li>
+    <li>Pick starting hyperparameters, read train/validation curves, and stop before overfitting or catastrophic forgetting set in.</li>
+    <li>Derive what the RLHF reward model, PPO, DPO, and GRPO each optimize, and explain what DPO's β and GRPO's group baseline do.</li>
+    <li>Run a LoRA fine-tune with TRL or MLX, serve the adapter with vLLM, and show it beats a prompted baseline on held-out data without regressing elsewhere.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="what">What fine-tuning is, and what it isn't</h2>
+
+<p>Fine-tuning means taking a model that has already been trained and continuing to train it on a much smaller dataset of your own. The weights and the next-token objective stay the same; what changes is that the gradient now points at <em>your</em> examples. A few hundred well-chosen examples can change how a model behaves in ways no prompt reliably will.</p>
+
+<p>The important word is <strong>behaves</strong>. Fine-tuning is very good at changing:</p>
+<ul>
+  <li><strong>Format</strong>: always emit valid JSON with these four keys, always call tools with this schema, never add a preamble.</li>
+  <li><strong>Style and voice</strong>: your support team's tone, terse commit messages, a house style for legal summaries.</li>
+  <li><strong>Narrow skills</strong>: classify tickets into your 40 categories, extract fields from invoices, translate your DSL into SQL.</li>
+  <li><strong>Cost and latency</strong>: a 3B model fine-tuned on a task can match a much larger prompted model on that one task, and you can drop the 2,000-token instruction block from every request.</li>
+</ul>
+
+<p>It is a weak tool for <strong>adding lots of new facts</strong>. A model trained on your product docs for a few epochs will learn their vocabulary and tone, but it won't reliably recall that the refund window changed from 30 to 45 days last Tuesday, and it can't cite where it read that. Ovadia et al. (2023) compared the two directly and found retrieval beat unsupervised fine-tuning for knowledge injection across their tasks. Gekhman et al. (2024) found that examples containing genuinely new knowledge are learned slowly and, once learned, make the model more prone to hallucinate. When the gap is <em>knowledge</em>, especially knowledge that changes, use retrieval (Module 11).</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 410" id="fig-decide"></svg>
+<figcaption>A decision path for adapting a model. Start at the top and stop at the first box that solves your problem. Each step down costs more and is harder to undo. The right-hand column covers the common combination: retrieval supplies the facts, a small fine-tune teaches the model how to use retrieved context in your format.</figcaption></figure>
+
+<div class="intuition"><b>Intuition</b>
+<p>Pretraining gives the model a library. Fine-tuning teaches it a job: how to read a request, which shelf to walk to, how to write the answer up. If the book it needs isn't in the library, training it harder on the job won't put the book there. Hand it the book at request time instead.</p>
+</div>
+
+<details class="think"><summary>Think first: your model writes great answers but wraps the JSON in markdown fences 8% of the time. Prompt, RAG, or fine-tune?</summary>
+<div>Try prompting and constrained decoding first: a schema-constrained or JSON-mode sampler (structured outputs, supported by vLLM, llama.cpp, and most APIs) removes the fences at decode time with zero training. If you also need the model to follow a subtle extraction policy that the prompt keeps missing, that's a behaviour gap, and a few hundred SFT examples is the right next step. RAG doesn't help, because nothing is missing from the model's knowledge.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="pipeline">The post-training pipeline</h2>
+
+<p>The "chat model" you call through an API is a base model that went through several stages of post-training. Knowing the stages tells you where your own fine-tune sits and which knobs each stage turns.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 300" id="fig-pipeline"></svg>
+<figcaption>The modern post-training stack. Stages 2–4 use orders of magnitude less data than pretraining and change behaviour, not knowledge. Data sizes are rough public figures and vary widely between labs. Most product fine-tunes start from an instruct checkpoint and redo a small slice of stage 2, sometimes stage 3.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Stage</th><th>Data</th><th>Objective</th><th>What it changes</th></tr></thead>
+  <tbody>
+    <tr><td>Pretraining</td><td>Trillions of web, code, book tokens</td><td>Next-token cross-entropy on everything</td><td>Knowledge, language, latent skills (Module 07)</td></tr>
+    <tr><td>SFT (instruction tuning)</td><td>Prompt → ideal response demonstrations</td><td>Cross-entropy on response tokens only</td><td>Follows instructions, chat format, turn-taking, refusals, tool-call syntax</td></tr>
+    <tr><td>Preference tuning</td><td>Prompt + chosen vs rejected response</td><td>Reward model + PPO (RLHF), or DPO directly</td><td>Which of several acceptable answers people prefer: helpfulness, tone, length, safety</td></tr>
+    <tr><td>RL with verifiable rewards</td><td>Prompts with checkable answers (math, unit tests)</td><td>Policy gradient (PPO, GRPO) on a programmatic reward</td><td>Multi-step reasoning, self-checking, long chains of thought</td></tr>
+  </tbody>
+</table>
+
+<p>SFT is imitation: the model can only be as good as the demonstrations. Preference tuning and RL let the model generate its own attempts and get graded, which is how it can end up better than any single demonstration it saw. That difference comes up again in the last third of this module.</p>
+
+<!-- ================================================================== -->
+<h2 id="sft">Supervised fine-tuning: the objective</h2>
+
+<p>SFT uses exactly the pretraining loss from Module 03, with one change. A training example is a whole conversation rendered into one token sequence, but we only want the model to learn to produce the <em>assistant's</em> tokens. Learning to predict the user's question would waste gradient on text the model will never have to write. So each token gets a mask bit.</p>
+
+<div class="formula" data-name="SFT loss with a loss mask">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}_{\text{SFT}}}(\theta) = -\frac{1}{\sum_{t} \htmlClass{t2}{m_t}} \sum_{t=1}^{\htmlClass{t3}{T}} \htmlClass{t2}{m_t}\,\log \htmlClass{t4}{\pi_\theta}\big(\htmlClass{t5}{y_t} \mid \htmlClass{t6}{y_{\lt t}}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}_{\text{SFT}}\)</dt><dd>average negative log-likelihood per <em>counted</em> token; this is what the optimizer minimizes</dd></div>
+    <div data-t="t2"><dt>\(m_t\)</dt><dd>loss mask: 1 if token \(t\) belongs to an assistant response (including its end-of-turn token), 0 for system, user, tool-result, and template tokens</dd></div>
+    <div data-t="t3"><dt>\(T\)</dt><dd>length of the rendered sequence in tokens</dd></div>
+    <div data-t="t4"><dt>\(\pi_\theta\)</dt><dd>the model's next-token distribution with weights \(\theta\) (the "policy")</dd></div>
+    <div data-t="t5"><dt>\(y_t\)</dt><dd>the actual token at position \(t\)</dd></div>
+    <div data-t="t6"><dt>\(y_{\lt t}\)</dt><dd>every token before it, prompt included. The prompt is still <em>read</em>; it just isn't <em>scored</em></dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Run the whole conversation through the model, look at how much probability it gave to each assistant token, and push those probabilities up. Ignore the tokens the model didn't write.</p>
+  <p class="why"><b>Why it matters</b>On an extraction task with a 2,000-token document and a 60-token JSON answer, an unmasked loss spends 97% of its signal teaching the model to write invoices. Masking puts all of it on the answer.</p>
+</div>
+
+<figure class="fig wide"><div id="fig-mask"></div>
+<figcaption>One training example after the chat template has been applied (ChatML-style, as used by Qwen; token boundaries are illustrative). Grey tokens are read but not scored (\(m_t=0\)). Green tokens contribute to the loss (\(m_t=1\)). The final end-of-turn token is green on purpose: it is how the model learns to stop.</figcaption></figure>
+
+<div class="flag"><b>How the average is taken matters</b>
+<p>The formula divides by the number of counted tokens across the batch. Some implementations instead average per sequence, then across sequences, which gives a 20-token answer the same total weight as a 2,000-token one. Neither is wrong, but switching between them changes the effective learning rate on long responses. If you port a recipe between frameworks and the loss scale looks different, this is often why.</p>
+</div>
+
+<p>Two other loss choices you'll see. <strong>Continued pretraining</strong> (sometimes called domain-adaptive pretraining) sets \(m_t=1\) everywhere on raw domain text, with no chat template at all. It's how you shift a model's vocabulary toward, say, clinical notes, and it is the setting where forgetting is worst. <strong>Multi-turn masking</strong> scores every assistant turn in a conversation, not just the last one, which is usually what you want for chat data.</p>
+
+<!-- ================================================================== -->
+<h2 id="templates">Chat templates and data formats</h2>
+
+<p>A model doesn't see "messages". It sees one flat token sequence, and the <strong>chat template</strong> (a Jinja template shipped in <code>tokenizer_config.json</code>) decides how roles and turns are spelled with special tokens. Almost every fine-tuning dataset today is JSONL with one conversation per line:</p>
+
+<div class="code" data-lang="json" data-title="data/train.jsonl (one line per example, shown wrapped)"><pre><code>
+{"messages": [
+  {"role": "system", "content": "Extract invoice fields. Reply with JSON only: vendor, date (YYYY-MM-DD), total (number), currency (ISO 4217)."},
+  {"role": "user", "content": "ACME Corp - Invoice #4471\nServices rendered March 2024\nTotal due: EUR 1,240.00 by 15/03/2024"},
+  {"role": "assistant", "content": "{\"vendor\": \"ACME Corp\", \"date\": \"2024-03-15\", \"total\": 1240.0, \"currency\": \"EUR\"}"}
+]}
+</code></pre></div>
+
+<p>The same example rendered with the Llama 3 template looks like this. Every <code>&lt;|…|&gt;</code> marker is a single special token:</p>
+
+<div class="code" data-lang="text" data-title="what the model actually trains on (Llama 3 template)"><pre><code>
+&lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;
+
+Extract invoice fields. Reply with JSON only: vendor, date (YYYY-MM-DD), total (number), currency (ISO 4217).&lt;|eot_id|&gt;&lt;|start_header_id|&gt;user&lt;|end_header_id|&gt;
+
+ACME Corp - Invoice #4471
+Services rendered March 2024
+Total due: EUR 1,240.00 by 15/03/2024&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;
+
+{"vendor": "ACME Corp", "date": "2024-03-15", "total": 1240.0, "currency": "EUR"}&lt;|eot_id|&gt;
+</code></pre></div>
+
+<p>Other dataset shapes you'll meet: <code>{"prompt": …, "completion": …}</code> (the prompt is masked by default in TRL), <code>{"text": …}</code> for continued pretraining, <code>{"prompt", "chosen", "rejected"}</code> for preference tuning, and <code>messages</code> with <code>tool_calls</code> and a <code>tools</code> list for function-calling data.</p>
+
+<div class="code" data-lang="python" data-title="always look at the rendered string before training"><pre><code>
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+msgs = [{"role": "user", "content": "Total due: EUR 1,240.00"},
+        {"role": "assistant", "content": "{\"total\": 1240.0, \"currency\": \"EUR\"}"}]
+
+print(tok.apply_chat_template(msgs, tokenize=False))                     # training view
+print(tok.apply_chat_template(msgs[:1], tokenize=False,
+                              add_generation_prompt=True))             # serving view: must be a prefix of the training view
+ids = tok.apply_chat_template(msgs, tokenize=True)
+print(tok.convert_ids_to_tokens(ids)[-5:], tok.eos_token)              # does it end with the end-of-turn token?
+</code></pre></div>
+
+<div class="pitfall"><b>Pitfalls that silently ruin a fine-tune</b>
+<p><strong>Mismatched template.</strong> Training a Llama checkpoint with a ChatML template (or a home-made <code>### User:</code> format) teaches the model a second dialect. It may work in your notebook and fall apart behind a server that applies the official template.</p>
+<p><strong>Missing EOS / end-of-turn.</strong> If the scored tokens don't end with the token the server treats as "stop" (<code>&lt;|eot_id|&gt;</code>, <code>&lt;|im_end|&gt;</code>), the model never learns to stop and rambles until <code>max_tokens</code>. A base model whose tokenizer EOS differs from the template's end-of-turn token is the classic case; TRL's <code>SFTConfig(eos_token=…)</code> exists for it.</p>
+<p><strong>Train/serve drift.</strong> The serving stack renders prompts with whatever template it finds. Templates differ in small ways that matter: Llama 3.1+ templates add a "Cutting Knowledge Date / Today Date" preamble to the system turn, some Qwen templates insert a default system prompt when you pass none, and hybrid-reasoning models (Qwen3) render a <code>&lt;think&gt;</code> block that depends on <code>enable_thinking</code>. Train and serve with the same template and the same flags, and test with the exact production request path.</p>
+<p><strong>Double BOS.</strong> Tokenizing a string that already contains <code>&lt;|begin_of_text|&gt;</code> with <code>add_special_tokens=True</code> gives two BOS tokens. Harmless-looking, but it's a distribution shift the model never saw.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="data">Data: quality over quantity</h2>
+
+<p>The single most reliable lever in fine-tuning is the dataset. LIMA (Zhou et al., 2023) fine-tuned LLaMA-65B on just 1,000 carefully curated prompt–response pairs. In the authors' human study its answers were judged equivalent to or better than GPT-4's in 43% of cases. Their reading, the <em>superficial alignment hypothesis</em>: nearly all knowledge comes from pretraining, and alignment mostly teaches which format and style to use. A thousand excellent examples beat fifty thousand sloppy ones for that purpose.</p>
+
+<h3>How many examples?</h3>
+<p>These are rules of thumb from public recipes and practitioner experience, not guarantees. The right number depends on how far the target behaviour is from what the model already does.</p>
+<table class="t">
+  <thead><tr><th>Goal</th><th class="num">Typical size</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Output format, schema, tone</td><td class="num">100 – 1,000</td><td>Diversity of inputs matters more than count. Cover edge cases: empty fields, two currencies, malformed input.</td></tr>
+    <tr><td>Narrow task (extraction, classification, routing)</td><td class="num">500 – 5,000</td><td>Balance classes. Include hard negatives and examples the prompted baseline gets wrong.</td></tr>
+    <tr><td>New sub-skill or domain style (DSL → SQL, clinical tone)</td><td class="num">5,000 – 50,000+</td><td>Consider continued pretraining on raw domain text first.</td></tr>
+    <tr><td>General instruction following from a base model</td><td class="num">1,000 – 1M</td><td>LIMA showed 1k can go far; open recipes like Tülu 3 mix close to a million to cover many skills.</td></tr>
+    <tr><td>Preference pairs (DPO)</td><td class="num">1,000 – 100,000</td><td>Pairs where the difference is the thing you care about. Noisy labels hurt more than few labels.</td></tr>
+  </tbody>
+</table>
+
+<h3>Synthetic data and distillation</h3>
+<p>Most open fine-tuning recipes of the last two years (Alpaca-style sets, Tülu 3, the R1 distills) rely at least partly on data written by a stronger model. The pattern: write a few dozen seed examples by hand, have a strong model generate thousands of varied inputs and answers, then <em>filter hard</em>, with programmatic checks (does the JSON parse, do totals add up, do the unit tests pass) and a judge model or human spot-checks. When the outputs come from a bigger model and the student learns to imitate them, that's sequence-level distillation (covered formally near the end of this module). DeepSeek-R1's small "distilled" models were produced exactly this way: the R1 paper (DeepSeek-AI, 2025) reports SFT on roughly 800k samples curated with the large model. Check the provider's terms of use before training on API model outputs; several prohibit using them to build competing models.</p>
+
+<h3>Hygiene: dedup, decontamination, packing</h3>
+<ul>
+  <li><strong>Deduplicate.</strong> Exact-hash duplicates, then near-duplicates with MinHash or embedding similarity. Synthetic data is especially repetitive; a template that produced 500 near-identical invoices will be memorized, not learned from.</li>
+  <li><strong>Decontaminate against every eval set.</strong> Remove training examples that overlap your held-out test set and any public benchmark you'll report, using n-gram overlap (the GPT-3 paper used 13-grams) or embedding search. A synthetic generator prompted with "examples like GSM8K" will happily reproduce GSM8K.</li>
+  <li>Split by source, not by row. If ten examples come from one customer's invoices, all ten belong on the same side of the train/test split; otherwise your test set measures memorization of that customer's layout.</li>
+  <li><strong>Pack short examples.</strong> Padding a 150-token example to 2,048 wastes over 90% of the compute on that row. Packing concatenates several examples into one sequence; good implementations (TRL's <code>packing=True</code> with the default best-fit strategy) also reset position ids so examples can't attend to each other, which requires a padding-free attention kernel such as FlashAttention.</li>
+</ul>
+
+<div class="formula" data-name="Optimizer steps and effective batch">
+  <div class="tex">$$\htmlClass{t1}{S} = \left\lceil \frac{\htmlClass{t2}{E}\cdot \htmlClass{t3}{N}}{\htmlClass{t4}{b}\cdot \htmlClass{t5}{g}\cdot \htmlClass{t6}{n_{\text{gpu}}}} \right\rceil$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(S\)</dt><dd>number of optimizer steps (what warmup and the LR schedule are measured in)</dd></div>
+    <div data-t="t2"><dt>\(E\)</dt><dd>epochs: full passes over the data</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>training examples (or packed sequences, if packing)</dd></div>
+    <div data-t="t4"><dt>\(b\)</dt><dd>micro-batch: sequences per GPU per forward pass (limited by memory)</dd></div>
+    <div data-t="t5"><dt>\(g\)</dt><dd>gradient accumulation steps: forward/backward passes summed before one update</dd></div>
+    <div data-t="t6"><dt>\(n_{\text{gpu}}\)</dt><dd>data-parallel workers. \(b\cdot g\cdot n_{\text{gpu}}\) is the <em>effective batch</em></dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>2,000 examples × 3 epochs ÷ (4 × 4 × 1) = 375 steps. With 3% warmup that's 11 warmup steps.</p>
+  <p class="why"><b>Why it matters</b>Small datasets give few steps. 200 examples at effective batch 32 is 7 steps per epoch, and a recipe tuned for 5,000 steps will behave nothing like that. Reason in steps and tokens, not epochs alone.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="peft">Full fine-tuning vs parameter-efficient methods</h2>
+
+<p>Full fine-tuning updates every weight. Module 07 showed what that costs with AdamW in mixed precision: the weights themselves are the smallest part of the bill.</p>
+
+<div class="formula" data-name="Full fine-tuning memory (AdamW, mixed precision)">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{full}}} \approx \htmlClass{t2}{N}\,\big(\htmlClass{t4}{2} + \htmlClass{t5}{2} + \htmlClass{t6}{12}\big) + \htmlClass{t3}{M_{\text{act}}} = 16\,\htmlClass{t2}{N} + \htmlClass{t3}{M_{\text{act}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{full}}\)</dt><dd>bytes of GPU memory for training (before framework overhead)</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameters (8B → \(8\times10^9\))</dd></div>
+    <div data-t="t4"><dt>2</dt><dd>bf16 working copy of the weights</dd></div>
+    <div data-t="t5"><dt>2</dt><dd>bf16 gradient for every weight</dd></div>
+    <div data-t="t6"><dt>12</dt><dd>AdamW state in fp32: master weights (4) + first moment \(m\) (4) + second moment \(v\) (4)</dd></div>
+    <div data-t="t3"><dt>\(M_{\text{act}}\)</dt><dd>saved activations for backprop; grows with batch × sequence length, shrinks with gradient checkpointing</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every parameter costs about 16 bytes to train, versus 2 bytes to serve. An 8B model needs about 128 GB before activations, so more than one 80 GB GPU, sharded with FSDP or ZeRO-3.</p>
+</div>
+
+<p><strong>Parameter-efficient fine-tuning (PEFT)</strong> freezes the pretrained weights and trains a small number of new or selected parameters. Frozen weights need no gradient and no optimizer state, so they cost only their storage. The main families:</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">Additive · adapters</div><h4>Insert small trainable layers</h4><p>Houlsby et al. (2019) added bottleneck MLPs inside each block. Effective, but they add sequential compute at inference that you can't remove.</p></div>
+  <div class="card"><div class="k">Soft prompts</div><h4>Train virtual tokens</h4><p>Prefix- and prompt-tuning learn embedding vectors prepended to the input. Tiny, but they eat context length and trail LoRA on most LLM tasks.</p></div>
+  <div class="card blue"><div class="k">Reparameterize · LoRA</div><h4>Train a low-rank update</h4><p>Learn \(\Delta W = BA\) beside each frozen matrix. Mergeable into the weights after training, so zero inference overhead. The default today.</p></div>
+</div>
+
+<p>Full fine-tuning still has its place. When you have a lot of data and need the model to absorb a lot (continued pretraining on a new language, large-scale code), LoRA learns less. Biderman et al. (2024), in a paper titled <em>LoRA Learns Less and Forgets Less</em>, found full fine-tuning clearly ahead on code and math continued pretraining, while LoRA kept more of the base model's other abilities. For the typical product task, a few thousand examples and a narrow skill, LoRA usually lands close to full fine-tuning at a fraction of the cost.</p>
+
+<!-- ================================================================== -->
+<h2 id="lora">LoRA: low-rank adaptation</h2>
+
+<p>LoRA (Hu et al., 2021) rests on one empirical bet: the <em>change</em> fine-tuning makes to a weight matrix has low intrinsic rank. You don't need a full 4096×4096 matrix of independent updates; a product of two thin matrices captures most of it.</p>
+
+<div class="formula" data-name="LoRA forward pass">
+  <div class="tex">$$\htmlClass{t1}{h} = \htmlClass{t2}{W_0}\,\htmlClass{t3}{x} + \frac{\htmlClass{t4}{\alpha}}{\htmlClass{t5}{r}}\,\htmlClass{t6}{B}\,\htmlClass{t7}{A}\,\htmlClass{t3}{x}, \qquad \htmlClass{t6}{B}\in\mathbb{R}^{d\times \htmlClass{t5}{r}},\;\; \htmlClass{t7}{A}\in\mathbb{R}^{\htmlClass{t5}{r}\times k},\;\; \htmlClass{t5}{r}\ll\min(d,k)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(h\)</dt><dd>layer output, a vector of size \(d\) (e.g. the query vector from <code>q_proj</code>)</dd></div>
+    <div data-t="t2"><dt>\(W_0\)</dt><dd>the pretrained \(d\times k\) weight matrix. <b>Frozen</b>: no gradient, no optimizer state</dd></div>
+    <div data-t="t3"><dt>\(x\)</dt><dd>layer input, a vector of size \(k\)</dd></div>
+    <div data-t="t4"><dt>\(\alpha\)</dt><dd>scaling hyperparameter (<code>lora_alpha</code>). Together with \(r\) it sets how loud the update is</dd></div>
+    <div data-t="t5"><dt>\(r\)</dt><dd>rank: width of the bottleneck. Typical 8–64, versus \(d=4096\)</dd></div>
+    <div data-t="t6"><dt>\(B\)</dt><dd>up-projection \(r\to d\). <b>Initialized to zero</b></dd></div>
+    <div data-t="t7"><dt>\(A\)</dt><dd>down-projection \(k\to r\). Initialized randomly (Gaussian in the paper; Kaiming-uniform in PEFT)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Keep the original layer exactly as it was, and add a side path that squeezes the input down to \(r\) numbers and expands it back. Only the side path learns.</p>
+  <p class="why"><b>Why it matters</b>Because \(B=0\) at the start, \(BA=0\): step zero is exactly the pretrained model, and training starts from a known-good point instead of a randomly perturbed one. \(A\) must not also be zero, because then the gradients of both matrices would be zero and nothing would ever move.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 760 330" id="fig-lora"></svg>
+<figcaption>A LoRA-adapted linear layer. The frozen path (grey) is the original matmul. The trainable bypass (green) compresses \(x\) to \(r\) dimensions with \(A\) and expands back with \(B\). After training you can fold it in, \(W = W_0 + \tfrac{\alpha}{r}BA\), and serve a normal dense model at zero extra cost. Or keep it separate and swap adapters per request.</figcaption></figure>
+
+<div class="formula" data-name="LoRA parameter count, per matrix">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{LoRA}}} = \htmlClass{t2}{r}\,(\htmlClass{t3}{d} + \htmlClass{t4}{k}) \qquad\text{versus}\qquad \htmlClass{t3}{d}\,\htmlClass{t4}{k}\;\text{ for a full update}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{LoRA}}\)</dt><dd>trainable parameters added for one weight matrix: \(B\) has \(dr\), \(A\) has \(rk\)</dd></div>
+    <div data-t="t2"><dt>\(r\)</dt><dd>rank</dd></div>
+    <div data-t="t3"><dt>\(d\)</dt><dd>output dimension of the matrix</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>input dimension of the matrix</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Cost grows with the <em>sum</em> of the dimensions, not their product. A 4096×4096 <code>q_proj</code> at \(r=16\): \(16\times8192 = 131{,}072\) parameters, against 16.8M for the full matrix, or 0.78%.</p>
+  <p class="why"><b>Why it matters</b>Llama-3-8B with \(r=16\) on all seven linear layers in all 32 blocks adds 41.9M parameters, 0.52% of the model. In bf16 that's an 84 MB adapter file you can version, ship, and hot-swap.</p>
+</div>
+
+<div id="w-lora"></div>
+
+<h3>Why low rank works</h3>
+<p>Any matrix can be written as a sum of rank-1 pieces ordered by importance, via the singular value decomposition. Keeping the top \(r\) pieces gives the best possible rank-\(r\) approximation. If the fine-tuning update concentrates its energy in a few directions, a small \(r\) captures most of it. Hu et al. found exactly this on GPT-3: very low ranks (even \(r=1\) to 4 on \(W_q\) and \(W_v\)) were competitive with full fine-tuning on their benchmarks.</p>
+
+<div class="formula" data-name="Best rank-r approximation (Eckart–Young)">
+  <div class="tex">$$\htmlClass{t1}{\Delta W_r} = \sum_{i=1}^{\htmlClass{t2}{r}} \htmlClass{t3}{\sigma_i}\,\htmlClass{t4}{u_i}\,\htmlClass{t5}{v_i}^{\top}, \qquad \text{energy}(\htmlClass{t2}{r}) = \frac{\sum_{i\le \htmlClass{t2}{r}}\htmlClass{t3}{\sigma_i}^2}{\sum_{i}\htmlClass{t3}{\sigma_i}^2}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\Delta W_r\)</dt><dd>the closest rank-\(r\) matrix to \(\Delta W\) in Frobenius norm (no other rank-\(r\) matrix does better)</dd></div>
+    <div data-t="t2"><dt>\(r\)</dt><dd>how many components we keep</dd></div>
+    <div data-t="t3"><dt>\(\sigma_i\)</dt><dd>singular values, sorted largest first: how much each direction contributes</dd></div>
+    <div data-t="t4"><dt>\(u_i\)</dt><dd>left singular vector: an output direction</dd></div>
+    <div data-t="t5"><dt>\(v_i\)</dt><dd>right singular vector: the input direction that triggers it</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The relative error of the approximation is \(\sqrt{1-\text{energy}}\). When the singular values fall off fast, a handful of components carry nearly all of the update.</p>
+  <p class="why"><b>Why it matters</b>LoRA doesn't compute an SVD. It learns \(B\) and \(A\) by gradient descent directly. But this is the ceiling it's working under: rank \(r\) can capture at most this much of any target update.</p>
+</div>
+
+<div id="w-lowrank"></div>
+
+<details class="think"><summary>Think first: you merge a LoRA adapter into the base weights. How much slower is inference?</summary>
+<div>Not at all. \(W_0 + \tfrac{\alpha}{r}BA\) is just another \(d\times k\) matrix, the same shape and dtype as before. The catch: merging into a <em>quantized</em> base requires dequantizing, adding, and re-quantizing, which adds rounding error. Merge into the 16-bit weights, then quantize the merged model (Module 09).</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="knobs">LoRA knobs: scaling, targets, rsLoRA, DoRA</h2>
+
+<h3>α and r</h3>
+<p>The update is multiplied by \(\gamma = \alpha/r\). The intent is that you can change \(r\) without retuning the learning rate. Common practice: set \(\alpha = r\) (\(\gamma=1\)) or \(\alpha = 2r\) (\(\gamma=2\)), and tune the learning rate.</p>
+
+<div class="formula" data-name="Adapter scaling: LoRA vs rsLoRA">
+  <div class="tex">$$\htmlClass{t1}{\gamma_{\text{LoRA}}} = \frac{\htmlClass{t2}{\alpha}}{\htmlClass{t3}{r}}, \qquad \htmlClass{t4}{\gamma_{\text{rsLoRA}}} = \frac{\htmlClass{t2}{\alpha}}{\sqrt{\htmlClass{t3}{r}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\gamma_{\text{LoRA}}\)</dt><dd>original scaling: the update shrinks as \(1/r\) when you raise the rank</dd></div>
+    <div data-t="t2"><dt>\(\alpha\)</dt><dd><code>lora_alpha</code>, a constant you pick</dd></div>
+    <div data-t="t3"><dt>\(r\)</dt><dd>rank</dd></div>
+    <div data-t="t4"><dt>\(\gamma_{\text{rsLoRA}}\)</dt><dd>rank-stabilized scaling (Kalajdzievski, 2023): shrinks only as \(1/\sqrt{r}\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>With \(\alpha/r\) at fixed \(\alpha\), going from \(r=8\) to \(r=128\) divides the update by 16, so high-rank adapters learn slowly and look no better than low-rank ones. Dividing by \(\sqrt r\) keeps the update's size stable as rank grows.</p>
+  <p class="why"><b>Why it matters</b>If you sweep rank and see no gain above 16, try <code>use_rslora=True</code> before concluding rank doesn't matter.</p>
+</div>
+
+<div class="flag"><b>Frameworks disagree on the knob</b>
+<p>PEFT uses <code>lora_alpha</code> and computes \(\alpha/r\). mlx-lm exposes a <code>scale</code> that multiplies \(BA\) directly, defaulting to 20 at rank 8, which is ten times PEFT's common \(\alpha/r = 2\). That's one reason mlx-lm's default learning rate (1e-5) is an order of magnitude below the usual PEFT LoRA rate. Don't copy hyperparameters between frameworks without converting the scale.</p>
+</div>
+
+<h3>Which modules to target</h3>
+<p>The original paper adapted only <code>q_proj</code> and <code>v_proj</code>. The QLoRA paper (Dettmers et al., 2023) found that adapting <strong>all linear layers</strong> (attention q, k, v, o and the MLP gate, up, down) was needed to match full fine-tuning, and that once you did, rank mattered much less. In Llama-3-8B the three MLP matrices hold about 80% of each block's parameters; leaving them frozen leaves most of the model's capacity out of reach. Start with <code>target_modules="all-linear"</code>, which PEFT resolves to every linear layer except the output head. Embeddings and <code>lm_head</code> are normally left frozen unless you add new tokens, in which case you must train (or at least save) them via <code>modules_to_save</code>.</p>
+
+<h3>DoRA</h3>
+<p>DoRA (Liu et al., 2024) splits each weight into a <em>magnitude</em> and a <em>direction</em> and lets LoRA update only the direction, while a separate small vector learns the magnitude. Full fine-tuning tends to change the two somewhat independently; plain LoRA couples them.</p>
+
+<div class="formula" data-name="DoRA decomposition">
+  <div class="tex">$$\htmlClass{t1}{W'} = \htmlClass{t2}{m}\odot\frac{\htmlClass{t3}{W_0} + \htmlClass{t4}{BA}}{\big\lVert \htmlClass{t3}{W_0} + \htmlClass{t4}{BA} \big\rVert_{\htmlClass{t5}{c}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(W'\)</dt><dd>the effective adapted weight</dd></div>
+    <div data-t="t2"><dt>\(m\)</dt><dd>trainable magnitude vector, one scalar per column, initialized to \(\lVert W_0\rVert_c\)</dd></div>
+    <div data-t="t3"><dt>\(W_0\)</dt><dd>frozen pretrained weight</dd></div>
+    <div data-t="t4"><dt>\(BA\)</dt><dd>ordinary LoRA update, now only steering direction</dd></div>
+    <div data-t="t5"><dt>\(c\)</dt><dd>norm taken column by column, so every column of the fraction is a unit vector</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Point each column where LoRA says, then rescale it to a learned length.</p>
+  <p class="why"><b>Why it matters</b>Reported gains over LoRA are consistent but modest, and largest at low ranks. It costs some training speed (the norm must be recomputed each step) and still merges into a plain matrix afterwards. In PEFT it's <code>use_dora=True</code>; in mlx-lm <code>--fine-tune-type dora</code>.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="qlora">QLoRA: fine-tuning on one GPU</h2>
+
+<p>LoRA removes gradients and optimizer state for the frozen weights, but the frozen weights still sit in memory in bf16: 16 GB for an 8B model. QLoRA (Dettmers et al., 2023) quantizes them too. Their headline: fine-tuning a 65B model on a single 48 GB GPU, with results matching 16-bit LoRA on their benchmarks. Four ingredients:</p>
+<ol>
+  <li><strong>4-bit NormalFloat (NF4)</strong> for the frozen base. Sixteen levels placed at quantiles of a normal distribution, in blocks of 64 weights with one absmax scale each (Module 09).</li>
+  <li><strong>bf16 LoRA adapters</strong> on top. In each forward pass the 4-bit block is dequantized to bf16 on the fly, multiplied, and thrown away. Gradients flow <em>through</em> the dequantized weights to \(A\) and \(B\), but the 4-bit weights themselves never change.</li>
+  <li><strong>Double quantization</strong>: the per-block fp32 scales are themselves quantized to 8 bits, in blocks of 256. That drops the scale overhead from 0.5 to about 0.127 bits per weight.</li>
+  <li><strong>Paged optimizers</strong>: optimizer state lives in unified memory that can be paged to CPU RAM, so a long sequence that briefly spikes memory doesn't crash the run.</li>
+</ol>
+
+<div class="formula" data-name="QLoRA training memory">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{QLoRA}}} \approx \htmlClass{t2}{N_{\text{lin}}}\cdot\frac{\htmlClass{t3}{4.127}}{8} \;+\; 2\,\htmlClass{t4}{N_{\text{emb}}} \;+\; 16\,\htmlClass{t5}{P_{\text{LoRA}}} \;+\; \htmlClass{t6}{M_{\text{act}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{QLoRA}}\)</dt><dd>training memory in bytes</dd></div>
+    <div data-t="t2"><dt>\(N_{\text{lin}}\)</dt><dd>parameters in the quantized linear layers (everything except embeddings and output head)</dd></div>
+    <div data-t="t3"><dt>4.127</dt><dd>bits per weight: 4 for NF4 + \(8/64\) for the 8-bit scales + \(32/(64\cdot256)\) for the second-level scales</dd></div>
+    <div data-t="t4"><dt>\(N_{\text{emb}}\)</dt><dd>embedding and <code>lm_head</code> parameters, which bitsandbytes leaves in bf16 (2 bytes)</dd></div>
+    <div data-t="t5"><dt>\(P_{\text{LoRA}}\)</dt><dd>adapter parameters. 16 bytes each: fp32 weight, gradient, and two Adam moments</dd></div>
+    <div data-t="t6"><dt>\(M_{\text{act}}\)</dt><dd>activations, which quantizing the weights does <em>not</em> shrink</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Llama-3-8B: 6.98B linear params × 4.127/8 ≈ 3.6 GB, plus 1.05B embedding/head params × 2 ≈ 2.1 GB, plus 42M adapter params × 16 ≈ 0.67 GB. About 6.4 GB before activations, versus 128 GB for full fine-tuning.</p>
+  <p class="why"><b>Why it matters</b>Once the weights are small, activations and the logits tensor (sequence × 128K vocabulary) dominate. Gradient checkpointing and a modest micro-batch then decide whether you fit, not the model size.</p>
+</div>
+
+<div id="w-mem"></div>
+
+<div class="flag"><b>QLoRA trades speed for memory</b>
+<p>Dequantizing every block on every forward and backward pass makes QLoRA steps measurably slower than bf16 LoRA. If the bf16 base fits, prefer plain LoRA. And remember the deployment side: an adapter trained against an NF4 base saw slightly different weights than the bf16 model you may serve. In practice the mismatch is small, but evaluate the exact artifact you ship.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="training">Hyperparameters and training dynamics</h2>
+
+<p>The values below are <strong>starting points</strong> collected from the LoRA and QLoRA papers, TRL and PEFT defaults, and common open recipes. They're where to begin a sweep, not answers. The learning rate matters most, so sweep it first.</p>
+
+<table class="t">
+  <thead><tr><th>Knob</th><th>LoRA / QLoRA</th><th>Full fine-tune</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Learning rate</td><td>1e-4 – 2e-4</td><td>1e-5 – 2e-5</td><td>QLoRA used 2e-4 for ≤13B, 1e-4 for 33B/65B. Adapters start at zero and need bigger steps. Larger models want smaller LRs.</td></tr>
+    <tr><td>Epochs</td><td>1 – 3</td><td>1 – 3</td><td>More epochs on small data = memorization. Pick by validation loss and task metric, not by habit.</td></tr>
+    <tr><td>Effective batch</td><td>16 – 64 seqs</td><td>32 – 128 seqs</td><td>Reach it with gradient accumulation. Smaller datasets: lean small, so you still get enough steps.</td></tr>
+    <tr><td>Rank \(r\)</td><td>8 – 64</td><td>n/a</td><td>16 is a fine default. Higher for harder or larger-data tasks (with rsLoRA).</td></tr>
+    <tr><td><code>lora_alpha</code></td><td>\(r\) or \(2r\)</td><td>n/a</td><td>Keep \(\alpha/r\) fixed while sweeping rank.</td></tr>
+    <tr><td>LoRA dropout</td><td>0 – 0.1</td><td>n/a</td><td>QLoRA used 0.1 for ≤13B, 0.05 above. Many recipes use 0 with enough data.</td></tr>
+    <tr><td>Warmup</td><td>3–10% of steps</td><td>3–10% of steps</td><td>Protects against an early destructive step, especially for full FT.</td></tr>
+    <tr><td>Schedule</td><td>cosine or linear decay</td><td>cosine or linear decay</td><td>Decay to zero or about 10% of peak.</td></tr>
+    <tr><td>Weight decay</td><td>0 – 0.01</td><td>0 – 0.1</td><td>Minor effect on short runs.</td></tr>
+    <tr><td>Max length</td><td>cover ~p99 of examples</td><td>same</td><td>Truncating the assistant answer silently removes its EOS. Check the length histogram.</td></tr>
+  </tbody>
+</table>
+
+<h3>Reading the loss curves</h3>
+<p>Fine-tuning runs are short, so you can watch them closely. Training loss almost always falls. The question is what <strong>validation loss</strong> (same distribution, never trained on) does. A typical small-data run looks like this: both fall fast in the first epoch, validation flattens, then turns up as the model starts memorizing individual examples. Training loss often drops in visible steps at epoch boundaries, which is the model recognizing examples it has seen before. Treat those steps as a warning and check validation loss at each one.</p>
+
+<div id="w-curves"></div>
+
+<div class="pitfall"><b>Validation loss is a proxy</b>
+<p>Lower loss usually means better task performance, but not always. For extraction, a run can keep improving exact-match accuracy slightly after validation loss bottoms out, or get worse while loss still looks fine (more confident, more wrong). Save checkpoints along the way and pick by your task metric on the validation set, with loss as a guide.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="forgetting">Catastrophic forgetting, and evaluating a fine-tune</h2>
+
+<p>Gradient descent doesn't know which of the model's abilities you care about. Train an instruct model on 5,000 invoice extractions and every update pushes it toward "output JSON". Ask it to write a poem afterwards and you may get <code>{"poem": …}</code>. Or it answers in your extraction format but has lost some of its general reasoning. This is <strong>catastrophic forgetting</strong> (McCloskey and Cohen, 1989): new training overwrites what earlier training put in the same weights.</p>
+
+<p>How much you lose depends on how far and how long you push. Ways to push less:</p>
+<ul>
+  <li>Use LoRA at a modest rank. The update is restricted to a low-rank subspace, so it can disturb less, which is the "forgets less" half of Biderman et al. (2024).</li>
+  <li>Lower the learning rate and stop early. Most of the drift happens in the steps after the task is already learned.</li>
+  <li><strong>Replay</strong>: mix 5–20% general instruction data (or samples generated by the original model on varied prompts) into your training set. A rule of thumb, not a law; tune it against your regression suite.</li>
+  <li>Anchor to the original model. RLHF does this with a KL penalty (next section), and InstructGPT also mixed pretraining gradients into PPO ("PPO-ptx") to reduce regressions on public benchmarks.</li>
+  <li>Don't merge what you don't need to. A separate adapter only applies to requests routed to it; the base model is untouched for everything else.</li>
+</ul>
+
+<h3>Evaluating a fine-tune</h3>
+<p>The question isn't "is the loss low". It's "is this model better than the cheapest alternative, on the thing we ship, without breaking the rest". That takes four measurements:</p>
+<ol>
+  <li><strong>A held-out test set</strong> from the production distribution, deduplicated against training data, split by source, and never used for any decision until the end. Use the validation set to pick checkpoints; touch the test set once.</li>
+  <li><strong>Task metrics</strong> you can compute: JSON validity rate, per-field exact match, F1 for classification, pass@1 for code. Where outputs are free-form, an <strong>LLM judge</strong> with a written rubric and pairwise comparisons, spot-checked against human labels (Module 13).</li>
+  <li><strong>The prompted baseline</strong>: the same base model with your best prompt and a few examples, and ideally a stronger API model too. If the fine-tune doesn't clearly beat a good prompt, you've bought a training pipeline for nothing. Report the difference with a bootstrap confidence interval, not a single number.</li>
+  <li><strong>A regression suite</strong> on general capability: a few hundred items from something like IFEval (instruction following), MMLU or ARC (knowledge), GSM8K (arithmetic reasoning), plus your own canary prompts for tone and safety. Compare to the base model you started from.</li>
+</ol>
+
+<div class="mle"><b>MLE angle · evaluate what you serve</b>
+<p>Run evals through the production path: the same inference server, chat template, sampling parameters, and quantization as deployment. When a fine-tune looks worse in production than in your notebook, check template drift and merged-then-quantized artifacts first; neither shows up in an offline eval that skips the serving path.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="preference">Preference tuning: RLHF and DPO</h2>
+
+<p>SFT needs someone to write the ideal answer. For many qualities (helpfulness, tone, choosing the right level of detail) it's far easier to look at two answers and say which is better than to write the perfect one. Preference tuning learns from those comparisons.</p>
+
+<h3>RLHF</h3>
+<p>The InstructGPT recipe (Ouyang et al., 2022) has three steps. Their labelers preferred outputs of the 1.3B InstructGPT model to those of the 175B GPT-3, despite over 100× fewer parameters.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 330" id="fig-rlhf"></svg>
+<figcaption>RLHF in three steps (after Ouyang et al., 2022). Step 3 keeps four models in play: the policy being trained, a frozen reference copy of the SFT model for the KL penalty, the frozen reward model, and a value model (critic) that PPO uses to estimate advantages. That's why PPO-based RLHF is memory-hungry and fiddly.</figcaption></figure>
+
+<div class="formula" data-name="Reward model loss (Bradley–Terry)">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}_{\text{RM}}}(\phi) = -\,\mathbb{E}_{(x,\,y_w,\,y_l)}\Big[\log \htmlClass{t2}{\sigma}\big(\htmlClass{t3}{r_\phi}(x, \htmlClass{t4}{y_w}) - \htmlClass{t3}{r_\phi}(x, \htmlClass{t5}{y_l})\big)\Big]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}_{\text{RM}}\)</dt><dd>loss for training the reward model with parameters \(\phi\)</dd></div>
+    <div data-t="t2"><dt>\(\sigma\)</dt><dd>sigmoid, \(\sigma(z) = 1/(1+e^{-z})\), turning a score gap into a probability</dd></div>
+    <div data-t="t3"><dt>\(r_\phi\)</dt><dd>reward model: usually the SFT model with its LM head replaced by a scalar output</dd></div>
+    <div data-t="t4"><dt>\(y_w\)</dt><dd>the response the labeler preferred ("winner", chosen)</dd></div>
+    <div data-t="t5"><dt>\(y_l\)</dt><dd>the response they rejected ("loser")</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The Bradley–Terry model says \(P(y_w \succ y_l) = \sigma(r_w - r_l)\). Train the scorer so the preferred answer gets the higher score, by a margin that matches how consistently people prefer it.</p>
+  <p class="why"><b>Why it matters</b>Only score <em>differences</em> are learned; the absolute level is arbitrary. That's why reward models are often normalized before RL.</p>
+</div>
+
+<div class="formula" data-name="The RLHF objective">
+  <div class="tex">$$\max_{\htmlClass{t1}{\pi_\theta}}\;\; \mathbb{E}_{x\sim\mathcal{D},\; y\sim\htmlClass{t1}{\pi_\theta}(\cdot\mid x)}\big[\htmlClass{t2}{r_\phi}(x,y)\big] \;-\; \htmlClass{t3}{\beta}\;\mathbb{D}_{\text{KL}}\big(\htmlClass{t1}{\pi_\theta}(\cdot\mid x)\,\Vert\,\htmlClass{t4}{\pi_{\text{ref}}}(\cdot\mid x)\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\pi_\theta\)</dt><dd>the policy being trained; it generates its own responses \(y\)</dd></div>
+    <div data-t="t2"><dt>\(r_\phi\)</dt><dd>the frozen reward model's score</dd></div>
+    <div data-t="t3"><dt>\(\beta\)</dt><dd>KL coefficient: how strongly to stay close to the reference</dd></div>
+    <div data-t="t4"><dt>\(\pi_{\text{ref}}\)</dt><dd>frozen reference policy, normally the SFT model</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Generate answers that score well, but don't drift far from the model you started with.</p>
+  <p class="why"><b>Why it matters</b>The reward model is an imperfect proxy trained on limited data. Without the KL term, the policy finds outputs that fool it (reward hacking): longer answers, flattery, repeated phrases the RM happens to like. The KL term also limits forgetting.</p>
+</div>
+
+<p>The objective is optimized with <strong>PPO</strong> (Schulman et al., 2017). For a language model, each generated token is an "action", the prompt plus tokens so far is the "state", and the reward arrives at the end of the sequence (with the KL penalty often applied per token).</p>
+
+<div class="formula" data-name="PPO clipped surrogate objective">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{J}^{\text{CLIP}}}(\theta) = \mathbb{E}_t\Big[\min\big(\htmlClass{t2}{\rho_t}\,\htmlClass{t3}{\hat A_t},\;\; \text{clip}(\htmlClass{t2}{\rho_t},\,1-\htmlClass{t4}{\epsilon},\,1+\htmlClass{t4}{\epsilon})\,\htmlClass{t3}{\hat A_t}\big)\Big], \qquad \htmlClass{t2}{\rho_t} = \frac{\pi_\theta(a_t\mid s_t)}{\htmlClass{t5}{\pi_{\theta_{\text{old}}}}(a_t\mid s_t)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{J}^{\text{CLIP}}\)</dt><dd>objective to <em>maximize</em> (the loss is its negative)</dd></div>
+    <div data-t="t2"><dt>\(\rho_t\)</dt><dd>probability ratio: how much more (or less) likely the current policy makes token \(a_t\) than the policy that generated it</dd></div>
+    <div data-t="t3"><dt>\(\hat A_t\)</dt><dd>advantage: was this token better (\(\gt 0\)) or worse (\(\lt 0\)) than expected? Estimated from rewards and the value model (GAE)</dd></div>
+    <div data-t="t4"><dt>\(\epsilon\)</dt><dd>clip range, typically 0.2: the ratio is only allowed to pull within \([0.8, 1.2]\)</dd></div>
+    <div data-t="t5"><dt>\(\pi_{\theta_{\text{old}}}\)</dt><dd>the policy snapshot that sampled this batch</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Make good tokens more likely and bad tokens less likely, but once a token's probability has moved more than about 20% from where it was when sampled, stop pushing it further on this batch.</p>
+  <p class="why"><b>Why it matters</b>The same batch of samples is reused for several gradient steps. Clipping keeps those steps from overshooting into a policy the samples no longer describe, which is the main source of RL instability.</p>
+</div>
+
+<h3>DPO: preference tuning without RL</h3>
+<p>Rafailov et al. (2023) noticed that the RLHF objective has a closed-form optimum: \(\pi^*(y\mid x) \propto \pi_{\text{ref}}(y\mid x)\,\exp\!\big(r(x,y)/\beta\big)\). Rearranged, any policy implicitly defines a reward, \(\hat r(x,y) = \beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\) (up to a term that depends only on \(x\) and cancels in comparisons). Substitute that into the Bradley–Terry loss, and you can train the policy directly on preference pairs. No reward model, no sampling, no PPO. The paper's title says it: <em>your language model is secretly a reward model</em>.</p>
+
+<div class="formula" data-name="DPO loss">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}_{\text{DPO}}} = -\,\mathbb{E}_{(x,y_w,y_l)}\Big[\log\sigma\Big(\htmlClass{t2}{\beta}\Big(\log\frac{\htmlClass{t3}{\pi_\theta}(\htmlClass{t5}{y_w}\mid x)}{\htmlClass{t4}{\pi_{\text{ref}}}(\htmlClass{t5}{y_w}\mid x)} - \log\frac{\htmlClass{t3}{\pi_\theta}(\htmlClass{t6}{y_l}\mid x)}{\htmlClass{t4}{\pi_{\text{ref}}}(\htmlClass{t6}{y_l}\mid x)}\Big)\Big)\Big]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}_{\text{DPO}}\)</dt><dd>a binary classification loss: "is the chosen response the chosen one?"</dd></div>
+    <div data-t="t2"><dt>\(\beta\)</dt><dd>the same KL strength as in RLHF. Higher β = stay closer to the reference; typical 0.1</dd></div>
+    <div data-t="t3"><dt>\(\pi_\theta\)</dt><dd>the policy being trained. \(\log\pi_\theta(y\mid x)\) is the sum of token log-probs of the response</dd></div>
+    <div data-t="t4"><dt>\(\pi_{\text{ref}}\)</dt><dd>frozen reference (the SFT model). Its log-probs can be precomputed once</dd></div>
+    <div data-t="t5"><dt>\(y_w\)</dt><dd>chosen response</dd></div>
+    <div data-t="t6"><dt>\(y_l\)</dt><dd>rejected response</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each fraction asks "how much more likely is this response under my model than under the reference?" Make that boost bigger for the chosen answer than for the rejected one. The gap, times β, goes through the same sigmoid as the reward model loss.</p>
+  <p class="why"><b>Why it matters</b>DPO is as cheap and stable as SFT: two forward passes per pair through the policy, two through the reference, no generation. That's why it became the default first preference method for open models.</p>
+</div>
+
+<div class="formula" data-name="What the DPO gradient does">
+  <div class="tex">$$\nabla_\theta\mathcal{L}_{\text{DPO}} = -\beta\;\mathbb{E}\Big[\,\htmlClass{t1}{\sigma\big(\hat r(x,y_l) - \hat r(x,y_w)\big)}\,\big(\htmlClass{t2}{\nabla_\theta\log\pi_\theta(y_w\mid x)} - \htmlClass{t3}{\nabla_\theta\log\pi_\theta(y_l\mid x)}\big)\Big]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\sigma(\hat r_l - \hat r_w)\)</dt><dd>per-pair weight \(=\sigma(-\beta\cdot\text{margin})\): near 1 when the model currently ranks the pair <em>wrong</em>, near 0 when it's already confidently right</dd></div>
+    <div data-t="t2"><dt>\(\nabla\log\pi_\theta(y_w)\)</dt><dd>direction that makes the chosen response more likely</dd></div>
+    <div data-t="t3"><dt>\(\nabla\log\pi_\theta(y_l)\)</dt><dd>direction that makes the rejected response more likely (subtracted, so pushed down)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Push chosen up and rejected down, weighted by how wrong the model currently is about this pair. Pairs it already gets right fade out of the gradient.</p>
+</div>
+
+<div id="w-dpo"></div>
+
+<div class="pitfall"><b>DPO failure modes</b>
+<p>The loss only cares about the <em>gap</em>. It can fall while the log-probability of <em>both</em> responses drops, which pushes probability mass onto text that appeared in neither. Watch <code>logps/chosen</code> as well as the margin. DPO also learns whatever separates chosen from rejected: if chosen answers are systematically longer, you get a model that rambles. And it works best on pairs sampled from a model close to the one you're training ("on-policy" data); pairs from an unrelated model give a weaker signal. Variants like IPO, KTO, ORPO, and SimPO each target one of these issues.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="grpo">GRPO and RL with verifiable rewards</h2>
+
+<p>For math and code you don't need a learned reward model at all: you can check the answer. A unit test passes or fails; the final number matches or doesn't. Lambert et al. (2024, Tülu 3) named this <strong>RL with verifiable rewards (RLVR)</strong>. It's the engine behind reasoning models: DeepSeek-R1 (DeepSeek-AI, 2025) was trained with rule-based accuracy and format rewards; in its R1-Zero variant, long chains of thought with self-checking emerged from RL alone, with no SFT demonstrations at all.</p>
+
+<p>The algorithm most open work uses is <strong>GRPO</strong>, Group Relative Policy Optimization, introduced in DeepSeekMath (Shao et al., 2024). It keeps PPO's clipped ratio but drops the value model. Instead of a learned critic predicting how good a state is, it samples a <em>group</em> of \(G\) answers to the same prompt and uses the group itself as the baseline.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 250" id="fig-grpo"></svg>
+<figcaption>One GRPO step for one prompt. The policy samples \(G\) answers, a verifier scores them, and each answer's advantage is its reward relative to its siblings. Every token of answer \(i\) gets advantage \(\hat A_i\) in a PPO-style clipped update. No critic network is trained, which removes one of the four models in the PPO loop of Fig 10.5.</figcaption></figure>
+
+<div class="formula" data-name="GRPO group-relative advantage">
+  <div class="tex">$$\htmlClass{t1}{\hat A_i} = \frac{\htmlClass{t2}{r_i} - \operatorname{mean}\big(\htmlClass{t3}{\{r_1,\dots,r_{\htmlClass{t4}{G}}\}}\big)}{\operatorname{std}\big(\htmlClass{t3}{\{r_1,\dots,r_{\htmlClass{t4}{G}}\}}\big)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat A_i\)</dt><dd>advantage for every token of the \(i\)-th sampled answer</dd></div>
+    <div data-t="t2"><dt>\(r_i\)</dt><dd>its reward, e.g. 1 if the final answer is correct, 0 if not (plus optional format reward)</dd></div>
+    <div data-t="t3"><dt>\(\{r_1..r_G\}\)</dt><dd>rewards of all answers sampled for the same prompt</dd></div>
+    <div data-t="t4"><dt>\(G\)</dt><dd>group size, typically 8–64</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>An answer is "good" if it beat its siblings. If 2 of 8 attempts are correct, those two get a large positive advantage and the six wrong ones a small negative one.</p>
+  <p class="why"><b>Why it matters</b>If all 8 are right, or all 8 wrong, every advantage is zero and the prompt teaches nothing. RLVR needs prompts at the edge of the model's ability, so curating difficulty is as important as the algorithm.</p>
+</div>
+
+<div id="w-grpo"></div>
+
+<p>GRPO is still moving. Follow-ups such as Dr. GRPO (Liu et al., 2025) and DAPO (Yu et al., 2025) argue that dividing by the standard deviation and averaging the loss per sequence introduce biases (toward easy or hard prompts, and toward longer wrong answers), and change the normalization. Recent TRL versions default to a DAPO-style loss and to \(\beta = 0\), with no KL term at all. Read the defaults of whatever version you install.</p>
+
+<div class="flag"><b>When RL is worth it</b>
+<p>RL fine-tuning is expensive: each step generates \(G\) full answers per prompt, so it's dominated by inference, and most setups pair the trainer with a fast generation engine such as vLLM. It pays off when you have a reliable verifier and the base model already succeeds sometimes (pass@8 well above zero). If the model never gets an answer right, there's no signal; do SFT first.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="distill">Distillation and model merging</h2>
+
+<h3>Knowledge distillation</h3>
+<p>Distillation trains a small <em>student</em> to imitate a large <em>teacher</em>. The classic version (Hinton et al., 2015) matches the teacher's whole next-token distribution, not just its top choice. The teacher's "second guesses" carry information: that "car" is closer to "truck" than to "banana".</p>
+
+<div class="formula" data-name="Distillation loss with temperature">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}_{\text{KD}}} = \htmlClass{t2}{\tau}^2\;\mathbb{D}_{\text{KL}}\Big(\operatorname{softmax}\big(\htmlClass{t3}{z^{(t)}}/\htmlClass{t2}{\tau}\big)\;\Big\Vert\;\operatorname{softmax}\big(\htmlClass{t4}{z^{(s)}}/\htmlClass{t2}{\tau}\big)\Big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}_{\text{KD}}\)</dt><dd>distillation loss, per token position</dd></div>
+    <div data-t="t2"><dt>\(\tau\)</dt><dd>temperature (often 1–2). Higher \(\tau\) flattens both distributions so small probabilities matter. The \(\tau^2\) keeps gradient size comparable across temperatures</dd></div>
+    <div data-t="t3"><dt>\(z^{(t)}\)</dt><dd>teacher logits</dd></div>
+    <div data-t="t4"><dt>\(z^{(s)}\)</dt><dd>student logits</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>At every position, make the student's softened probability distribution look like the teacher's. Usually combined with ordinary cross-entropy on the real tokens.</p>
+  <p class="why"><b>Why it matters</b>It needs the teacher's logits, so teacher and student must share a tokenizer and you must be able to run the teacher. Google's smaller Gemma 2 models were trained with this kind of logit distillation from a larger model.</p>
+</div>
+
+<p><strong>Sequence-level distillation</strong> (Kim and Rush, 2016) is simpler: have the teacher <em>generate</em> answers, then SFT the student on them. No logits, no shared tokenizer, works through an API. This is what "synthetic data from a stronger model" is, and it's the form behind most open "distilled" models, including DeepSeek-R1's Qwen and Llama distills.</p>
+
+<h3>Model merging</h3>
+<p>You can sometimes combine fine-tunes without any training, by doing arithmetic on their weights. This works when the models share a base, so their weights stay in the same "basin".</p>
+
+<div class="formula" data-name="Task arithmetic">
+  <div class="tex">$$\htmlClass{t1}{\theta_{\text{merged}}} = \htmlClass{t2}{\theta_0} + \sum_{j} \htmlClass{t3}{\lambda_j}\,\htmlClass{t4}{\tau_j}, \qquad \htmlClass{t4}{\tau_j} = \theta_j - \htmlClass{t2}{\theta_0}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\theta_{\text{merged}}\)</dt><dd>weights of the merged model</dd></div>
+    <div data-t="t2"><dt>\(\theta_0\)</dt><dd>shared base model weights</dd></div>
+    <div data-t="t3"><dt>\(\lambda_j\)</dt><dd>mixing weight for fine-tune \(j\) (often 0.3–1)</dd></div>
+    <div data-t="t4"><dt>\(\tau_j\)</dt><dd>"task vector": what fine-tune \(j\) changed (for LoRA, exactly \(\tfrac{\alpha}{r}BA\))</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Measure what each fine-tune added on top of the base, then add scaled versions of those changes back onto the base (Ilharco et al., 2023).</p>
+</div>
+<ul>
+  <li><strong>Linear / model soups</strong> (Wortsman et al., 2022): average the weights of several fine-tunes of the same base. Often beats each one alone on robustness.</li>
+  <li><strong>SLERP</strong>: interpolate two models along the arc between their weight vectors instead of the straight line, which preserves weight norms. Two models at a time only.</li>
+  <li><strong>TIES</strong> (Yadav et al., 2023): trim each task vector to its largest entries, elect a sign per parameter by majority, and average only the entries that agree. This reduces interference when merging several models.</li>
+</ul>
+<p>Tools like <code>mergekit</code> implement all three. Merging is cheap to try and hard to predict; evaluate every merge like a new model.</p>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on: recipes and a lab</h2>
+
+<p>Five recipes, from a GPU box to a MacBook to a serving endpoint. The APIs below match current TRL (which requires <code>transformers&gt;=4.56</code>), PEFT, mlx-lm, and vLLM. These libraries move fast; when something errors, check <code>inspect.signature(SFTConfig)</code> before searching the web.</p>
+
+<h3>(a) LoRA SFT with TRL and PEFT</h3>
+<div class="code" data-lang="python" data-title="sft_lora.py"><pre><code>
+# pip install -U trl peft transformers datasets accelerate
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+
+model_id = "Qwen/Qwen3-1.7B"          # or "meta-llama/Llama-3.2-3B-Instruct"
+ds = load_dataset("json", data_files={"train": "data/train.jsonl",
+                                      "validation": "data/valid.jsonl"})  # {"messages": [...]} per line
+
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16)
+
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,                    # alpha / r = 2
+    lora_dropout=0.05,
+    target_modules="all-linear",      # q,k,v,o,gate,up,down
+    task_type="CAUSAL_LM",
+)
+
+args = SFTConfig(
+    output_dir="out/extract-lora",
+    num_train_epochs=2,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,    # effective batch 16
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    max_length=2048,                  # was max_seq_length in older TRL
+    assistant_only_loss=True,         # m_t = 1 only on assistant tokens
+    packing=False,
+    bf16=True,
+    gradient_checkpointing=True,
+    eval_strategy="steps", eval_steps=50,
+    save_strategy="steps", save_steps=50,
+    load_best_model_at_end=True, metric_for_best_model="eval_loss",
+    logging_steps=10,
+    report_to="none",
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=args,
+    train_dataset=ds["train"],
+    eval_dataset=ds["validation"],
+    processing_class=tok,
+    peft_config=peft_config,
+)
+trainer.model.print_trainable_parameters()
+trainer.train()
+trainer.save_model("out/extract-lora/final")   # saves only the adapter (~tens of MB)
+</code></pre></div>
+<div class="flag"><b>assistant_only_loss needs template support</b>
+<p>TRL builds the mask from <code>{% generation %}</code> markers in the chat template. It patches known families such as Qwen3 automatically; for others, check the template or TRL will refuse. The fallback that always works: store data as conversational prompt–completion, <code>{"prompt": [user msgs], "completion": [assistant msg]}</code>. The prompt is masked by default (<code>completion_only_loss</code>).</p>
+</div>
+
+<h3>(b) LoRA on a Mac with mlx-lm</h3>
+<div class="code" data-lang="bash" data-title="mlx-lm (Apple silicon)"><pre><code>
+pip install "mlx-lm[train]"
+
+# data/ must contain train.jsonl (and valid.jsonl for validation loss, test.jsonl for --test)
+# each line: {"messages": [{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}]}
+
+mlx_lm.lora \
+  --model Qwen/Qwen3-1.7B \
+  --train \
+  --data ./data \
+  --fine-tune-type lora \
+  --mask-prompt \
+  --num-layers 16 \
+  --batch-size 4 \
+  --iters 600 \
+  --learning-rate 1e-5 \
+  --steps-per-eval 100 \
+  --adapter-path adapters/extract \
+  --grad-checkpoint
+# --num-layers: how many of the top transformer blocks get adapters (-1 = all)
+# rank/scale/dropout come from a YAML via -c config.yaml:  lora_parameters: {rank: 16, scale: 20.0, dropout: 0.0}
+
+# test-set loss and perplexity
+mlx_lm.lora --model Qwen/Qwen3-1.7B --adapter-path adapters/extract --data ./data --test
+
+# try it
+mlx_lm.generate --model Qwen/Qwen3-1.7B --adapter-path adapters/extract \
+  --prompt "Total due: EUR 1,240.00 by 15/03/2024" --max-tokens 200
+
+# fold the adapter into the weights for a standalone model
+mlx_lm.fuse --model Qwen/Qwen3-1.7B --adapter-path adapters/extract --save-path fused/extract-1.7b
+</code></pre></div>
+<p>If <code>--model</code> points at a quantized MLX model (for example one made with <code>mlx_lm.convert -q</code>), mlx-lm trains QLoRA-style automatically. <code>--iters</code> counts batches, not epochs: 600 iterations × batch 4 = 2,400 examples seen.</p>
+
+<h3>(c) QLoRA with bitsandbytes</h3>
+<div class="code" data-lang="python" data-title="qlora.py (changes from recipe a)"><pre><code>
+import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import prepare_model_for_kbit_training
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",              # NormalFloat-4 for the frozen base
+    bnb_4bit_use_double_quant=True,         # quantize the per-block scales too
+    bnb_4bit_compute_dtype=torch.bfloat16,  # dequantize to bf16 for each matmul
+)
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B-Instruct", quantization_config=bnb, device_map="auto")
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+# then: same LoraConfig and SFTConfig as recipe (a), optionally optim="paged_adamw_8bit"
+</code></pre></div>
+
+<h3>(d) Preference tuning with DPO</h3>
+<div class="code" data-lang="python" data-title="dpo.py"><pre><code>
+# data/prefs.jsonl, conversational preference format, one pair per line:
+# {"prompt":   [{"role": "user", "content": "Summarize this ticket: ..."}],
+#  "chosen":   [{"role": "assistant", "content": "Customer cannot log in since the 2FA reset; ..."}],
+#  "rejected": [{"role": "assistant", "content": "Sure! Here is a summary of the ticket you provided ..."}]}
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOConfig, DPOTrainer
+
+sft_path = "out/sft-merged"                 # start from your SFT model, not the raw base
+model = AutoModelForCausalLM.from_pretrained(sft_path, dtype=torch.bfloat16)
+tok = AutoTokenizer.from_pretrained(sft_path)
+ds = load_dataset("json", data_files="data/prefs.jsonl", split="train")
+
+args = DPOConfig(
+    output_dir="out/dpo",
+    beta=0.1,                               # KL strength; try 0.05 to 0.5
+    learning_rate=5e-6,                     # LoRA; full fine-tune DPO is usually ~5e-7
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,
+    num_train_epochs=1,
+    max_length=2048,
+    bf16=True,
+    logging_steps=10,
+    report_to="none",
+)
+trainer = DPOTrainer(
+    model=model,
+    args=args,
+    train_dataset=ds,
+    processing_class=tok,
+    peft_config=LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"),
+)   # with a peft_config, the reference model is the base with the adapter switched off: no second copy
+trainer.train()
+</code></pre></div>
+<p>Watch <code>rewards/margins</code> (should rise), <code>rewards/accuracies</code> (fraction of pairs ranked correctly), and <code>logps/chosen</code> (shouldn't collapse). TRL's <code>GRPOTrainer</code> follows the same pattern, with <code>reward_funcs=[your_python_function]</code> in place of preference pairs.</p>
+
+<h3>(e) Serving adapters with vLLM</h3>
+<div class="code" data-lang="bash" data-title="vLLM multi-LoRA serving"><pre><code>
+vllm serve Qwen/Qwen3-1.7B \
+  --enable-lora \
+  --lora-modules extract=out/extract-lora/final \
+  --max-lora-rank 16 \
+  --max-loras 4
+# --max-lora-rank must be >= the largest adapter rank you load (default 16)
+
+# the adapter name becomes a model id in the OpenAI-compatible API
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "extract",
+  "messages": [{"role": "user", "content": "Total due: EUR 1,240.00 by 15/03/2024"}],
+  "temperature": 0,
+  "chat_template_kwargs": {"enable_thinking": false}
+}'
+# "model": "Qwen/Qwen3-1.7B" in the same server hits the untouched base model
+</code></pre></div>
+<p>One server, one copy of the base weights, many adapters. vLLM batches requests for different adapters together using Punica-style multi-LoRA kernels, so serving 20 customer-specific fine-tunes costs little more than serving one. The trade-off against merging is a small per-token overhead for the extra matmuls.</p>
+
+<h3>Lab: beat the prompted baseline</h3>
+<p>Fine-tune a 1–3B instruct model (Qwen3-1.7B or Llama-3.2-3B-Instruct) for structured extraction: invoices, job postings, support tickets, anything with 4–8 fields you can grade programmatically.</p>
+<ol>
+  <li>Build 1,000+ train, 200 validation, and 300 test examples. Generate synthetic inputs with a stronger model if you like, but write and review the gold JSON carefully. Dedup, and split by source.</li>
+  <li>Measure the <strong>prompted baseline</strong> on the test set: the same base model, your best system prompt, three few-shot examples, temperature 0.</li>
+  <li>Train a LoRA adapter with recipe (a) or (b). Keep the validation curves. Pick the checkpoint by validation field accuracy.</li>
+  <li>Evaluate both through vLLM (recipe e) with the scorer below, and run a 200-item general eval slice (IFEval or MMLU) on base vs fine-tuned.</li>
+</ol>
+<div class="code" data-lang="python" data-title="score.py"><pre><code>
+import json, random
+
+FIELDS = ["vendor", "date", "total", "currency"]
+
+def norm(field, v):
+    if v is None:
+        return None
+    if field == "total":
+        try:
+            return round(float(str(v).replace(",", "")), 2)
+        except ValueError:
+            return None
+    return str(v).strip().lower()
+
+def score(pred_text, gold):
+    try:
+        pred = json.loads(pred_text)
+    except json.JSONDecodeError:
+        return 0, [0] * len(FIELDS)
+    return 1, [int(norm(f, pred.get(f)) == norm(f, gold[f])) for f in FIELDS]
+
+def bootstrap_diff(a, b, n=2000, seed=0):
+    """95% CI of mean(a) - mean(b) for paired per-example scores."""
+    rnd, k, diffs = random.Random(seed), len(a), []
+    for _ in range(n):
+        idx = [rnd.randrange(k) for _ in range(k)]
+        diffs.append(sum(a[i] - b[i] for i in idx) / k)
+    diffs.sort()
+    return diffs[int(0.025 * n)], diffs[int(0.975 * n)]
+
+# per_example = mean field accuracy for each test item, for baseline and fine-tune
+# lo, hi = bootstrap_diff(finetuned_scores, baseline_scores)
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you can show a table with <em>model · JSON valid % · field accuracy % · 95% CI of the gain · general-eval score · adapter size · tokens/s</em> and all of these hold:</p>
+<p>(1) JSON validity ≥ 99% on the test set. (2) Mean field accuracy beats the prompted baseline by at least 10 points, with the bootstrap 95% interval of the gain excluding zero. (3) On the general eval slice, the fine-tune is within 2 points of the base model, or you've explained the regression and reduced it with replay or a lower LR. (4) You can point to the step where validation loss bottomed out, and say which checkpoint you shipped and why.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="10-main" data-title="Check yourself · Fine-tuning">
+  <div class="q" data-answer="1"><p>You add a rank-16 LoRA adapter to a single 4096×4096 projection matrix. How many trainable parameters does that add?</p>
+    <ol><li>65,536</li><li>131,072</li><li>262,144</li><li>16,777,216</li></ol>
+    <div class="explain">\(B\) is 4096×16 and \(A\) is 16×4096, so \(r(d+k) = 16\times(4096+4096) = 131{,}072\). That's 0.78% of the 16.8M entries a full update would train. 65,536 counts only one of the two matrices.</div></div>
+  <div class="q" data-answer="3"><p>Why does LoRA initialize \(B\) to zero (and \(A\) randomly)?</p>
+    <ol><li>Zero matrices take less memory to store</li><li>It makes \(A\) orthogonal, which speeds up convergence</li><li>It forces the adapter to stay low-rank during training</li><li>So \(BA = 0\) at step zero and training starts exactly from the pretrained model, while gradients can still flow</li></ol>
+    <div class="explain">With \(B=0\) the adapted layer computes \(W_0x\) exactly, so there's no random damage at the start. \(A\) is random because if both were zero, \(\partial L/\partial B \propto (Ax)^\top = 0\) and \(\partial L/\partial A \propto B^\top(\cdot) = 0\): nothing would ever learn. Rank is limited by the shapes, not by the init.</div></div>
+  <div class="q" data-answer="0"><p>Your extraction dataset has ~2,000-token documents in the user turn and ~60-token JSON answers. You forget to mask the prompt. What's the most likely effect?</p>
+    <ol><li>About 97% of the loss goes into modeling the input documents, so the extraction signal is diluted and the model drifts toward generating document-like text</li><li>Training crashes because the labels don't line up</li><li>No effect, because the prompt tokens are identical across examples</li><li>The model gets better at following the system prompt and nothing else changes</li></ol>
+    <div class="explain">Without the mask every token is scored: 2,000 of 2,060 tokens are document text. The model spends its update budget learning to write invoices, and learns the actual task slower. Documents differ per example, so their loss is far from constant. Masking (\(m_t=0\) on the prompt) fixes this.</div></div>
+  <div class="q" data-answer="2"><p>In DPO, what does increasing β from 0.1 to 0.5 do?</p>
+    <ol><li>It's the learning rate, so training goes five times faster</li><li>It raises the sampling temperature for generating responses</li><li>It strengthens the implicit KL anchor: the loss saturates after smaller moves away from the reference, so the policy stays closer to it</li><li>It increases how many preference pairs are used per step</li></ol>
+    <div class="explain">β is the KL coefficient from the RLHF objective that DPO solves in closed form. In the loss it multiplies the log-ratio margin, so with larger β a small margin already gives a low loss and a small gradient weight \(\sigma(-\beta\cdot\text{margin})\). The policy reaches "confident" with less drift from \(\pi_{\text{ref}}\). The widget in the DPO section shows the sigmoid sharpening.</div></div>
+  <div class="q" data-answer="1"><p>A support assistant must answer from a 3,000-page policy manual that's revised every week, and cite the section it used. What's the best first approach?</p>
+    <ol><li>Full fine-tune on the manual every week</li><li>RAG over the manual, optionally with a small fine-tune to teach the answer-and-cite format</li><li>DPO on pairs of correct and incorrect policy answers</li><li>LoRA with a very high rank so it can memorize the whole manual</li></ol>
+    <div class="explain">The gap is knowledge, and the knowledge changes weekly and must be citable. Fine-tuning is poor at injecting many facts, can't cite sources, and would need retraining every week. Retrieval keeps facts editable. A small SFT on (retrieved context → cited answer) pairs is the common add-on.</div></div>
+  <div class="q" data-answer="2"><p>Roughly how much memory do the frozen weights of Llama-3-8B take under QLoRA (NF4 with double quantization; bitsandbytes leaves embeddings and <code>lm_head</code> in bf16)?</p>
+    <ol><li>~16 GB</li><li>~8 GB</li><li>~5.7 GB</li><li>~1 GB</li></ol>
+    <div class="explain">6.98B linear-layer params × 4.127 bits ÷ 8 ≈ 3.6 GB, plus the untied 128K-vocab embedding and output head (2 × 525M params) × 2 bytes ≈ 2.1 GB, so about 5.7 GB. 16 GB is the bf16 model; 8 GB would be int8. Add about 0.7 GB of adapter training state and the activations to get the full job.</div></div>
+  <div class="q" data-answer="3"><p>In GRPO with \(G = 8\), the model gets all 8 sampled answers to a prompt right (reward 1 each). What does this prompt contribute to the update?</p>
+    <ol><li>A large positive update, because every answer was correct</li><li>A negative update, to encourage exploration</li><li>The same update as if 4 of 8 were correct</li><li>Essentially nothing: every reward equals the group mean, so every advantage is zero</li></ol>
+    <div class="explain">\(\hat A_i = (r_i - \text{mean})/\text{std}\), and each \(r_i - \text{mean} = 0\). Implementations add a small ε to the std to avoid dividing by zero, but the numerator is still zero. Prompts that are always solved or never solved give no signal, which is why RLVR datasets are filtered for difficulty.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, heatmap, widget, fmtNum, fmtSI, rng, palette, clamp } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const fmtGB = v => v >= 1000 ? fmtNum(v / 1000, 2) + " TB" : fmtNum(v, v < 10 ? 1 : 0) + " GB";
+  const arrowDefs = (s, id, color) => {
+    const d = svg("defs");
+    d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color || palette.muted })));
+    s.appendChild(d);
+  };
+  const txt = (s, x, y, t, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, text: t }, o || {})));
+  const lines = (s, x, y, arr, o, lh) => arr.forEach((t, i) => txt(s, x, y + i * (lh || 14), t, o));
+  const rect = (s, x, y, w, h, o) => s.appendChild(svg("rect", Object.assign({ x, y, width: w, height: h, rx: 10, fill: "#fff", stroke: "rgba(28,27,25,.25)", "stroke-width": 1.2 }, o || {})));
+  const path = (s, d, id, o) => s.appendChild(svg("path", Object.assign({ d, fill: "none", stroke: palette.muted, "stroke-width": 1.3, "marker-end": id ? `url(#${id})` : null }, o || {})));
+
+  // Architecture presets: [in, out] shapes of the 7 linear layers per block
+  const MODELS = [
+    { v: "1b", label: "Llama-3.2-1B", d: 2048, L: 16, kv: 512, ff: 8192, V: 128256, tied: true },
+    { v: "3b", label: "Llama-3.2-3B", d: 3072, L: 28, kv: 1024, ff: 8192, V: 128256, tied: true },
+    { v: "8b", label: "Llama-3.1-8B", d: 4096, L: 32, kv: 1024, ff: 14336, V: 128256, tied: false },
+    { v: "14b", label: "Qwen2.5-14B", d: 5120, L: 48, kv: 1024, ff: 13824, V: 152064, tied: false },
+    { v: "32b", label: "Qwen2.5-32B", d: 5120, L: 64, kv: 1024, ff: 27648, V: 152064, tied: false },
+    { v: "70b", label: "Llama-3.1-70B", d: 8192, L: 80, kv: 1024, ff: 28672, V: 128256, tied: false }
+  ];
+  const MODS = ["q", "k", "v", "o", "gate", "up", "down"];
+  const shapeOf = (p, m) => ({ q: [p.d, p.d], k: [p.d, p.kv], v: [p.d, p.kv], o: [p.d, p.d], gate: [p.d, p.ff], up: [p.d, p.ff], down: [p.ff, p.d] })[m];
+  const embParams = p => p.V * p.d * (p.tied ? 1 : 2);
+  const linParams = p => p.L * MODS.reduce((a, m) => { const [i, o] = shapeOf(p, m); return a + i * o; }, 0);
+  const totalParams = p => linParams(p) + embParams(p) + p.L * 2 * p.d + p.d;
+  const loraParams = (p, r, mods) => p.L * mods.reduce((a, m) => { const [i, o] = shapeOf(p, m); return a + r * (i + o); }, 0);
+
+  /* ---------------------------------------------------------- Fig: decision tree */
+  (function () {
+    const s = document.getElementById("fig-decide");
+    arrowDefs(s, "arr-dec");
+    const node = (x, y, w, h, title, sub, kind) => {
+      const fill = kind === "q" ? "#fbfaf7" : kind === "a" ? "rgba(26,122,82,.08)" : kind === "b" ? "rgba(47,93,138,.07)" : "#fff";
+      const stroke = kind === "a" ? "rgba(26,122,82,.55)" : kind === "b" ? "rgba(47,93,138,.5)" : "rgba(28,27,25,.25)";
+      rect(s, x, y, w, h, { fill, stroke });
+      txt(s, x + w / 2, y + (sub ? 22 : h / 2 + 4), title, { "text-anchor": "middle", "font-size": 13, "font-weight": 600 });
+      if (sub) lines(s, x + w / 2, y + 39, sub.split("|"), { "text-anchor": "middle", "font-size": 11, fill: palette.muted }, 13);
+    };
+    const lab = (x, y, t, a) => txt(s, x, y, t, { "font-size": 11, class: "mono", fill: palette.muted, "text-anchor": a || "start" });
+    node(290, 10, 280, 58, "Does a good prompt + a few examples do it?", "try first: cheap, instant, reversible", "q");
+    node(20, 10, 220, 58, "Prompt engineering", "ship it; revisit if cost or|latency of long prompts bites", "a");
+    node(290, 100, 280, 58, "Is the gap missing or changing knowledge?", "docs, catalog, policies, anything updated often", "q");
+    node(20, 100, 220, 58, "RAG (Module 11)", "facts stay editable|and citable", "b");
+    node(290, 190, 280, 58, "Is it behaviour: format, style, a narrow skill?", "schema adherence, tone, routing, extraction", "q");
+    node(620, 190, 220, 58, "Measure before you train", "build an eval; maybe a|bigger model is the fix", null);
+    node(290, 290, 280, 58, "Fine-tune: SFT with LoRA", "100s–1000s of examples; add DPO|if you have preference pairs", "a");
+    node(620, 290, 220, 58, "RAG + fine-tune", "train on (retrieved context →|answer in your format) pairs", "a");
+    path(s, "M290,39 L244,39", "arr-dec"); lab(267, 32, "yes", "middle");
+    path(s, "M430,68 L430,96", "arr-dec"); lab(438, 88, "no");
+    path(s, "M290,129 L244,129", "arr-dec"); lab(267, 122, "yes", "middle");
+    path(s, "M430,158 L430,186", "arr-dec"); lab(438, 178, "no");
+    path(s, "M570,219 L616,219", "arr-dec"); lab(593, 212, "no", "middle");
+    path(s, "M430,248 L430,286", "arr-dec"); lab(438, 272, "yes");
+    path(s, "M130,158 L130,372 L730,372 L730,352", "arr-dec", { "stroke-dasharray": "4 3" });
+    path(s, "M570,319 L616,319", "arr-dec", { "stroke-dasharray": "4 3" });
+    lab(140, 366, "facts from RAG + behaviour from a fine-tune: need both?");
+    txt(s, 430, 396, "Each step down costs more to build, more to maintain, and is harder to undo. Most teams skip the eval and regret it.", { "text-anchor": "middle", "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: post-training pipeline */
+  (function () {
+    const s = document.getElementById("fig-pipeline");
+    arrowDefs(s, "arr-pipe", palette.ink);
+    const stages = [
+      ["Pretrained base", "next-token prediction", ["~10¹³ tokens of", "web, code, books"], ["knowledge, language,", "latent skills"], "#fbfaf7", "rgba(28,27,25,.25)"],
+      ["SFT", "imitate demonstrations", ["10³–10⁶ prompt →", "response pairs"], ["instruction following,", "chat + tool format"], "rgba(26,122,82,.08)", "rgba(26,122,82,.55)"],
+      ["Preference tuning", "RLHF (PPO) or DPO", ["10⁴–10⁶ chosen vs", "rejected pairs"], ["helpfulness, tone,", "length, safety"], "rgba(47,93,138,.07)", "rgba(47,93,138,.5)"],
+      ["RL, verifiable rewards", "GRPO / PPO + checkers", ["prompts with checkable", "answers, tests"], ["multi-step reasoning,", "self-verification"], "rgba(154,123,34,.10)", "rgba(154,123,34,.55)"]
+    ];
+    const w = 180, gap = 32, x0 = 16;
+    stages.forEach(([t, sub, data, chg, fill, stroke], i) => {
+      const x = x0 + i * (w + gap);
+      rect(s, x, 20, w, 70, { fill, stroke });
+      txt(s, x + w / 2, 48, t, { "text-anchor": "middle", "font-size": 14, "font-weight": 600 });
+      txt(s, x + w / 2, 68, sub, { "text-anchor": "middle", "font-size": 11.5, fill: palette.muted });
+      txt(s, x + 6, 118, "DATA", { "font-size": 10, class: "mono", fill: palette.faint, "letter-spacing": "1.5" });
+      lines(s, x + 6, 134, data, { "font-size": 11.5, fill: palette.ink }, 14);
+      txt(s, x + 6, 178, "CHANGES", { "font-size": 10, class: "mono", fill: palette.faint, "letter-spacing": "1.5" });
+      lines(s, x + 6, 194, chg, { "font-size": 11.5, fill: palette.ink }, 14);
+      if (i < stages.length - 1) path(s, `M${x + w + 3},55 L${x + w + gap - 5},55`, "arr-pipe", { stroke: palette.ink });
+    });
+    const bx = x0 + (w + gap);
+    path(s, `M${bx},240 L${bx},250 L${bx + 2 * w + gap},250 L${bx + 2 * w + gap},240`, null, { stroke: palette.green, "stroke-width": 1.5 });
+    txt(s, bx + w + gap / 2, 270, "where most product fine-tunes live: a small SFT (and maybe DPO) on top of an instruct checkpoint", { "text-anchor": "middle", "font-size": 11.5, fill: palette.green });
+    txt(s, x0, 292, "imitation: bounded by demo quality", { "font-size": 11, class: "mono", fill: palette.muted });
+    txt(s, 844, 292, "the model grades its own attempts: can exceed the demos", { "font-size": 11, class: "mono", fill: palette.muted, "text-anchor": "end" });
+  })();
+
+  /* ---------------------------------------------------------- Fig: loss mask on a chat sample */
+  (function () {
+    const host = document.getElementById("fig-mask");
+    const toks = [
+      ["<|im_start|>", "s", 0], ["system", "p", 0], ["↵", "p", 0], ["Extract", "p", 0], [" invoice", "p", 0], [" fields", "p", 0], [" as", "p", 0], [" JSON", "p", 0], [".", "p", 0], ["<|im_end|>", "s", 0], ["↵", "p", 0],
+      ["<|im_start|>", "s", 0], ["user", "p", 0], ["↵", "p", 0], ["AC", "p", 0], ["ME", "p", 0], [" Corp", "p", 0], [" -", "p", 0], [" Total", "p", 0], [" due", "p", 0], [":", "p", 0], [" EUR", "p", 0], [" 1", "p", 0], [",", "p", 0], ["240", "p", 0], [".", "p", 0], ["00", "p", 0], ["<|im_end|>", "s", 0], ["↵", "p", 0],
+      ["<|im_start|>", "s", 0], ["assistant", "p", 0], ["↵", "p", 0],
+      ["{\"", "r", 1], ["total", "r", 1], ["\":", "r", 1], [" 1240", "r", 1], [".", "r", 1], ["0", "r", 1], [",", "r", 1], [" \"", "r", 1], ["currency", "r", 1], ["\":", "r", 1], [" \"", "r", 1], ["EUR", "r", 1], ["\"}", "r", 1], ["<|im_end|>", "e", 1]
+    ];
+    const W = 860, cw = 7.3, padX = 6, h = 26, rowH = 52;
+    const s = svg("svg", { viewBox: `0 0 ${W} 300` });
+    let x = 10, y = 14, row = 0;
+    const counted = toks.filter(t => t[2]).length;
+    toks.forEach(([t, kind, m]) => {
+      const w = Math.max(18, t.length * cw + padX * 2);
+      if (x + w > W - 10) { x = 10; row++; y = 14 + row * rowH; }
+      const fill = m ? (kind === "e" ? "rgba(26,122,82,.42)" : "rgba(26,122,82,.16)") : (kind === "s" ? "rgba(28,27,25,.10)" : "rgba(28,27,25,.045)");
+      const stroke = m ? "rgba(26,122,82,.6)" : "rgba(28,27,25,.18)";
+      s.appendChild(svg("rect", { x, y, width: w - 3, height: h, rx: 4, fill, stroke, "stroke-width": 1 }));
+      txt(s, x + (w - 3) / 2, y + 17, t.replace(/ /g, "·"), { "text-anchor": "middle", "font-size": 11.5, class: "mono", fill: m ? palette.ink : palette.faint });
+      txt(s, x + (w - 3) / 2, y + h + 13, String(m), { "text-anchor": "middle", "font-size": 10, class: "mono", fill: m ? palette.green : palette.faint });
+      x += w;
+    });
+    const ly = 14 + (row + 1) * rowH + 8;
+    s.setAttribute("viewBox", `0 0 ${W} ${ly + 40}`);
+    const leg = [["rgba(28,27,25,.045)", "prompt / template token, m = 0 (read, not scored)"], ["rgba(26,122,82,.16)", "assistant token, m = 1 (scored)"], ["rgba(26,122,82,.42)", "end-of-turn token, m = 1 (teaches stopping)"]];
+    leg.forEach(([c, t], i) => { s.appendChild(svg("rect", { x: 10 + i * 285, y: ly, width: 14, height: 14, rx: 3, fill: c, stroke: "rgba(28,27,25,.2)" })); txt(s, 30 + i * 285, ly + 11, t, { "font-size": 11.5, fill: palette.muted }); });
+    txt(s, 10, ly + 34, `loss is averaged over ${counted} of ${toks.length} tokens  ·  "·" marks a leading space, "↵" a newline`, { "font-size": 11.5, class: "mono", fill: palette.ink });
+    host.appendChild(s);
+  })();
+
+  /* ---------------------------------------------------------- Fig: LoRA bypass */
+  (function () {
+    const s = document.getElementById("fig-lora");
+    arrowDefs(s, "arr-lora", palette.ink);
+    arrowDefs(s, "arr-lora-g", palette.green);
+    // input x (bottom) and output h (top)
+    rect(s, 250, 290, 260, 24, { rx: 6, fill: "rgba(47,93,138,.12)", stroke: "rgba(47,93,138,.5)" });
+    txt(s, 380, 306, "x  ∈ ℝᵏ   (layer input, k = 4096)", { "text-anchor": "middle", "font-size": 12, class: "mono" });
+    rect(s, 250, 12, 260, 24, { rx: 6, fill: "rgba(47,93,138,.12)", stroke: "rgba(47,93,138,.5)" });
+    txt(s, 380, 28, "h  ∈ ℝᵈ   (layer output)", { "text-anchor": "middle", "font-size": 12, class: "mono" });
+    // plus node
+    s.appendChild(svg("circle", { cx: 380, cy: 66, r: 13, fill: "#fff", stroke: palette.ink, "stroke-width": 1.3 }));
+    txt(s, 380, 71, "+", { "text-anchor": "middle", "font-size": 18 });
+    path(s, "M380,53 L380,40", "arr-lora", { stroke: palette.ink });
+    // frozen W0
+    rect(s, 150, 100, 170, 160, { rx: 6, fill: "rgba(28,27,25,.07)", stroke: "rgba(28,27,25,.35)" });
+    txt(s, 235, 170, "W₀", { "text-anchor": "middle", "font-size": 22, "font-family": "var(--serif)" });
+    txt(s, 235, 192, "d × k, frozen", { "text-anchor": "middle", "font-size": 12, class: "mono", fill: palette.muted });
+    txt(s, 235, 210, "no grads, no Adam state", { "text-anchor": "middle", "font-size": 11, fill: palette.muted });
+    path(s, "M300,290 C 270,280 240,275 235,264", "arr-lora", { stroke: palette.ink });
+    path(s, "M235,100 C 235,80 320,70 365,68", "arr-lora", { stroke: palette.ink });
+    // A trapezoid: wide bottom (k) to narrow top (r)
+    s.appendChild(svg("path", { d: "M440,262 L600,262 L545,214 L495,214 Z", fill: "rgba(26,122,82,.14)", stroke: "rgba(26,122,82,.6)", "stroke-width": 1.2 }));
+    txt(s, 520, 246, "A", { "text-anchor": "middle", "font-size": 18, "font-family": "var(--serif)" });
+    // bottleneck r
+    rect(s, 495, 186, 50, 22, { rx: 4, fill: "rgba(26,122,82,.30)", stroke: "rgba(26,122,82,.6)" });
+    txt(s, 520, 201, "r = 16", { "text-anchor": "middle", "font-size": 11, class: "mono" });
+    // B trapezoid: narrow bottom (r) to wide top (d)
+    s.appendChild(svg("path", { d: "M495,180 L545,180 L600,130 L440,130 Z", fill: "rgba(26,122,82,.14)", stroke: "rgba(26,122,82,.6)", "stroke-width": 1.2 }));
+    txt(s, 520, 162, "B", { "text-anchor": "middle", "font-size": 18, "font-family": "var(--serif)" });
+    // scale
+    rect(s, 480, 94, 80, 24, { rx: 12, fill: "#fff", stroke: "rgba(26,122,82,.6)" });
+    txt(s, 520, 110, "× α / r", { "text-anchor": "middle", "font-size": 12, class: "mono", fill: palette.green });
+    path(s, "M460,290 C 480,280 510,275 520,266", "arr-lora-g", { stroke: palette.green });
+    path(s, "M520,94 C 520,76 440,68 395,67", "arr-lora-g", { stroke: palette.green });
+    // annotations
+    lines(s, 612, 240, ["A ∈ ℝ^(r×k): k → r", "init random"], { "font-size": 11.5, class: "mono", fill: palette.green }, 15);
+    lines(s, 612, 150, ["B ∈ ℝ^(d×r): r → d", "init ZERO → BA = 0"], { "font-size": 11.5, class: "mono", fill: palette.green }, 15);
+    lines(s, 612, 196, ["trainable:", "r(d + k) params"], { "font-size": 11.5, class: "mono", fill: palette.ink }, 15);
+    lines(s, 16, 160, ["frozen path", "(pretrained)"], { "font-size": 11.5, class: "mono", fill: palette.muted }, 15);
+  })();
+
+  /* ---------------------------------------------------------- Fig: RLHF */
+  (function () {
+    const s = document.getElementById("fig-rlhf");
+    arrowDefs(s, "arr-rl", palette.ink);
+    const col = (x, n, title) => { txt(s, x, 22, "STEP " + n, { "font-size": 10.5, class: "mono", fill: palette.faint, "letter-spacing": "1.5" }); txt(s, x, 40, title, { "font-size": 13.5, "font-weight": 600 }); };
+    const b = (x, y, w, h, t, sub, kind) => {
+      const fill = kind === "g" ? "rgba(26,122,82,.10)" : kind === "b" ? "rgba(47,93,138,.08)" : kind === "r" ? "rgba(176,67,46,.08)" : kind === "y" ? "rgba(154,123,34,.10)" : "#fff";
+      rect(s, x, y, w, h, { rx: 8, fill });
+      txt(s, x + w / 2, y + (sub ? 18 : h / 2 + 4), t, { "text-anchor": "middle", "font-size": 12, "font-weight": 600 });
+      if (sub) lines(s, x + w / 2, y + 33, sub.split("|"), { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted }, 12);
+    };
+    const a = (d) => path(s, d, "arr-rl", { stroke: palette.ink });
+    // Step 1
+    col(16, 1, "Supervised fine-tuning");
+    b(16, 60, 196, 48, "Demonstrations", "labelers write ideal answers");
+    a("M114,108 L114,138");
+    b(16, 140, 196, 48, "SFT model π_SFT", "cross-entropy on responses", "g");
+    lines(s, 16, 222, ["Step 3 repeats; InstructGPT", "collected new comparisons", "in rounds as the policy improved."], { "font-size": 10.5, fill: palette.muted }, 14);
+    // Step 2
+    col(250, 2, "Train a reward model");
+    b(250, 60, 210, 48, "Sample K answers per prompt", "from π_SFT");
+    a("M355,108 L355,128");
+    b(250, 130, 210, 48, "Humans rank them", "→ pairs (x, y_w, y_l)");
+    a("M355,178 L355,198");
+    b(250, 200, 210, 48, "Reward model r_φ", "Bradley–Terry loss on pairs", "y");
+    path(s, "M212,164 C 232,164 230,84 246,84", "arr-rl", { stroke: palette.muted, "stroke-dasharray": "3 3" });
+    // Step 3
+    col(500, 3, "Optimize the policy with PPO");
+    b(500, 60, 160, 40, "prompt x", null);
+    a("M580,100 L580,118");
+    b(500, 120, 160, 48, "policy π_θ", "generates y (init: π_SFT)", "g");
+    a("M660,144 L686,144");
+    b(688, 120, 156, 48, "r_φ(x, y)", "frozen, from step 2", "y");
+    a("M580,168 L580,194");
+    txt(s, 586, 186, "KL", { "font-size": 10.5, class: "mono", fill: palette.muted });
+    b(500, 196, 160, 48, "reference π_ref", "frozen copy of π_SFT", "b");
+    a("M766,168 L766,194");
+    b(688, 196, 156, 48, "value model", "critic for advantages", "r");
+    rect(s, 500, 266, 344, 46, { rx: 8, fill: "#fbfaf7" });
+    txt(s, 672, 285, "PPO update on  r_φ(x,y) − β·KL(π_θ ‖ π_ref)", { "text-anchor": "middle", "font-size": 11.5, class: "mono" });
+    txt(s, 672, 302, "repeat: sample → score → update", { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted });
+    a("M766,244 L766,262");
+    a("M580,244 L580,262");
+    path(s, "M500,289 C 478,289 478,144 496,144", "arr-rl", { stroke: palette.ink, "stroke-dasharray": "4 3" });
+  })();
+
+  /* ---------------------------------------------------------- Fig: GRPO */
+  (function () {
+    const s = document.getElementById("fig-grpo");
+    arrowDefs(s, "arr-grpo", palette.ink);
+    const a = d => path(s, d, "arr-grpo", { stroke: palette.ink });
+    rect(s, 10, 92, 110, 50, { rx: 8, fill: "#fbfaf7" });
+    txt(s, 65, 114, "prompt x", { "text-anchor": "middle", "font-size": 12.5, "font-weight": 600 });
+    txt(s, 65, 130, "\"solve: 3x+5=20\"", { "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted });
+    a("M120,117 L146,117");
+    rect(s, 148, 92, 110, 50, { rx: 8, fill: "rgba(26,122,82,.10)" });
+    txt(s, 203, 114, "policy π_θ", { "text-anchor": "middle", "font-size": 12.5, "font-weight": 600 });
+    txt(s, 203, 130, "sample G times", { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted });
+    const rs = [1, 0, 1, 0, 0, 0, 1, 0], ans = [5, 4, 5, 6, 7, 3, 5, 8];
+    const mean = rs.reduce((x, y) => x + y, 0) / rs.length;
+    const sd = Math.sqrt(rs.reduce((x, y) => x + (y - mean) ** 2, 0) / rs.length);
+    rs.forEach((r, i) => {
+      const y = 14 + i * 27;
+      path(s, `M258,117 C 280,117 280,${y + 10} 296,${y + 10}`, null, { stroke: palette.faint, "stroke-width": 1 });
+      rect(s, 298, y, 150, 21, { rx: 4, fill: "#fff" });
+      txt(s, 306, y + 15, `o${i + 1}: … so x = ${ans[i]}`, { "font-size": 10.5, class: "mono" });
+      txt(s, 470, y + 15, r ? "✓ r=1" : "✗ r=0", { "font-size": 11, class: "mono", fill: r ? palette.green : palette.brick });
+      const A = (r - mean) / sd;
+      const bw = Math.abs(A) * 30;
+      s.appendChild(svg("rect", { x: A >= 0 ? 760 : 760 - bw, y: y + 3, width: bw, height: 15, rx: 2, fill: A >= 0 ? palette.green : palette.brick, opacity: 0.8 }));
+      txt(s, A >= 0 ? 764 + bw : 756 - bw, y + 15, (A >= 0 ? "+" : "") + A.toFixed(2), { "font-size": 10.5, class: "mono", fill: palette.muted, "text-anchor": A >= 0 ? "start" : "end" });
+    });
+    txt(s, 470, 246, "verifier", { "font-size": 10.5, class: "mono", fill: palette.faint });
+    s.appendChild(svg("line", { x1: 760, x2: 760, y1: 10, y2: 232, stroke: palette.ink }));
+    rect(s, 540, 88, 112, 58, { rx: 8, fill: "rgba(154,123,34,.10)" });
+    txt(s, 596, 108, "normalize", { "text-anchor": "middle", "font-size": 12.5, "font-weight": 600 });
+    txt(s, 596, 124, `mean ${mean.toFixed(3)}`, { "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.muted });
+    txt(s, 596, 138, `std ${sd.toFixed(3)}`, { "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.muted });
+    a("M516,117 L538,117");
+    a("M652,117 L690,117");
+    txt(s, 760, 246, "advantage Â_i", { "font-size": 10.5, class: "mono", fill: palette.faint, "text-anchor": "middle" });
+  })();
+
+  /* ---------------------------------------------------------- Widget 1: LoRA calculator */
+  (function () {
+    const w = widget("w-lora", { title: "LoRA calculator: what are you actually training?", kicker: "Calculator", note: "Shapes are the real architectures (Llama 3 uses grouped-query attention, so k_proj and v_proj output only 8 KV heads × head_dim). Adapter file assumes bf16 storage; fp32 doubles it. Training state assumes fp32 adapter weights + gradients + two Adam moments = 16 bytes per trainable parameter." });
+    let model = MODELS[2];
+    const on = { q: true, k: true, v: true, o: true, gate: true, up: true, down: true };
+    select(w.controls, { label: "Model", options: MODELS.map(m => ({ value: m.v, label: m.label })), value: "8b", onChange: v => { model = MODELS.find(m => m.v === v); draw(); } });
+    const RANKS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+    const rs = slider(w.controls, { label: "Rank r", min: 0, max: RANKS.length - 1, step: 1, value: 4, fmt: i => String(RANKS[i]), onInput: draw });
+    const tctl = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Target modules (click to toggle)" })));
+    const tg = el("div", { class: "seg" }); const btns = {};
+    const sync = () => MODS.forEach(m => btns[m].classList.toggle("on", on[m]));
+    MODS.forEach(m => { const b = el("button", { text: m + "_proj", class: "on", onclick: () => { on[m] = !on[m]; sync(); draw(); } }); btns[m] = b; tg.appendChild(b); });
+    tctl.appendChild(tg); w.controls.appendChild(tctl);
+    const pr = el("div", { class: "btnrow" });
+    [["q, v only (LoRA paper)", ["q", "v"]], ["attention only", ["q", "k", "v", "o"]], ["all-linear (QLoRA)", MODS]].forEach(([t, list]) => pr.appendChild(el("button", { class: "btn", text: t, onclick: () => { MODS.forEach(m => on[m] = list.includes(m)); sync(); draw(); } })));
+    w.controls.appendChild(pr);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 230, horizontal: true, labelWidth: 190 });
+    const set = stats(w.body, [{ key: "p", label: "Trainable params" }, { key: "pct", label: "Share of model" }, { key: "file", label: "Adapter file (bf16)" }, { key: "opt", label: "Adapter training state" }]);
+    const line = el("p", { class: "small muted", style: { margin: "10px 0 0" } }); w.body.appendChild(line);
+    function draw() {
+      const r = RANKS[rs.value], p = model;
+      wrap.dataset.layers = p.L;
+      const full = MODS.map(m => { const [i, o] = shapeOf(p, m); return p.L * r * (i + o); });
+      const per = MODS.map((m, j) => on[m] ? full[j] : 0);
+      const P = per.reduce((a, b) => a + b, 0), N = totalParams(p);
+      B.draw(MODS.map(m => { const [i, o] = shapeOf(p, m); return `${m}_proj ${i}→${o}`; }), per, { max: Math.max(...full), colors: per.map(v => v ? palette.green : palette.faint), fmt: v => v ? fmtSI(v, 2) : "frozen" });
+      set("p", P ? fmtSI(P, 1) : "0", null, "total model " + fmtSI(N, 2));
+      set("pct", P ? fmtNum(100 * P / N, P / N < 0.001 ? 3 : 2) + "%" : "0%", P / N < 0.02 ? "good" : "warn", "of all parameters");
+      set("file", P ? fmtNum(P * 2 / 1e6, P * 2 / 1e6 < 10 ? 1 : 0) + " MB" : "0", null, "vs " + fmtGB(N * 2 / 1e9) + " for the full model");
+      set("opt", P ? fmtNum(P * 16 / 1e9, 2) + " GB" : "0", null, "full fine-tune: " + fmtGB(N * 16 / 1e9));
+      const [qi, qo] = shapeOf(p, "q");
+      line.textContent = `Bars are summed over all ${p.L} layers. One q_proj matrix (${qo}×${qi}) at r = ${r}: r(d + k) = ${r} × (${qo} + ${qi}) = ${(r * (qi + qo)).toLocaleString("en-US")} params, versus ${(qi * qo).toLocaleString("en-US")} in the frozen matrix (${fmtNum(100 * r * (qi + qo) / (qi * qo), 2)}%).`;
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget 2: low-rank intuition */
+  (function () {
+    const w = widget("w-lowrank", { title: "How much of an update fits in rank r?", kicker: "Interactive", note: "A synthetic 20×20 update ΔW built from known singular vectors, so truncating it is exactly the best rank-r approximation. Colours: green positive, brick negative, same scale in all three panels. Real fine-tuning updates are much larger, but Hu et al. (2021) found their useful content concentrated in a few directions, like the \"low intrinsic rank\" setting." });
+    const n = 20, R = rng(5);
+    const ortho = () => {
+      const Q = [];
+      while (Q.length < n) {
+        let v = Array.from({ length: n }, () => R.normal());
+        Q.forEach(q => { const d = q.reduce((a, x, i) => a + x * v[i], 0); v = v.map((x, i) => x - d * q[i]); });
+        const nr = Math.hypot(...v); if (nr > 1e-6) Q.push(v.map(x => x / nr));
+      }
+      return Q;
+    };
+    const U = ortho(), V = ortho();
+    const SPECS = {
+      low: i => i < 3 ? [1, 0.62, 0.38][i] : 0.05 * Math.exp(-0.12 * i),
+      mid: i => Math.exp(-0.28 * i),
+      flat: i => 1 - 0.025 * i
+    };
+    let spec = "low";
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "What the update looks like" })));
+    seg(c1, { options: [{ value: "low", label: "low intrinsic rank" }, { value: "mid", label: "gradual decay" }, { value: "flat", label: "flat (noise-like)" }], value: "low", onChange: v => { spec = v; draw(); } });
+    w.controls.appendChild(c1);
+    const rs = slider(w.controls, { label: "Rank r kept", min: 1, max: n, step: 1, value: 2, onInput: draw });
+    const grid = el("div", { class: "tri" }); w.body.appendChild(grid);
+    const mk = title => { const c = el("div", { class: "canvas-wrap", style: { padding: "8px" } }); c.appendChild(el("div", { class: "small muted", style: { marginBottom: "4px", fontFamily: "var(--mono)" }, text: title })); grid.appendChild(c); return { h: heatmap(c, { cell: 11, showValues: false, maxWidth: 240 }), c }; };
+    const H1 = mk("target ΔW"), H2 = mk("rank-r approximation"), H3 = mk("residual ΔW − ΔW_r");
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    wrap2.appendChild(el("div", { class: "small muted", style: { fontFamily: "var(--mono)", marginBottom: "2px" }, text: "singular values σ_i (green = kept)" }));
+    const SB = bars(wrap2, { width: 760, height: 130 });
+    const set = stats(w.body, [{ key: "e", label: "Energy captured" }, { key: "err", label: "Relative error" }, { key: "par", label: "Params r(d+k)" }, { key: "cmp", label: "vs full d×k" }]);
+    function draw() {
+      const r = rs.value, sv = Array.from({ length: n }, (_, i) => SPECS[spec](i));
+      const build = k => Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => { let a = 0; for (let t = 0; t < k; t++) a += sv[t] * U[t][i] * V[t][j]; return a; }));
+      const full = build(n), approx = build(r), res = full.map((row, i) => row.map((v, j) => v - approx[i][j]));
+      const mx = Math.max(...full.flat().map(Math.abs));
+      H1.h.draw(full, { diverging: true, max: mx });
+      H2.h.draw(approx, { diverging: true, max: mx });
+      H3.h.draw(res, { diverging: true, max: mx });
+      SB.draw(sv.map((_, i) => String(i + 1)), sv, { colors: sv.map((_, i) => i < r ? palette.green : palette.faint), showValues: false, max: 1 });
+      const tot = sv.reduce((a, v) => a + v * v, 0), e = sv.slice(0, r).reduce((a, v) => a + v * v, 0) / tot;
+      set("e", fmtNum(100 * e, 1) + "%", e > 0.95 ? "good" : e > 0.75 ? "warn" : "bad", "Σ σ² kept / Σ σ² total");
+      set("err", fmtNum(100 * Math.sqrt(Math.max(0, 1 - e)), 1) + "%", null, "‖ΔW − ΔW_r‖ / ‖ΔW‖");
+      set("par", String(r * (n + n)), null, `${r} × (${n} + ${n})`);
+      set("cmp", fmtNum(100 * r * 2 * n / (n * n), 0) + "%", r * 2 * n < n * n ? "good" : "bad", r * 2 * n >= n * n ? "no savings at this rank" : "of " + n * n + " entries");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget 3: memory comparison */
+  (function () {
+    const w = widget("w-mem", { title: "Will it fit? Full fine-tune vs LoRA vs QLoRA", kicker: "Calculator", note: "Rough estimates: bf16 compute with FlashAttention (no sequence² term), AdamW, LoRA r = 16 on all linear layers. Activations assume about 8d + 4·d_ff saved values per token per layer without checkpointing; logits counted as tokens × vocab × 6 bytes (bf16 + fp32 upcast for the loss). Real numbers vary ±30–50% with framework, kernels, and fragmentation. Full fine-tuning beyond one GPU is sharded with FSDP/ZeRO-3 (Module 07)." });
+    let model = MODELS[2], gpu = 24, ckpt = true;
+    const GPUS = [{ v: "16", l: "16 GB · T4 / RTX 4080" }, { v: "24", l: "24 GB · RTX 4090 / L4" }, { v: "48", l: "48 GB · L40S / RTX 6000 Ada" }, { v: "80", l: "80 GB · A100 / H100" }, { v: "141", l: "141 GB · H200" }];
+    select(w.controls, { label: "Model", options: MODELS.map(m => ({ value: m.v, label: m.label })), value: "8b", onChange: v => { model = MODELS.find(m => m.v === v); draw(); } });
+    select(w.controls, { label: "GPU", options: GPUS.map(g => ({ value: g.v, label: g.l })), value: "24", onChange: v => { gpu = +v; draw(); } });
+    const SEQS = [512, 1024, 2048, 4096, 8192];
+    const ss = slider(w.controls, { label: "Sequence length", min: 0, max: SEQS.length - 1, step: 1, value: 2, fmt: i => SEQS[i] + " tokens", onInput: draw });
+    const bs = slider(w.controls, { label: "Micro-batch", min: 1, max: 8, step: 1, value: 1, onInput: draw });
+    const cc = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Gradient checkpointing" })));
+    seg(cc, { options: [{ value: true, label: "on" }, { value: false, label: "off" }], value: true, onChange: v => { ckpt = v; draw(); } });
+    w.controls.appendChild(cc);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 230" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "full", label: "Full fine-tune" }, { key: "lora", label: "LoRA (bf16 base)" }, { key: "q", label: "QLoRA (NF4 base)" }, { key: "gpus", label: "Full FT on 80 GB GPUs" }]);
+    const SEG = [["weights", "weights", palette.blue], ["grads", "gradients", palette.gold], ["optim", "Adam state", palette.brick], ["adapters", "adapter + its Adam", palette.green], ["act", "activations + logits", palette.teal], ["other", "CUDA context etc.", palette.faint]];
+    function parts(kind) {
+      const p = model, N = totalParams(p), Pl = loraParams(p, 16, MODS), Tk = bs.value * SEQS[ss.value];
+      const perTokLayer = 2 * (8 * p.d + 4 * p.ff);
+      const act = (ckpt ? Tk * p.L * p.d * 2 + 2 * Tk * perTokLayer : Tk * p.L * perTokLayer) + Tk * p.V * 6;
+      const other = 1e9;
+      if (kind === "full") return { weights: 2 * N, grads: 2 * N, optim: 12 * N, adapters: 0, act, other };
+      if (kind === "lora") return { weights: 2 * N, grads: 0, optim: 0, adapters: 16 * Pl, act, other };
+      return { weights: (N - embParams(p)) * 4.127 / 8 + embParams(p) * 2, grads: 0, optim: 0, adapters: 16 * Pl, act, other };
+    }
+    function draw() {
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const rows = [["Full fine-tune", parts("full")], ["LoRA", parts("lora")], ["QLoRA", parts("qlora")]];
+      const tot = rows.map(([, pt]) => Object.values(pt).reduce((a, b) => a + b, 0) / 1e9);
+      const max = Math.max(gpu * 1.35, tot[1] * 1.08, tot[2] * 1.08);
+      const x0 = 120, x1 = 690, sx = v => x0 + Math.min(v, max) / max * (x1 - x0);
+      rows.forEach(([name, pt], i) => {
+        const y = 18 + i * 52;
+        txt(s, x0 - 10, y + 20, name, { "text-anchor": "end", "font-size": 12.5, "font-weight": 600 });
+        let acc = 0;
+        SEG.forEach(([k, , c]) => {
+          const v = pt[k] / 1e9; if (v <= 0) return;
+          const a = sx(acc), b = sx(acc + v);
+          if (b > a) s.appendChild(svg("rect", { x: a, y, width: Math.max(0.5, b - a - 1), height: 30, rx: 3, fill: c, opacity: 0.8 }));
+          acc += v;
+        });
+        const fits = tot[i] <= gpu;
+        const clipped = tot[i] > max;
+        txt(s, clipped ? 755 : sx(tot[i]) + 6, clipped ? y + 46 : y + 20, fmtGB(tot[i]) + (clipped ? " total (bar cut off)" : ""), { "font-size": 11.5, class: "mono", fill: fits ? palette.green : palette.brick, "font-weight": 600, "text-anchor": clipped ? "end" : "start" });
+      });
+      const gx = sx(gpu);
+      s.appendChild(svg("line", { x1: gx, x2: gx, y1: 8, y2: 172, stroke: palette.ink, "stroke-width": 1.5, "stroke-dasharray": "5 3" }));
+      txt(s, gx, 186, gpu + " GB GPU", { "text-anchor": "middle", "font-size": 11, class: "mono" });
+      SEG.forEach(([, lab, c], i) => { const x = 20 + i * 123; s.appendChild(svg("rect", { x, y: 204, width: 12, height: 12, rx: 2, fill: c, opacity: 0.8 })); txt(s, x + 17, 214, lab, { "font-size": 10.5, fill: palette.muted }); });
+      const N = totalParams(model);
+      set("full", fmtGB(tot[0]), tot[0] <= gpu ? "good" : "bad", tot[0] <= gpu ? "fits" : "doesn't fit one GPU");
+      set("lora", fmtGB(tot[1]), tot[1] <= gpu ? "good" : "bad", tot[1] <= gpu ? "fits" : "doesn't fit");
+      set("q", fmtGB(tot[2]), tot[2] <= gpu ? "good" : "bad", tot[2] <= gpu ? "fits" : "doesn't fit");
+      const shardable = 16 * N / 1e9, perGpuAct = (tot[0] - shardable);
+      const k = Math.max(1, Math.ceil(shardable / Math.max(1, 80 * 0.85 - perGpuAct)));
+      set("gpus", tot[0] <= 80 ? "1" : "≥ " + k, tot[0] <= 80 ? "good" : "warn", "weights+grads+Adam sharded (ZeRO-3)");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget 4: loss curves (toy) */
+  (function () {
+    const w = widget("w-curves", { title: "Train vs validation loss (toy model)", kicker: "Simulation", note: "<b>This is an illustrative toy</b>, not a fitted model of any real run: learning speed scales with steps (epochs × examples) and LR, memorization grows with repeated epochs and is stronger on small datasets, and high LRs add instability. It reproduces the qualitative shapes you'll see in practice. The green line marks where early stopping would pick a checkpoint." });
+    const ns = slider(w.controls, { label: "Training examples", min: 2, max: 5, step: 0.1, value: 3, fmt: v => Math.round(10 ** v).toLocaleString("en-US"), onInput: draw });
+    const es = slider(w.controls, { label: "Epochs", min: 1, max: 10, step: 1, value: 5, onInput: draw });
+    const ls = slider(w.controls, { label: "Learning rate (× recommended)", min: -1, max: 1, step: 0.05, value: 0, fmt: v => fmtNum(10 ** v, 10 ** v < 1 ? 2 : 1) + "×", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "best", label: "Best val loss" }, { key: "at", label: "Early-stop epoch" }, { key: "final", label: "Final val loss" }, { key: "verdict", label: "Diagnosis" }]);
+    function curves(N, lrm) {
+      const L0 = 2.2;
+      const floor = 0.6 + 0.5 * Math.pow(100 / N, 0.3);
+      const rate = Math.min(N, 20000) * Math.min(lrm, 3) / 450;          // progress per epoch
+      const unstable = Math.max(0, Math.log10(lrm) - 0.4);              // kicks in above ~2.5×
+      const memo = 0.75 * Math.sqrt(300 / (N + 300));
+      const c = 0.08 * Math.pow(1000 / N, 0.4) * Math.sqrt(Math.min(lrm, 4));
+      const t0 = 0.8 + 0.35 * Math.log10(N / 100) + 0.6 / Math.max(rate, 0.2);
+      const fit = t => L0 - (L0 - floor) * (1 - Math.exp(-rate * t));
+      const noise = t => unstable * (0.35 + 0.18 * Math.sin(t * 11) + 0.1 * Math.sin(t * 29));
+      const train = t => Math.max(0.02, fit(t) - memo * (1 - Math.exp(-0.5 * Math.min(lrm, 3) * Math.max(0, t - 0.6))) * (1 + 0.04 * Math.floor(t)) + noise(t));
+      const val = t => fit(t) + c * Math.pow(Math.max(0, t - t0), 1.3) + noise(t) * 1.1;
+      return { train, val, unstable };
+    }
+    function draw() {
+      wrap.innerHTML = "";
+      const N = Math.round(10 ** ns.value), E = es.value, lrm = 10 ** ls.value;
+      const { train, val, unstable } = curves(N, lrm);
+      let best = Infinity, bt = 0;
+      for (let i = 0; i <= 400; i++) { const t = E * i / 400; const v = val(t); if (v < best) { best = v; bt = t; } }
+      const P = plot(wrap, { width: 760, height: 300, x: [0, E], y: [0, 2.6], xlabel: "epoch", ylabel: "loss (nats / token)" });
+      P.draw([
+        { fn: train, color: palette.blue, label: "train loss" },
+        { fn: val, color: palette.brick, label: "validation loss" },
+        { vline: bt, color: palette.green, label: "early stop · epoch " + fmtNum(bt, 2) },
+        { marker: [bt, best], color: palette.green }
+      ]);
+      const fin = val(E), gap = fin - train(E);
+      set("best", fmtNum(best, 3), null, "lower is better");
+      set("at", fmtNum(bt, 2), null, "≈ step " + Math.round(bt * N / 16).toLocaleString("en-US") + " at batch 16");
+      set("final", fmtNum(fin, 3), fin - best > 0.05 ? "bad" : "good", "gap to train: " + fmtNum(gap, 2));
+      let v, cls;
+      if (unstable > 0.05) { v = "LR too high"; cls = "bad"; }
+      else if (bt > E * 0.97 && val(E * 0.9) - fin > 0.02) { v = "underfit: more steps"; cls = "warn"; }
+      else if (fin - best > 0.05) { v = "overfit: stop early"; cls = "bad"; }
+      else { v = "about right"; cls = "good"; }
+      set("verdict", v, cls, unstable > 0.05 ? "spiky, higher floor" : cls === "bad" ? "or add data" : "");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget 5: DPO loss and gradient weight */
+  (function () {
+    const w = widget("w-dpo", { title: "DPO: loss and gradient weight vs implicit reward margin", kicker: "Interactive", note: "Margin Δ = log[π_θ(y_w)/π_ref(y_w)] − log[π_θ(y_l)/π_ref(y_l)], in nats summed over response tokens. Δ = 0 at the start of training (π_θ = π_ref), where the loss is ln 2 ≈ 0.693 and the weight is 0.5 for every β. Dashed curves show other β values for comparison." });
+    let mode = "loss";
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Plot" })));
+    seg(c1, { options: [{ value: "loss", label: "loss −log σ(βΔ)" }, { value: "weight", label: "gradient weight σ(−βΔ)" }], value: "loss", onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    const bsl = slider(w.controls, { label: "β", min: -2, max: 0, step: 0.02, value: -1, fmt: v => fmtNum(10 ** v, 10 ** v < 0.1 ? 3 : 2), onInput: draw });
+    const ms = slider(w.controls, { label: "Current margin Δ (nats)", min: -30, max: 30, step: 0.5, value: 5, fmt: v => (v > 0 ? "+" : "") + fmtNum(v, 1), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "loss", label: "Loss" }, { key: "wt", label: "Gradient weight" }, { key: "p", label: "P(chosen ≻ rejected)" }, { key: "r", label: "Reward gap β·Δ" }]);
+    const sig = z => 1 / (1 + Math.exp(-z));
+    const lossF = b => d => Math.log1p(Math.exp(-b * d));
+    const wtF = b => d => sig(-b * d);
+    function draw() {
+      wrap.innerHTML = "";
+      const b = 10 ** bsl.value, d = ms.value;
+      const F = mode === "loss" ? lossF : wtF;
+      const P = plot(wrap, { width: 760, height: 290, x: [-30, 30], y: mode === "loss" ? [0, 4] : [0, 1], xlabel: "implicit reward margin Δ (nats): negative = model prefers the rejected answer", ylabel: mode === "loss" ? "DPO loss" : "weight on this pair" });
+      const layers = [];
+      [0.05, 0.1, 0.5].forEach((bb, i) => { if (Math.abs(bb - b) > 0.01) layers.push({ fn: F(bb), color: [palette.faint, palette.muted, palette.gold][i], dash: "4 3", width: 1.4, label: "β = " + bb }); });
+      layers.push({ fn: F(b), color: palette.green, width: 2.6, label: "β = " + fmtNum(b, b < 0.1 ? 3 : 2) });
+      layers.push({ vline: 0, color: palette.ink, dash: "2 3" });
+      layers.push({ marker: [d, F(b)(d)], color: palette.brick, label: fmtNum(F(b)(d), 3) });
+      P.draw(layers);
+      set("loss", fmtNum(lossF(b)(d), 3), lossF(b)(d) < 0.3 ? "good" : lossF(b)(d) > 0.69 ? "bad" : "warn", "ln 2 = 0.693 at Δ = 0");
+      set("wt", fmtNum(wtF(b)(d), 3), null, wtF(b)(d) < 0.1 ? "pair mostly ignored now" : wtF(b)(d) > 0.5 ? "model ranks it wrong: big push" : "still learning from it");
+      set("p", fmtNum(100 * sig(b * d), 1) + "%", null, "Bradley–Terry σ(β·Δ)");
+      set("r", fmtNum(b * d, 2), null, "implicit reward difference");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget 6: GRPO group advantages */
+  (function () {
+    const w = widget("w-grpo", { title: "GRPO: advantages within one group", kicker: "Interactive", note: "Click a sample to cycle its reward 0 → 0.5 (partial credit) → 1. Std here is the population std plus ε = 1e-4, as most implementations add. Turning std-normalization off gives plain mean-centred advantages, the change Dr. GRPO argues for." });
+    let G = 8, norm = true;
+    let rewards = [1, 0, 0, 1, 0, 0, 0, 0];
+    const cg = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Group size G" })));
+    seg(cg, { options: [{ value: 4, label: "4" }, { value: 8, label: "8" }, { value: 16, label: "16" }], value: 8, onChange: v => { G = v; rewards = Array.from({ length: G }, (_, i) => rewards[i] != null ? rewards[i] : 0); draw(); } });
+    w.controls.appendChild(cg);
+    const cn = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Divide by std" })));
+    seg(cn, { options: [{ value: true, label: "yes (GRPO)" }, { value: false, label: "no (mean-centred)" }], value: true, onChange: v => { norm = v; draw(); } });
+    w.controls.appendChild(cn);
+    const pr = el("div", { class: "btnrow" });
+    [["1 of G correct", k => k === 0 ? 1 : 0], ["half correct", k => k % 2 === 0 ? 1 : 0], ["all correct", () => 1], ["none correct", () => 0]].forEach(([t, f]) => pr.appendChild(el("button", { class: "btn", text: t, onclick: () => { rewards = Array.from({ length: G }, (_, k) => f(k)); draw(); } })));
+    w.controls.appendChild(pr);
+    const chips = el("div", { class: "chips" }); w.body.appendChild(chips);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 220 });
+    const set = stats(w.body, [{ key: "m", label: "Group mean reward" }, { key: "s", label: "Group std" }, { key: "best", label: "Best answer's advantage" }, { key: "sig", label: "Learning signal" }]);
+    function draw() {
+      chips.innerHTML = "";
+      rewards.forEach((r, i) => chips.appendChild(el("button", { class: r === 1 ? "r1" : r === 0.5 ? "rh" : "r0", text: `o${i + 1} · ${r}`, onclick: () => { rewards[i] = r === 0 ? 0.5 : r === 0.5 ? 1 : 0; draw(); } })));
+      const m = rewards.reduce((a, b) => a + b, 0) / G;
+      const sd = Math.sqrt(rewards.reduce((a, b) => a + (b - m) ** 2, 0) / G);
+      const A = rewards.map(r => norm ? (r - m) / (sd + 1e-4) : r - m);
+      const mx = 1.18 * Math.max(1, ...A.map(Math.abs));
+      B.draw(rewards.map((_, i) => "o" + (i + 1)), A.map(a => Math.abs(a) < 1e-9 ? 0 : a), { max: mx, fmt: v => (v > 0 ? "+" : "") + fmtNum(v, 2), colors: A.map(a => a > 1e-9 ? palette.green : a < -1e-9 ? palette.brick : palette.faint) });
+      set("m", fmtNum(m, 3), null, "the baseline");
+      set("s", fmtNum(sd, 3), null, norm ? "divides every advantage" : "not used");
+      set("best", (Math.max(...A) > 0 ? "+" : "") + fmtNum(Math.max(...A), 2), null, "applied to every token of that answer");
+      const tot = A.reduce((a, b) => a + Math.abs(b), 0);
+      set("sig", tot < 1e-6 ? "none" : fmtNum(tot, 2), tot < 1e-6 ? "bad" : "good", tot < 1e-6 ? "all rewards equal: prompt is wasted" : "Σ |Â_i|");
+    }
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>

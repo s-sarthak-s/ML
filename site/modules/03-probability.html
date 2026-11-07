@@ -1,0 +1,838 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Probability &amp; information — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+</head>
+<body data-module="03">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 03 · Foundations</p>
+<h1 class="title">Probability &amp; information: how a model keeps <span class="it">score</span></h1>
+<p class="lede">Every language model ends the same way. A softmax turns a vector of raw scores into a probability for each of ~100K tokens, and the training loss is minus the log of the probability it gave the token that actually came next. This module builds that pipeline from the ground up, one symbol at a time, and then uses it to read loss curves, perplexities, and KL penalties without guessing.</p>
+<div class="meta"><span class="tag">~2.5 hours</span><span class="tag n">prereqs: 01, 02</span><span class="tag g">hands-on: PyTorch, transformers</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Write the probability of a sentence as a product of next-token probabilities, and explain why we add logs instead.</li>
+    <li>Compute a softmax by hand, say what temperature does, and know why adding a constant to every logit changes nothing.</li>
+    <li>Turn a model's probability for the right token into a cross-entropy loss and its gradient, in nats and in bits.</li>
+    <li>Read entropy, KL divergence, and perplexity as numbers with units, and know which direction of KL a training recipe is using.</li>
+    <li>Compute a Hugging Face model's perplexity on your own text, and say when two perplexities can't be compared.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="distributions">Random variables and distributions</h2>
+
+<p>A <strong>random variable</strong> is a quantity whose value you don't know yet, together with a rule saying how likely each value is. That rule is its <strong>distribution</strong>. For a language model, the most important random variable is "the next token". Its possible values are the entries of the vocabulary: 50,257 for GPT-2, 128,256 for Llama 3. Each forward pass of the model produces one full distribution over all of them.</p>
+
+<div class="def"><b>Definition · Categorical distribution</b>
+<p>A random variable \(X\) that takes one of \(V\) discrete values has a <em>categorical</em> distribution, given by a vector \(\mathbf{p} = (p_1, \ldots, p_V)\) with \(P(X = k) = p_k\), every \(p_k \ge 0\), and \(\sum_{k=1}^{V} p_k = 1\). The output of an LLM's final softmax is exactly such a vector, one per position.</p>
+</div>
+
+<figure class="fig"><div id="fig-cat"></div>
+<figcaption>An illustrative next-token distribution after the prompt <code>The capital of France is</code>. The numbers are made up to show the shape, not measured from a specific model. A handful of tokens take almost all the mass and a long tail of 128,251 other tokens shares the rest. The leading space is part of the token (Module 05).</figcaption></figure>
+
+<p>Some quantities are continuous instead: a weight value, an activation, a latency. These have a <strong>probability density</strong> \(p(x)\). A density is not a probability; it can exceed 1. Probabilities come from areas under it: \(P(a \le X \le b) = \int_a^b p(x)\,dx\), and the total area is 1.</p>
+
+<h3>The Gaussian</h3>
+<p>The most important density is the <strong>normal</strong> or <strong>Gaussian</strong> distribution, the bell curve. It shows up in ML for two reasons. Sums of many small independent effects tend toward it (the central limit theorem), and we choose it on purpose: GPT-2 initializes its weights from a Gaussian with standard deviation 0.02. Trained weight matrices stay roughly bell-shaped, though usually with heavier tails than a true Gaussian, which is the assumption NF4 quantization builds on (Module 09).</p>
+
+<div class="formula" data-name="Gaussian (normal) density">
+  <div class="tex">$$\htmlClass{t1}{p(x)} = \frac{1}{\htmlClass{t3}{\sigma}\sqrt{2\pi}}\,\exp\!\left(-\frac{(\htmlClass{t4}{x} - \htmlClass{t2}{\mu})^2}{2\htmlClass{t3}{\sigma}^2}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(p(x)\)</dt><dd>density at value \(x\). Written \(\mathcal{N}(x;\mu,\sigma^2)\)</dd></div>
+    <div data-t="t2"><dt>\(\mu\)</dt><dd><b>mean</b>: where the peak sits</dd></div>
+    <div data-t="t3"><dt>\(\sigma\)</dt><dd><b>standard deviation</b>: how wide the bell is. \(\sigma^2\) is the variance</dd></div>
+    <div data-t="t4"><dt>\(x\)</dt><dd>the value you're asking about</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The density falls off with the squared distance from the mean, measured in units of \(\sigma\). The \(\frac{1}{\sigma\sqrt{2\pi}}\) in front is just whatever constant makes the total area 1, so a narrower bell has to be taller.</p>
+  <p class="why"><b>Why it matters</b>About 68.3% of the mass lies within \(\pm1\sigma\), 95.4% within \(\pm2\sigma\), 99.7% within \(\pm3\sigma\). If a weight sits at \(6\sigma\) you are looking at an outlier, not bad luck. A true Gaussian produces one about twice per billion draws.</p>
+</div>
+
+<div id="w-gauss"></div>
+
+<!-- ================================================================== -->
+<h2 id="expectation">Expectation and variance</h2>
+
+<p>Two numbers summarize most distributions well enough for engineering: where the center is, and how spread out the values are.</p>
+
+<div class="formula" data-name="Expectation (mean)">
+  <div class="tex">$$\htmlClass{t1}{\mathbb{E}[X]} = \sum_{x} \htmlClass{t2}{x}\;\htmlClass{t3}{P(X = x)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbb{E}[X]\)</dt><dd>expected value, often written \(\mu\)</dd></div>
+    <div data-t="t2"><dt>\(x\)</dt><dd>each possible value</dd></div>
+    <div data-t="t3"><dt>\(P(X=x)\)</dt><dd>its probability, which acts as the weight</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A probability-weighted average. For a density, the sum becomes an integral: \(\mathbb{E}[X] = \int x\,p(x)\,dx\). The same recipe works for any function of \(X\): \(\mathbb{E}[f(X)] = \sum_x f(x)\,P(X=x)\).</p>
+  <p class="why"><b>Why it matters</b>The training loss is an expectation: the average of \(-\log p_\theta(\text{next token})\) over the data distribution. You can't compute it exactly, so every minibatch average is an estimate of it, and the noise in that estimate is the "stochastic" in stochastic gradient descent.</p>
+</div>
+
+<div class="formula" data-name="Variance and standard deviation">
+  <div class="tex">$$\htmlClass{t1}{\operatorname{Var}[X]} = \mathbb{E}\big[(X - \htmlClass{t2}{\mu})^2\big] = \htmlClass{t3}{\mathbb{E}[X^2]} - \htmlClass{t2}{\mu}^2, \qquad \htmlClass{t4}{\sigma} = \sqrt{\operatorname{Var}[X]}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\operatorname{Var}[X]\)</dt><dd>variance: average squared distance from the mean</dd></div>
+    <div data-t="t2"><dt>\(\mu\)</dt><dd>the mean, \(\mathbb{E}[X]\)</dd></div>
+    <div data-t="t3"><dt>\(\mathbb{E}[X^2]\)</dt><dd>mean of the squared values (the "second moment")</dd></div>
+    <div data-t="t4"><dt>\(\sigma\)</dt><dd>standard deviation, in the same units as \(X\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Square the distances so positive and negative deviations don't cancel, then average. The second form is easier to compute: mean of the squares minus the square of the mean.</p>
+</div>
+
+<h3>Worked example: tokens per word</h3>
+<p>Suppose a tokenizer splits English words into 1, 2 or 3 tokens with the probabilities below. These are illustrative, not measured from a real tokenizer.</p>
+<table class="t">
+  <thead><tr><th>Tokens per word \(x\)</th><th class="num">\(P(X=x)\)</th><th class="num">\(x \cdot P\)</th><th class="num">\(x^2 \cdot P\)</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td class="num">0.6</td><td class="num">0.6</td><td class="num">0.6</td></tr>
+    <tr><td>2</td><td class="num">0.3</td><td class="num">0.6</td><td class="num">1.2</td></tr>
+    <tr><td>3</td><td class="num">0.1</td><td class="num">0.3</td><td class="num">0.9</td></tr>
+    <tr><td>Sum</td><td class="num">1.0</td><td class="num">\(\mathbb{E}[X] = 1.5\)</td><td class="num">\(\mathbb{E}[X^2] = 2.7\)</td></tr>
+  </tbody>
+</table>
+<p>So \(\operatorname{Var}[X] = 2.7 - 1.5^2 = 0.45\) and \(\sigma \approx 0.67\). A 1,000-word document costs about 1,500 tokens on average. And because variances of independent quantities add, the total's variance is \(1000 \times 0.45 = 450\), a standard deviation of only about 21 tokens. Long documents are very predictable in token count even when single words are not.</p>
+
+<div class="mle"><b>MLE angle · why attention divides by \(\sqrt{d}\)</b>
+<p>Two rules do a lot of work: \(\operatorname{Var}[aX] = a^2\operatorname{Var}[X]\), and variances of independent terms add. Take a query and a key with \(d\) independent entries, each with mean 0 and variance 1. Their dot product \(\sum_i q_i k_i\) is a sum of \(d\) terms of variance 1, so it has variance \(d\). With \(d = 128\) the scores have \(\sigma \approx 11\), which pushes softmax into near one-hot territory. Dividing by \(\sqrt{d}\) brings the variance back to 1. The same argument gives the \(1/\sqrt{n_{\text{in}}}\) scale used in weight initialization (Modules 04, 06).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="chain">Conditional probability and the chain rule</h2>
+
+<p>A language model never outputs "the probability of a sentence" directly. It outputs the probability of the next token <em>given</em> everything before it. That word "given" is conditional probability.</p>
+
+<div class="def"><b>Definition · Conditional probability</b>
+<p>\(P(A \mid B) = \dfrac{P(A, B)}{P(B)}\), read "the probability of \(A\) given \(B\)". Restrict attention to the worlds where \(B\) happened, and ask what fraction of those also have \(A\). \(P(A, B)\) is the <em>joint</em> probability that both happen.</p>
+</div>
+
+<p>Rearranging gives \(P(A, B) = P(A)\,P(B \mid A)\). Apply that rule repeatedly to a sequence of tokens and you get the <strong>chain rule of probability</strong>. It isn't an approximation or a modelling choice: it holds for any joint distribution.</p>
+
+<div class="formula" data-name="Autoregressive factorization">
+  <div class="tex">$$\htmlClass{t1}{P(x_1, x_2, \ldots, x_T)} = \prod_{t=1}^{\htmlClass{t2}{T}} \htmlClass{t3}{P}\big(\htmlClass{t4}{x_t} \mid \htmlClass{t5}{x_{\lt t}}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P(x_1,\ldots,x_T)\)</dt><dd>probability of the whole sequence</dd></div>
+    <div data-t="t2"><dt>\(T\)</dt><dd>sequence length in tokens</dd></div>
+    <div data-t="t3"><dt>\(P(\cdot\mid\cdot)\)</dt><dd>the next-token distribution. This is what the network computes</dd></div>
+    <div data-t="t4"><dt>\(x_t\)</dt><dd>the token at position \(t\)</dd></div>
+    <div data-t="t5"><dt>\(x_{\lt t}\)</dt><dd>all earlier tokens \(x_1,\ldots,x_{t-1}\): the context. For \(t=1\) it's just the start-of-sequence marker</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The probability of a sentence is the probability of its first token, times the probability of the second given the first, times the third given the first two, and so on to the end.</p>
+  <p class="why"><b>Why it matters</b>This is the whole contract of a GPT-style model. Learn one function, "next-token distribution given a prefix", and you have a full probability model over all text. Generation is just sampling from that function one step at a time (Module 08).</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 860 340" id="fig-chain"></svg>
+<figcaption>A six-token sentence scored by a hypothetical model. Each row of the staircase is one prediction: the grey bar is the context the model sees, the green dot is the token it's asked to predict. The probability of the sentence is the product of the six bars. The probabilities are illustrative. In training, a causal attention mask lets all six predictions run in one forward pass (Module 06).</figcaption></figure>
+
+<h3>Bayes' rule</h3>
+<p>Since \(P(A,B)\) can be split either way, \(P(A)P(B\mid A) = P(B)P(A\mid B)\). Divide through and you get a way to flip a conditional around.</p>
+
+<div class="formula" data-name="Bayes' rule">
+  <div class="tex">$$\htmlClass{t1}{P(H \mid E)} = \frac{\htmlClass{t2}{P(E \mid H)}\;\htmlClass{t3}{P(H)}}{\htmlClass{t4}{P(E)}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P(H\mid E)\)</dt><dd><b>posterior</b>: belief in hypothesis \(H\) after seeing evidence \(E\)</dd></div>
+    <div data-t="t2"><dt>\(P(E\mid H)\)</dt><dd><b>likelihood</b>: how probable the evidence is if \(H\) is true</dd></div>
+    <div data-t="t3"><dt>\(P(H)\)</dt><dd><b>prior</b>: belief in \(H\) before the evidence</dd></div>
+    <div data-t="t4"><dt>\(P(E)\)</dt><dd>total probability of the evidence, over all hypotheses</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>How much you believe something afterwards depends on how well it explains the evidence <em>and</em> how plausible it was to begin with.</p>
+  <p class="why"><b>Why it matters</b>A classifier that flags "AI-generated text" catches 90% of AI text and wrongly flags 5% of human text. If 10% of submissions are AI-written, then \(P(\text{flag}) = 0.9 \times 0.1 + 0.05 \times 0.9 = 0.135\) and \(P(\text{AI} \mid \text{flag}) = 0.09 / 0.135 \approx 0.67\). A third of flagged authors are innocent. Base rates decide how far you can trust any eval judge or detector (Module 13).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="softmax">Softmax: from scores to probabilities</h2>
+
+<p>The last layer of a transformer produces a vector of \(V\) real numbers called <strong>logits</strong>, one per vocabulary entry. They can be any size and any sign. We need non-negative numbers that sum to 1. The softmax does that.</p>
+
+<div class="formula" data-name="Softmax with temperature">
+  <div class="tex">$$\htmlClass{t1}{p_i} = \frac{\exp(\htmlClass{t2}{z_i} / \htmlClass{t3}{T})}{\sum_{j=1}^{\htmlClass{t4}{V}} \exp(\htmlClass{t2}{z_j} / \htmlClass{t3}{T})}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(p_i\)</dt><dd>probability of token \(i\)</dd></div>
+    <div data-t="t2"><dt>\(z_i\)</dt><dd><b>logit</b>: the model's raw score for token \(i\)</dd></div>
+    <div data-t="t3"><dt>\(T\)</dt><dd><b>temperature</b>. 1 during training; a sampling knob at inference</dd></div>
+    <div data-t="t4"><dt>\(V\)</dt><dd>vocabulary size: the sum runs over every token</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Exponentiate every score so it's positive, then divide by the total so they sum to 1. Bigger score, bigger share, and the exponential makes the gaps dramatic: a logit 1 higher means \(e \approx 2.72\times\) more probability.</p>
+  <p class="why"><b>Why it matters</b>Only <em>differences</em> between logits matter: \(p_i / p_j = e^{(z_i - z_j)/T}\). Add the same constant to every logit and the probabilities don't move, because \(e^{c/T}\) appears in the numerator and the denominator and cancels. That's what makes the stable implementation below legal.</p>
+</div>
+
+<div id="w-softmax"></div>
+
+<details class="think"><summary>Think first: what happens if you multiply every logit by 2?</summary>
+<div>Multiplying by 2 is the same as dividing by \(T = 0.5\). Every gap between logits doubles, so the distribution gets sharper: the top token gains share and the tail shrinks. So softmax is invariant to <em>shifting</em> logits but not to <em>scaling</em> them. Temperature is a scaling knob. Try it in the widget: set T to 0.5 and compare with the logits doubled at T = 1.</div>
+</details>
+
+<div class="pitfall"><b>Pitfall · softmax saturates</b>
+<p>When one logit is far above the rest, its probability is essentially 1 and the others are essentially 0, and the gradients through the softmax become tiny. That's the failure the \(\sqrt{d}\) scaling in attention prevents. It's also why training code passes logits to the loss rather than probabilities: the loss can then be computed in log space without ever forming the saturated values.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="logs">Log-probabilities: why everything is in logs</h2>
+
+<p>A 1,000-token document where the model gives each token a probability of about 0.13 has probability \(0.13^{1000} \approx 10^{-886}\). The smallest positive float32 is about \(1.4 \times 10^{-45}\), and the smallest float64 is about \(4.9 \times 10^{-324}\). Multiply the probabilities one by one and you get exactly 0 long before the end. That's <strong>underflow</strong>.</p>
+
+<p>Take logs and the product becomes a sum: \(\log P(x_{1:T}) = \sum_t \log P(x_t \mid x_{\lt t})\). Each term is a modest negative number, around \(-2\), and the sum is about \(-2040\), which any float can hold. Logs help in three other ways too. Sums are easier to differentiate than products. A sum over tokens splits cleanly across a minibatch. And \(-\log p\) has a meaning of its own, the <em>surprise</em> of an outcome in nats, which the rest of this module builds on.</p>
+
+<div id="w-underflow"></div>
+
+<h3>The log-sum-exp trick</h3>
+<p>Softmax has the opposite problem: overflow. \(e^{z}\) exceeds the largest float16 (65,504) once \(z \gt 11.09\), float32 once \(z \gt 88.7\), float64 once \(z \gt 709.8\). Logits of 20 or 30 are routine. The fix uses the shift invariance from the previous section.</p>
+
+<div class="formula" data-name="Log-sum-exp and log-softmax">
+  <div class="tex">$$\log \sum_{j} e^{\htmlClass{t1}{z_j}} = \htmlClass{t2}{m} + \log \sum_{j} e^{\htmlClass{t1}{z_j} - \htmlClass{t2}{m}}, \qquad \htmlClass{t2}{m} = \max_j \htmlClass{t1}{z_j}, \qquad \htmlClass{t3}{\log p_i} = \htmlClass{t1}{z_i} - \operatorname{LSE}(\htmlClass{t1}{\mathbf{z}})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(z_j\)</dt><dd>logits</dd></div>
+    <div data-t="t2"><dt>\(m\)</dt><dd>the largest logit. Subtracting it makes every exponent \(\le 0\), so every \(e^{(\cdot)}\) lies in \((0, 1]\)</dd></div>
+    <div data-t="t3"><dt>\(\log p_i\)</dt><dd>log-softmax: the log-probability of token \(i\), computed without ever forming \(p_i\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Pull the biggest logit out front before exponentiating. Nothing overflows, because the largest exponent is \(e^0 = 1\), and at least one term is exactly 1, so the sum can't underflow to 0 either.</p>
+  <p class="why"><b>Why it matters</b><code>torch.logsumexp</code>, <code>F.log_softmax</code> and <code>F.cross_entropy</code> all do this internally. Writing <code>torch.log(torch.softmax(z))</code> yourself skips it and gives <code>-inf</code> as soon as any probability rounds to 0.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="mle">Maximum likelihood: what training optimizes</h2>
+
+<p>A model with parameters \(\theta\) assigns a probability \(p_\theta(x)\) to every possible text \(x\). Training has to choose \(\theta\). The standard answer, used by essentially every pretraining run: pick the parameters under which the training data was most probable.</p>
+
+<div class="formula" data-name="Maximum likelihood estimation">
+  <div class="tex">$$\htmlClass{t1}{\theta^\star} = \arg\max_{\htmlClass{t2}{\theta}} \sum_{i=1}^{\htmlClass{t3}{N}} \log p_{\htmlClass{t2}{\theta}}\big(\htmlClass{t4}{x^{(i)}}\big) = \arg\min_{\htmlClass{t2}{\theta}} \; -\frac{1}{\htmlClass{t3}{N}} \sum_{i=1}^{\htmlClass{t3}{N}} \log p_{\htmlClass{t2}{\theta}}\big(\htmlClass{t4}{x^{(i)}}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\theta^\star\)</dt><dd>the maximum-likelihood parameters</dd></div>
+    <div data-t="t2"><dt>\(\theta\)</dt><dd>all model parameters (billions of them for an LLM)</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>number of training examples. For an LM, count every token position</dd></div>
+    <div data-t="t4"><dt>\(x^{(i)}\)</dt><dd>one training example. For an LM, a token given its prefix: \(\log p_\theta(x_t \mid x_{\lt t})\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Make the observed data as unsurprising as possible. Maximizing the total log-probability is the same as minimizing the average negative log-probability, and that average is the number your training loop prints as "loss".</p>
+  <p class="why"><b>Why it matters</b>Logs turn a product over trillions of tokens into a sum, and a sum's gradient is the sum of per-token gradients. That's what lets you estimate it from a random minibatch and split it across GPUs.</p>
+</div>
+
+<figure class="fig"><div id="fig-mle"></div>
+<figcaption>Maximum likelihood for a coin. With 7 heads in 10 flips, the average log-likelihood \(0.7\log\theta + 0.3\log(1-\theta)\) peaks at \(\theta = 0.7\): the MLE is the observed frequency. The height of the peak, \(-0.611\) nats per flip, is minus the entropy of a 70/30 coin. Even the best model can't beat the data's own randomness. That fact comes back in the entropy and KL sections.</figcaption></figure>
+
+<!-- ================================================================== -->
+<h2 id="cross-entropy">Cross-entropy: the loss function</h2>
+
+<p>For a single position, the data says "the next token was \(y\)". The model says "here's my distribution \(q\)". The loss compares the two.</p>
+
+<div class="formula" data-name="Cross-entropy loss">
+  <div class="tex">$$\htmlClass{t1}{H(p, q)} = -\sum_{x} \htmlClass{t2}{p(x)}\,\log \htmlClass{t3}{q(x)} \quad\xrightarrow{\;p\ =\ \text{one-hot at } y\;}\quad \htmlClass{t4}{\mathcal{L}} = -\log \htmlClass{t3}{q(y)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(H(p,q)\)</dt><dd><b>cross-entropy</b> of model \(q\) measured against true distribution \(p\)</dd></div>
+    <div data-t="t2"><dt>\(p(x)\)</dt><dd>the target distribution. For next-token training it's one-hot: 1 on the actual token, 0 elsewhere</dd></div>
+    <div data-t="t3"><dt>\(q(x)\)</dt><dd>the model's softmax output</dd></div>
+    <div data-t="t4"><dt>\(\mathcal{L}\)</dt><dd>per-token loss: negative log-probability (NLL) of the correct token</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>With a one-hot target, every term but one is multiplied by zero. The loss is just "minus the log of the probability you gave the right answer". \(q(y) = 1\) costs 0. \(q(y) = 0.5\) costs 0.69 nats. \(q(y) = 0.01\) costs 4.6. \(q(y) \to 0\) costs \(\infty\).</p>
+  <p class="why"><b>Why it matters</b>Averaged over the dataset this is exactly the maximum-likelihood objective above. "Cross-entropy loss", "NLL", and "negative log-likelihood" are the same number in LM training.</p>
+</div>
+
+<p>The gradient of that loss with respect to the logits is unusually clean. Write \(\mathcal{L} = -z_y + \log\sum_j e^{z_j}\). The derivative of the second term with respect to \(z_i\) is \(e^{z_i}/\sum_j e^{z_j} = q_i\), and the first contributes \(-1\) only at \(i = y\).</p>
+
+<div class="formula" data-name="Gradient of softmax + cross-entropy">
+  <div class="tex">$$\frac{\partial \htmlClass{t1}{\mathcal{L}}}{\partial \htmlClass{t2}{z_i}} = \htmlClass{t3}{q_i} - \htmlClass{t4}{y_i}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}\)</dt><dd>cross-entropy loss for one position</dd></div>
+    <div data-t="t2"><dt>\(z_i\)</dt><dd>logit for token \(i\)</dd></div>
+    <div data-t="t3"><dt>\(q_i\)</dt><dd>model's probability for token \(i\) (softmax output)</dd></div>
+    <div data-t="t4"><dt>\(y_i\)</dt><dd>one-hot target: 1 for the true token, 0 otherwise</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Predicted minus actual. Gradient descent subtracts this, so it raises the correct token's logit by \(1 - q_y\) and lowers every wrong token's logit in proportion to how much probability it stole. Once the model is confident and right, the gradient goes to zero by itself.</p>
+  <p class="why"><b>Why it matters</b>This is the starting signal of backpropagation in every LLM (Module 04). The components always sum to zero, because the \(q_i\) sum to 1 and so do the \(y_i\). That matches shift invariance: pushing all logits up together does nothing.</p>
+</div>
+
+<div id="w-xent"></div>
+
+<div class="mle"><b>MLE angle · the first-step sanity check</b>
+<p>A freshly initialized model has logits near zero, so its softmax is close to uniform and its loss should be close to \(-\log(1/V) = \log V\): 10.82 for GPT-2's 50,257 tokens, 11.76 for Llama 3's 128,256. If step 0 prints 25, your init scale is too big. If it prints 0.3, you're probably leaking the targets into the inputs, usually through a missing shift or a missing causal mask.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="entropy">Entropy: how uncertain a distribution is</h2>
+
+<p>Define the <strong>surprise</strong> of an outcome as \(-\log p\). A certain event (\(p=1\)) is no surprise at all; a one-in-a-million event carries about 13.8 nats (19.9 bits). Entropy is the average surprise.</p>
+
+<div class="formula" data-name="Entropy">
+  <div class="tex">$$\htmlClass{t1}{H(p)} = -\sum_{x} \htmlClass{t2}{p(x)}\,\htmlClass{t3}{\log p(x)} \;\le\; \log \htmlClass{t4}{V}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(H(p)\)</dt><dd>entropy: expected surprise under \(p\)</dd></div>
+    <div data-t="t2"><dt>\(p(x)\)</dt><dd>probability of outcome \(x\). It's also the weight in the average</dd></div>
+    <div data-t="t3"><dt>\(\log p(x)\)</dt><dd>log-probability. Natural log gives <b>nats</b>, \(\log_2\) gives <b>bits</b>. 1 nat \(= 1/\ln 2 \approx 1.443\) bits</dd></div>
+    <div data-t="t4"><dt>\(V\)</dt><dd>number of possible outcomes. The maximum, \(\log V\), is reached only by the uniform distribution</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>How many yes/no questions (bits) you'd need, on average, to pin down the outcome. A one-hot distribution has entropy 0. A fair coin has 1 bit. Uniform over 8 tokens has 3 bits. Uniform over Llama 3's vocabulary has \(\log_2 128{,}256 \approx 16.97\) bits.</p>
+  <p class="why"><b>Why it matters</b>Cross-entropy is always at least entropy: \(H(p,q) \ge H(p)\). The entropy of natural text is a floor that no model's loss can go below. It's the "irreducible loss" term in scaling laws (Module 07).</p>
+</div>
+
+<div id="w-entropy"></div>
+
+<div class="intuition"><b>Intuition</b>
+<p>Entropy of the model's own next-token distribution is a useful runtime signal. After "The capital of France is", entropy is low because one token dominates. At the start of a creative story it's high. Some decoding methods and uncertainty detectors use exactly this number. Low entropy doesn't mean correct, though: a model can be confidently wrong.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="kl">KL divergence: distance between distributions</h2>
+
+<p>Cross-entropy mixes two things: the randomness that's in the data, and the extra cost of using the wrong distribution. KL divergence is just the extra cost.</p>
+
+<div class="formula" data-name="Kullback–Leibler divergence">
+  <div class="tex">$$D_{\mathrm{KL}}(\htmlClass{t1}{p} \,\Vert\, \htmlClass{t2}{q}) = \sum_x \htmlClass{t1}{p(x)} \log \frac{\htmlClass{t1}{p(x)}}{\htmlClass{t2}{q(x)}} = \htmlClass{t3}{H(p, q)} - \htmlClass{t4}{H(p)} \;\ge\; 0$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(p\)</dt><dd>the reference distribution. The average is taken over samples from \(p\)</dd></div>
+    <div data-t="t2"><dt>\(q\)</dt><dd>the approximating distribution</dd></div>
+    <div data-t="t3"><dt>\(H(p,q)\)</dt><dd>cross-entropy: average surprise when outcomes come from \(p\) but you score them with \(q\)</dd></div>
+    <div data-t="t4"><dt>\(H(p)\)</dt><dd>entropy of \(p\): the unavoidable part</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The extra nats per sample you pay for believing \(q\) when the truth is \(p\). It's zero only when \(q = p\). It is <em>not</em> symmetric: \(D_{\mathrm{KL}}(p\Vert q) \ne D_{\mathrm{KL}}(q\Vert p)\) in general, so it isn't a true distance.</p>
+  <p class="why"><b>Why it matters</b>Since \(H(p)\) of the data doesn't depend on the model, minimizing cross-entropy is the same as minimizing \(D_{\mathrm{KL}}(p_{\text{data}}\Vert q_\theta)\). Pretraining is KL minimization in the "forward" direction.</p>
+</div>
+
+<h3>The asymmetry matters</h3>
+<p>Look at where each direction puts its weight. Forward KL, \(D_{\mathrm{KL}}(p\Vert q)\), averages over samples from \(p\). Wherever \(p\) has mass and \(q\) has almost none, \(\log(p/q)\) explodes. So \(q\) is forced to cover <em>everything</em> \(p\) can do, even if that means putting mass in places \(p\) never goes. Reverse KL, \(D_{\mathrm{KL}}(q\Vert p)\), averages over samples from \(q\). Now the explosion happens wherever \(q\) puts mass that \(p\) lacks. So \(q\) stays where \(p\) is solid and is free to ignore whole modes.</p>
+
+<figure class="fig"><div id="fig-kl"></div>
+<figcaption>Fitting a single Gaussian \(q\) to a two-humped target \(p\). Minimizing forward KL gives the wide <em>mass-covering</em> fit: it matches \(p\)'s mean and variance, and puts its peak in the valley where \(p\) has almost nothing. Minimizing reverse KL gives the narrow <em>mode-seeking</em> fit: it locks onto one hump (or its mirror image) and ignores the other. Both fits are computed live in this page by numerical integration.</figcaption></figure>
+
+<div class="grid2">
+  <div class="card"><div class="k">Forward · \(D_{\mathrm{KL}}(p\Vert q)\)</div><h4>Mass-covering</h4><p>Used by maximum-likelihood pretraining and SFT, and by classic distillation (Hinton et al., 2015), where the student matches the teacher's softened probabilities on a fixed transfer set. A student too small to fit the teacher spreads probability over everything the teacher might say, and can end up generating text the teacher never would.</p></div>
+  <div class="card blue"><div class="k">Reverse · \(D_{\mathrm{KL}}(q\Vert p)\)</div><h4>Mode-seeking</h4><p>The RLHF penalty \(\beta\,D_{\mathrm{KL}}(\pi_\theta \Vert \pi_{\text{ref}})\) is in this direction: it's averaged over the policy's own samples and keeps the tuned model from drifting into text the reference finds absurd (Module 10). Some LLM distillation methods, such as MiniLLM (Gu et al., 2023), deliberately switch to reverse KL so a small student commits to the teacher's main modes.</p></div>
+</div>
+
+<div class="flag"><b>Estimating KL from samples</b>
+<p>RL libraries usually can't sum over the whole vocabulary for every token of every sampled response. Instead they estimate KL from the sampled tokens, e.g. \(\log \pi_\theta(x) - \log \pi_{\text{ref}}(x)\) per token. That single-sample estimate is unbiased but can be negative on any one sample, so don't be alarmed when a logged "KL" dips below zero. Different libraries use different estimators; check which one yours logs before comparing runs.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="perplexity">Perplexity</h2>
+
+<p>Loss in nats is the natural unit for optimization, but hard to feel. Perplexity turns it back into a count.</p>
+
+<div class="formula" data-name="Perplexity">
+  <div class="tex">$$\htmlClass{t1}{\text{PPL}} = e^{\htmlClass{t2}{\mathcal{L}}}, \qquad \htmlClass{t2}{\mathcal{L}} = -\frac{1}{\htmlClass{t3}{N}} \sum_{t=1}^{\htmlClass{t3}{N}} \htmlClass{t4}{\log p_\theta(x_t \mid x_{\lt t})}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>PPL</dt><dd>perplexity. Lower is better; 1 means perfect prediction</dd></div>
+    <div data-t="t2"><dt>\(\mathcal{L}\)</dt><dd>mean negative log-likelihood per token, in nats (the eval loss). With bits, use \(2^{\mathcal{L}}\) instead</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>number of predicted tokens in the evaluation text</dd></div>
+    <div data-t="t4"><dt>\(\log p_\theta(\cdot)\)</dt><dd>the model's log-probability for each actual next token</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The geometric mean of \(1/p\) over the tokens. If the model were choosing uniformly among \(k\) equally likely tokens at every step, its perplexity would be exactly \(k\). So perplexity is the <strong>effective branching factor</strong>: "as unsure as a fair \(k\)-sided die, on average".</p>
+  <p class="why"><b>Why it matters</b>The six-token sentence in Fig 03.2 has mean NLL 2.00 nats, so its perplexity is about 7.4. Because perplexity is exponential in loss, a fixed loss drop of 0.05 nats always cuts perplexity by the same ~4.9%, whether you start at 20 or at 5.</p>
+</div>
+
+<div id="w-ppl"></div>
+
+<div class="flag"><b>Only compare perplexities that share a tokenizer</b>
+<p>Perplexity is <em>per token</em>, and tokens differ between tokenizers. A tokenizer with bigger tokens covers the same text in fewer, harder predictions: higher loss per token, possibly lower loss per document. Two models with different vocabularies, or the same model on text in a language its tokenizer splits finely, can't be ranked by perplexity. Normalize by text length instead: <strong>bits per byte</strong> \(= \frac{\sum_t -\log_2 p(x_t\mid x_{\lt t})}{\text{number of UTF-8 bytes}}\) is tokenizer-independent. Chat templates, the eval text, and the context length all change perplexity too, so hold them fixed.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="sampling">Sampling primer: from distribution to text</h2>
+
+<p>A trained model gives you a distribution at each step. To actually write text, you have to pick a token, append it, and run again. Three basic choices:</p>
+<ul>
+  <li><strong>Greedy</strong> takes \(\arg\max_i p_i\) every time. It's deterministic and fine for short extraction answers, but on long outputs it tends to loop and repeat itself.</li>
+  <li><strong>Sampling</strong> draws the token at random with probability \(p_i\). Over many generations you reproduce the model's distribution, including its long tail of odd choices.</li>
+  <li><strong>Temperature</strong> rescales logits before the softmax. \(T \lt 1\) sharpens toward greedy (\(T \to 0\) <em>is</em> greedy), \(T \gt 1\) flattens toward uniform. It changes the distribution's entropy but never the ranking of tokens.</li>
+</ul>
+
+<figure class="fig wide"><svg viewBox="0 0 860 250" id="fig-decode"></svg>
+<figcaption>The same five logits (illustrative, after "I drank a cup of") turned into a distribution at four temperatures. Greedy decoding always picks " tea". At \(T = 1\) " wine" is sampled about one time in 37; at \(T = 1.5\), about one time in 17. Entropy under each panel shows how much randomness is left.</figcaption></figure>
+
+<p>Production decoders add truncation on top: <strong>top-k</strong> keeps the \(k\) most likely tokens, <strong>top-p</strong> (nucleus) keeps the smallest set whose probability reaches \(p\), <strong>min-p</strong> drops tokens below a fraction of the top probability. Then they renormalize and sample. All of these, plus repetition penalties and speculative decoding, are in <a href="08-inference.html#sampling">Module 08 · Sampling</a>.</p>
+
+<div class="pitfall"><b>Pitfall · "temperature 0" isn't always reproducible</b>
+<p>Greedy decoding is deterministic in math, but serving stacks batch your request with others, and floating-point sums in different orders can round differently. When two tokens are nearly tied, that's enough to flip the argmax and send the rest of the generation down a different path. Don't build tests that assume byte-identical outputs from an API at \(T = 0\).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Log-softmax and cross-entropy on [B, T, V] logits</h3>
+<p>A causal LM returns logits of shape <code>[batch, seq, vocab]</code>. The logits at position \(t\) predict the token at \(t+1\), so you shift before computing the loss. <code>F.cross_entropy</code> wants class scores on dimension 1, so the usual move is to flatten batch and sequence into one axis.</p>
+<div class="code" data-lang="python" data-title="loss_by_hand.py"><pre><code>
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+B, T, V = 2, 6, 50
+logits = torch.randn(B, T, V)              # model output: one score per vocab entry
+tokens = torch.randint(0, V, (B, T))       # the input token ids
+
+# position t predicts token t+1: drop the last logit, drop the first token
+pred = logits[:, :-1, :]                   # [B, T-1, V]
+target = tokens[:, 1:]                     # [B, T-1]
+
+# (a) by hand with log_softmax (uses log-sum-exp internally)
+logp = F.log_softmax(pred, dim=-1)                         # [B, T-1, V]
+nll = -logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)   # [B, T-1], one loss per token
+loss_manual = nll.mean()
+
+# (b) the library call: flatten to [N, V] logits and [N] targets
+loss = F.cross_entropy(pred.reshape(-1, V), target.reshape(-1))
+assert torch.allclose(loss, loss_manual, atol=1e-6)
+
+print(f"loss {loss.item():.4f} nats   uniform would be ln V = {torch.log(torch.tensor(float(V))).item():.4f}")
+print(f"perplexity {torch.exp(loss).item():.2f}")
+
+# padding: label it -100 and cross_entropy skips it (ignore_index=-100 by default)
+target_padded = target.clone()
+target_padded[1, -2:] = -100
+loss_masked = F.cross_entropy(pred.reshape(-1, V), target_padded.reshape(-1))
+print(f"masked loss {loss_masked.item():.4f} (mean over the {(target_padded != -100).sum().item()} real tokens)")
+
+# the gradient really is softmax minus one-hot
+z = torch.tensor([[2.0, 1.0, 0.1]], requires_grad=True)
+F.cross_entropy(z, torch.tensor([0])).backward()
+print(z.grad)                                       # tensor([[-0.3410,  0.2424,  0.0986]])
+print(torch.softmax(z, -1) - torch.tensor([1.0, 0.0, 0.0]))
+</code></pre></div>
+
+<h3>2. Underflow and log-sum-exp in three lines</h3>
+<div class="code" data-lang="python" data-title="why_logs.py"><pre><code>
+import torch
+
+p = torch.full((1000,), 0.1)
+print(torch.prod(p))                        # tensor(0.)          underflow
+print(torch.log(p).sum())                   # tensor(-2302.5850)  fine
+
+z = torch.tensor([1000.0, 999.0])
+print(torch.log(torch.exp(z).sum()))        # tensor(inf)         overflow
+print(torch.logsumexp(z, dim=0))            # tensor(1000.3133)   = 1000 + log(1 + e^-1)
+</code></pre></div>
+
+<h3>3. Perplexity of a Hugging Face causal LM on your own text</h3>
+<p>Passing <code>labels=input_ids</code> makes the model shift internally and return the mean NLL over the \(T-1\) predicted tokens. The second half recomputes it from the logits so you can see nothing magic is happening.</p>
+<div class="code" data-lang="python" data-title="perplexity.py"><pre><code>
+import math
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "Qwen/Qwen2.5-0.5B"                  # any causal LM works
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, device_map="auto")  # newer releases also accept dtype=
+model.eval()
+
+text = open("sample.txt", encoding="utf-8").read()
+ids = tok(text, return_tensors="pt").input_ids[:, :1024].to(model.device)  # stay within context
+
+with torch.no_grad():
+    out = model(ids, labels=ids)            # HF shifts labels by one internally
+
+nll = out.loss.item()                       # mean nats per predicted token
+print(f"tokens {ids.shape[1]}  loss {nll:.3f} nats  ({nll / math.log(2):.3f} bits)  ppl {math.exp(nll):.2f}")
+
+# same number from the logits by hand
+logits = out.logits[:, :-1].float()         # position t predicts token t+1
+target = ids[:, 1:]
+nll_manual = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+print(f"manual loss {nll_manual.item():.3f}")
+
+# tokenizer-independent: bits per UTF-8 byte of the predicted text (approximate)
+total_bits = nll_manual.item() * target.numel() / math.log(2)
+n_bytes = len(tok.decode(target[0]).encode("utf-8"))
+print(f"bits per byte {total_bits / n_bytes:.3f}")
+# Longer texts: slide a window with overlap and score only the new tokens in each window
+# (see the transformers docs page "Perplexity of fixed-length models").
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you can (1) reproduce <code>out.loss</code> from <code>out.logits</code> to three decimals, (2) show the step-0 loss of a randomly initialized small model is within a few tenths of \(\ln V\), and (3) put two models with <em>different</em> tokenizers on the same text in a table with columns <em>tokens · loss/token · perplexity · bits/byte</em>, then explain why the perplexity column ranks them differently from the bits/byte column (or doesn't).</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="03-main" data-title="Check yourself · Probability &amp; information">
+  <div class="q" data-answer="2"><p>A model outputs logits \((1,\ 1,\ 1 + \ln 2)\) over three tokens, at temperature 1. What are the probabilities?</p>
+    <ol><li>(0.33, 0.33, 0.33)</li><li>(0.30, 0.30, 0.40)</li><li>(0.25, 0.25, 0.50)</li><li>(0.21, 0.21, 0.58)</li></ol>
+    <div class="explain">Subtract 1 from every logit (allowed, softmax is shift-invariant): \((0, 0, \ln 2)\). Exponentiate: \((1, 1, 2)\). Divide by the sum, 4: \((0.25, 0.25, 0.5)\).</div></div>
+  <div class="q" data-answer="1"><p>The model gives the correct next token a probability of 0.25. What is the cross-entropy loss on that token?</p>
+    <ol><li>0.25 nats</li><li>1.39 nats, which is exactly 2 bits</li><li>0.75 nats</li><li>4 nats</li></ol>
+    <div class="explain">\(-\ln 0.25 = \ln 4 \approx 1.386\) nats, and \(-\log_2 0.25 = 2\) bits. It's the same surprise as guessing among 4 equally likely options. 0.75 is \(1 - p\), which is the size of the gradient on the target logit, not the loss.</div></div>
+  <div class="q" data-answer="3"><p>Your eval loss is 2.3 nats per token. Roughly what is the perplexity?</p>
+    <ol><li>2.3</li><li>4.6</li><li>0.1</li><li>About 10</li></ol>
+    <div class="explain">\(e^{2.3} \approx 9.97\). On average the model is as unsure as a uniform choice among about 10 tokens. 0.1 is \(e^{-2.3}\), the geometric-mean probability of the correct token.</div></div>
+  <div class="q" data-answer="0"><p>You initialize a model with the GPT-2 vocabulary (50,257 tokens) and near-zero logits. What should the loss be on the very first step?</p>
+    <ol><li>About 10.8</li><li>About 0.69</li><li>About 1.0</li><li>About 50,257</li></ol>
+    <div class="explain">Near-zero logits give a near-uniform softmax, so the loss is \(-\ln(1/V) = \ln 50{,}257 \approx 10.82\), the entropy of the uniform distribution. 50,257 would be the perplexity, not the loss. A very different number at step 0 usually means a bug.</div></div>
+  <div class="q" data-answer="2"><p>You fit a single Gaussian \(q\) to a target \(p\) that has two well-separated humps, by minimizing \(D_{\mathrm{KL}}(q \Vert p)\) (reverse KL). What do you get?</p>
+    <ol><li>A wide Gaussian covering both humps</li><li>Exactly \(p\)</li><li>A narrow Gaussian sitting on one hump</li><li>A narrow Gaussian in the valley between the humps</li></ol>
+    <div class="explain">Reverse KL averages over samples from \(q\) and is huge wherever \(q\) puts mass that \(p\) lacks, so \(q\) avoids the valley and commits to one mode. A single Gaussian can't equal a two-hump mixture. The wide, mass-covering fit is what forward KL \(D_{\mathrm{KL}}(p\Vert q)\) gives you.</div></div>
+  <div class="q" data-answer="3"><p>After softmax the model's probabilities are \((0.7, 0.2, 0.1)\), and the true token is the second one. What is \(\partial\mathcal{L}/\partial\mathbf{z}\)?</p>
+    <ol><li>(0.7, 0.8, 0.1)</li><li>(−0.7, 0.8, −0.1)</li><li>(0, −0.8, 0)</li><li>(0.7, −0.8, 0.1)</li></ol>
+    <div class="explain">\(\mathbf{q} - \mathbf{y} = (0.7, 0.2, 0.1) - (0, 1, 0) = (0.7, -0.8, 0.1)\). The components sum to 0. A descent step raises the true token's logit and lowers the others, mostly the first one, which took the most probability.</div></div>
+  <div class="q" data-answer="1"><p>On the same English test file, model A (32K-token vocabulary) has perplexity 9 and model B (128K-token vocabulary) has perplexity 12. Which model predicts the text better?</p>
+    <ol><li>A, because lower perplexity always wins</li><li>You can't tell from these numbers. Compare total NLL per byte or per character instead</li><li>B, because a larger vocabulary is always better</li><li>They're equivalent, since 9 and 12 are close</li></ol>
+    <div class="explain">B's tokens are probably longer, so it makes fewer predictions over the same text, each one harder. Per-token perplexity penalizes that. Total NLL divided by the number of bytes (bits per byte) puts both on the same scale.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, seg, select, stats, plot, bars, widget, fmtNum, rng, palette, clamp, softmax } = C;
+  const LN2 = Math.LN2;
+  const entropyOf = p => -p.reduce((a, v) => a + (v > 0 ? v * Math.log(v) : 0), 0);
+  const gauss = (x, m, s) => Math.exp(-((x - m) ** 2) / (2 * s * s)) / (s * Math.sqrt(2 * Math.PI));
+
+  /* ---------------------------------------------------------- categorical figure */
+  (function () {
+    const host = document.getElementById("fig-cat");
+    const B = bars(host, { width: 760, height: 230, horizontal: true, labelWidth: 190, max: 1 });
+    const labels = ['" Paris"', '" a"', '" the"', '" located"', '" known"', "128,251 others"];
+    const vals = [0.82, 0.05, 0.04, 0.03, 0.02, 0.04];
+    B.draw(labels, vals, { max: 1, colors: vals.map((_, i) => i === 0 ? palette.green : i === 5 ? palette.faint : palette.blue), fmt: v => v.toFixed(2) });
+  })();
+
+  /* ---------------------------------------------------------- Gaussian widget */
+  (function () {
+    const w = widget("w-gauss", { title: "A Gaussian and 5,000 samples drawn from it", kicker: "Interactive", note: "Gold: histogram of 5,000 fixed standard-normal draws, shifted and stretched as \\(x = \\mu + \\sigma z\\). Shaded bands: \\(\\mu \\pm \\sigma\\) and \\(\\mu \\pm 2\\sigma\\). The empirical fractions wobble around 68.3% and 95.4% because the sample is finite. Real initializations use tiny \\(\\sigma\\) (GPT-2: 0.02); the shape is identical, only the axis labels change." });
+    const R = rng(3), N = 5000;
+    const Z = Array.from({ length: N }, () => R.normal());
+    const mu = slider(w.controls, { label: "Mean μ", min: -3, max: 3, step: 0.05, value: 0, fmt: v => v.toFixed(2), onInput: draw });
+    const sg = slider(w.controls, { label: "Std dev σ", min: 0.2, max: 2.5, step: 0.05, value: 1, fmt: v => v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 300, x: [-7, 7], y: [0, 0.5], xlabel: "x", ylabel: "density p(x)", yfmt: v => (+v.toFixed(2)).toString() });
+    const set = stats(w.body, [{ key: "in1", label: "Samples within ±1σ" }, { key: "in2", label: "Samples within ±2σ" }, { key: "peak", label: "Peak density" }, { key: "emp", label: "Sample mean / std" }]);
+    function draw() {
+      const m = mu.value, s = sg.value;
+      const pdf = x => gauss(x, m, s);
+      const peak = pdf(m);
+      P.y = [0, peak * 1.3];
+      const nb = 64, lo = m - 4 * s, bw = 8 * s / nb;
+      const cnt = new Array(nb).fill(0);
+      let in1 = 0, in2 = 0, sum = 0, sum2 = 0;
+      Z.forEach(z => {
+        const x = m + s * z, b = Math.floor((x - lo) / bw);
+        if (b >= 0 && b < nb) cnt[b]++;
+        if (Math.abs(z) <= 1) in1++;
+        if (Math.abs(z) <= 2) in2++;
+        sum += x; sum2 += x * x;
+      });
+      const step = [];
+      cnt.forEach((c, i) => { const h = c / (N * bw); step.push([lo + i * bw, h], [lo + (i + 1) * bw, h]); });
+      const top = peak * 1.3;
+      P.draw([
+        { band: [m - 2 * s, m + 2 * s], color: palette.green, opacity: 0.07 },
+        { band: [m - s, m + s], color: palette.green, opacity: 0.13 },
+        { points: step, color: palette.gold, width: 1, area: true, areaOpacity: 0.28, label: "histogram of samples" },
+        { fn: pdf, color: palette.ink, width: 2.2, label: "pdf  N(x; μ, σ²)" },
+        { vline: m, color: palette.muted, label: "μ" },
+        { text: [6.8, top * 0.9], label: "inner band ±1σ ≈ 68.3%", anchor: "end", color: palette.green },
+        { text: [6.8, top * 0.82], label: "outer band ±2σ ≈ 95.4%", anchor: "end", color: palette.green }
+      ]);
+      const em = sum / N, es = Math.sqrt(sum2 / N - em * em);
+      set("in1", fmtNum(100 * in1 / N, 1) + "%", null, "theory 68.27%");
+      set("in2", fmtNum(100 * in2 / N, 1) + "%", null, "theory 95.45%");
+      set("peak", peak.toFixed(3), peak > 1 ? "warn" : null, peak > 1 ? "above 1: densities aren't probabilities" : "1 / (σ√2π)");
+      set("emp", em.toFixed(2) + " / " + es.toFixed(2), null, "estimates of μ and σ");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- chain-rule figure */
+  (function () {
+    const s = document.getElementById("fig-chain");
+    const toks = ["The", "cat", "sat", "on", "the", "mat"];
+    const ps = [0.05, 0.01, 0.15, 0.6, 0.7, 0.2];
+    const x0 = 160, cw = 110, bw = 88;
+    const cx = i => x0 + i * cw + bw / 2;
+    const T = (x, y, t, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, "text-anchor": "middle", text: t }, o || {})));
+    const left = (y, t) => T(20, y, t, { "text-anchor": "start", fill: palette.muted, class: "mono", "font-size": 11.5 });
+    left(49, "tokens x_t");
+    toks.forEach((t, i) => {
+      s.appendChild(svg("rect", { x: x0 + i * cw, y: 28, width: bw, height: 32, rx: 6, fill: "#fbfaf7", stroke: "rgba(28,27,25,.3)" }));
+      T(cx(i), 49, t, { "font-size": 14, class: "mono" });
+    });
+    left(86, "context x_<t");
+    left(100, "→ predict x_t");
+    ps.forEach((p, i) => {
+      const y = 80 + i * 13;
+      if (i > 0) s.appendChild(svg("line", { x1: x0 + 4, x2: x0 + (i - 1) * cw + bw - 4, y1: y, y2: y, stroke: palette.muted, "stroke-width": 4, "stroke-linecap": "round", opacity: 0.45 }));
+      else s.appendChild(svg("text", { x: x0 - 6, y: y + 4, "text-anchor": "end", "font-size": 10, class: "mono", fill: palette.muted, text: "⟨s⟩" }));
+      s.appendChild(svg("circle", { cx: cx(i), cy: y, r: 4.5, fill: palette.green }));
+    });
+    const base = 252, hmax = 70;
+    left(base - hmax / 2, "P(x_t | x_<t)");
+    left(base + 18, "−ln P");
+    let lsum = 0;
+    ps.forEach((p, i) => {
+      const h = hmax * p;
+      lsum += -Math.log(p);
+      s.appendChild(svg("rect", { x: cx(i) - 18, y: base - hmax, width: 36, height: hmax, rx: 3, fill: "rgba(28,27,25,.05)" }));
+      s.appendChild(svg("rect", { x: cx(i) - 18, y: base - h, width: 36, height: Math.max(h, 1), rx: 3, fill: palette.green, opacity: 0.85 }));
+      T(cx(i), base - h - 6, String(p), { class: "mono", "font-size": 11.5 });
+      T(cx(i), base + 18, (-Math.log(p)).toFixed(2), { class: "mono", "font-size": 11.5, fill: palette.brick });
+      if (i < ps.length - 1) T(x0 + i * cw + bw + (cw - bw) / 2, base - 20, "×", { "font-size": 16, fill: palette.muted });
+    });
+    const prod = ps.reduce((a, b) => a * b, 1);
+    const [mant, ex] = prod.toExponential(1).split("e");
+    T(430, 300, `P(sentence) = ${ps.join(" × ")} = ${mant} × 10^${ex}`, { class: "mono", "font-size": 12.5 });
+    const mean = lsum / ps.length;
+    T(430, 324, `−ln P(sentence) ≈ ${lsum.toFixed(2)} nats  ·  mean ${mean.toFixed(2)} nats/token  ·  perplexity e^${mean.toFixed(2)} ≈ ${Math.exp(mean).toFixed(1)}`, { class: "mono", "font-size": 12.5, fill: palette.brick });
+  })();
+
+  /* ---------------------------------------------------------- softmax widget */
+  (function () {
+    const w = widget("w-softmax", { title: "Softmax: six logits, one temperature", kicker: "Interactive", note: "Next-token candidates after \"I drank a cup of\" (illustrative logits). Press <b>+1 to every logit</b> a few times: the logit readouts change, the bars don't. Then drag temperature: low T piles everything on the top token, high T spreads it toward uniform (1/6 ≈ 0.167 each)." });
+    const toks = [" tea", " coffee", " water", " milk", " wine", " soup"];
+    const init = [3.0, 2.6, 1.4, 0.9, 0.1, -1.2];
+    const z = init.slice();
+    let shift = 0;
+    const sl = toks.map((t, i) => slider(w.controls, { label: "logit z ·" + t, min: -8, max: 8, step: 0.1, value: init[i], fmt: v => v.toFixed(1), onInput: v => { z[i] = v; draw(); } }));
+    const T = slider(w.controls, { label: "Temperature T", min: 0.05, max: 3, step: 0.05, value: 1, fmt: v => v.toFixed(2), onInput: draw });
+    const row = el("div", { class: "btnrow" });
+    const shiftAll = d => {
+      if (z.some(v => v + d > 8 || v + d < -8)) return;
+      z.forEach((v, i) => { z[i] = +(v + d).toFixed(1); sl[i].value = z[i]; });
+      shift += d; draw();
+    };
+    row.appendChild(el("button", { class: "btn", text: "+1 to every logit", onclick: () => shiftAll(1) }));
+    row.appendChild(el("button", { class: "btn", text: "−1 to every logit", onclick: () => shiftAll(-1) }));
+    row.appendChild(el("button", { class: "btn", text: "reset", onclick: () => { init.forEach((v, i) => { z[i] = v; sl[i].value = v; }); T.value = 1; shift = 0; draw(); } }));
+    w.controls.appendChild(row);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 250, max: 1 });
+    const set = stats(w.body, [{ key: "top", label: "Top token" }, { key: "ratio", label: "p(1st) / p(2nd)" }, { key: "H", label: "Entropy" }, { key: "shift", label: "Constant added" }]);
+    function draw() {
+      const t = T.value, p = softmax(z, t);
+      const order = p.map((v, i) => i).sort((a, b) => p[b] - p[a]);
+      const a = order[0], b = order[1];
+      B.draw(toks, p, { max: 1, colors: p.map((_, i) => i === a ? palette.green : palette.blue), fmt: v => v.toFixed(3) });
+      set("top", toks[a].trim() + " · " + p[a].toFixed(3), null, "Σp = " + p.reduce((x, y) => x + y, 0).toFixed(3));
+      set("ratio", fmtNum(p[a] / p[b], 2) + "×", null, `e^((${z[a].toFixed(1)} − ${z[b].toFixed(1)}) / ${t.toFixed(2)})`);
+      const H = entropyOf(p) / LN2;
+      set("H", H.toFixed(2) + " bits", null, "max log₂6 = 2.58");
+      set("shift", (shift >= 0 ? "+" : "") + shift, shift !== 0 ? "good" : null, shift !== 0 ? "bars unchanged" : "try the buttons");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- underflow widget */
+  (function () {
+    const w = widget("w-underflow", { title: "Multiply probabilities and watch them vanish", kicker: "Interactive", note: "Each step multiplies by the same per-token probability p (think of it as the geometric mean; a model at loss 2 nats has p ≈ e⁻² ≈ 0.135). The fp32 and fp64 products are computed for real, one multiplication at a time. The fp16 count is estimated from its smallest subnormal, 2⁻²⁴ ≈ 6×10⁻⁸. The sum of logs never has a problem." });
+    const ns = slider(w.controls, { label: "Tokens N", min: 1, max: 2000, step: 1, value: 1000, fmt: v => String(v), onInput: draw });
+    const ps = slider(w.controls, { label: "Per-token probability p", min: 0.01, max: 0.99, step: 0.01, value: 0.13, fmt: v => v.toFixed(2) + "  (−ln p = " + (-Math.log(v)).toFixed(2) + ")", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 280, x: [0, 1000], y: [-1000, 0], xlabel: "tokens multiplied so far", ylabel: "log₁₀ of the product", margin: { l: 62 } });
+    const set = stats(w.body, [{ key: "f16", label: "float16 product" }, { key: "f32", label: "float32 product" }, { key: "f64", label: "float64 product" }, { key: "log", label: "Sum of logs" }]);
+    function draw() {
+      const N = ns.value, p = ps.value, l10 = Math.log10(p);
+      let a32 = 1, a64 = 1, die32 = null, die64 = null, lsum32 = 0;
+      const p32 = Math.fround(p), lp32 = Math.fround(Math.log(p));
+      for (let t = 1; t <= N; t++) {
+        a32 = Math.fround(a32 * p32); a64 = a64 * p;
+        lsum32 = Math.fround(lsum32 + lp32);
+        if (a32 === 0 && die32 == null) die32 = t;
+        if (a64 === 0 && die64 == null) die64 = t;
+      }
+      const die16raw = Math.ceil(Math.log(2 ** -25) / Math.log(p));
+      const die16 = die16raw <= N ? die16raw : null;
+      const ylo = Math.min(N * l10, -340) * 1.06;
+      P.x = [0, N]; P.y = [ylo, 0];
+      const layers = [
+        { fn: t => t * l10, color: palette.green, width: 2.2, label: "true value: N · log₁₀ p" },
+        { hline: Math.log10(1.4e-45), color: palette.gold, label: "fp32 smallest > 0 (1.4e−45)" },
+        { hline: Math.log10(4.9e-324), color: palette.brick, label: "fp64 smallest > 0 (4.9e−324)" }
+      ];
+      if (die32) layers.push({ vline: die32, color: palette.gold, label: "fp32 → 0" });
+      if (die64) layers.push({ vline: die64, color: palette.brick, label: "fp64 → 0" });
+      P.draw(layers);
+      const show = (v, t) => v === 0 ? ["0 (underflow)", "bad", "hit zero at token " + t] : [v.toExponential(2), "good", "still representable"];
+      set("f16", die16 ? "0 (underflow)" : (p ** N).toExponential(2), die16 ? "bad" : "good", die16 ? "after ~" + die16 + " tokens" : "still representable");
+      const s32 = show(a32, die32), s64 = show(a64, die64);
+      set("f32", s32[0], s32[1], s32[2]);
+      set("f64", s64[0], s64[1], s64[2]);
+      set("log", "ln P = " + lsum32.toFixed(1), "good", "= 10^" + (N * l10).toFixed(0) + " (fp32 sum)");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- MLE figure */
+  (function () {
+    const host = document.getElementById("fig-mle");
+    const P = plot(host, { width: 760, height: 280, x: [0.01, 0.99], y: [-2.4, -0.4], xlabel: "θ = model's probability of heads", ylabel: "mean log-likelihood per flip", xticks: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1] });
+    const ll = (k, n) => th => (k / n) * Math.log(th) + (1 - k / n) * Math.log(1 - th);
+    const h7 = -(0.7 * Math.log(0.7) + 0.3 * Math.log(0.3));
+    P.draw([
+      { fn: ll(7, 10), color: palette.green, width: 2.4, label: "data: 7 heads / 10 flips" },
+      { fn: ll(5, 10), color: palette.blue, width: 1.8, dash: "5 4", label: "data: 5 heads / 10 flips" },
+      { vline: 0.7, color: palette.green, label: "θ* = 0.7" },
+      { marker: [0.7, -h7], color: palette.green, label: "−" + h7.toFixed(3) + " = −H(0.7)" },
+      { marker: [0.5, -Math.LN2], color: palette.blue, label: "−0.693 = −ln 2" }
+    ]);
+  })();
+
+  /* ---------------------------------------------------------- cross-entropy widget */
+  (function () {
+    const w = widget("w-xent", { title: "Cross-entropy loss and its gradient", kicker: "Interactive", note: "Context: \"The Eiffel Tower is in\". Pick which token actually came next, then move the logits. Top: softmax probabilities (green = target). Middle: the gradient q − y that backprop sends into each logit. Bottom: the loss curve −ln p, with your target's position marked. <b>Take a step</b> applies z ← z − 1.0 · (q − y) and shows the loss falling." });
+    const toks = [" Paris", " France", " Europe", " London", " the", " a"];
+    const init = [2.0, 1.5, 0.5, 0.8, 0.2, -0.5];
+    const z = init.slice();
+    let target = 0;
+    select(w.controls, { label: "True next token (target)", options: toks.map((t, i) => ({ value: String(i), label: t.trim() })), value: "0", onChange: v => { target = +v; draw(); } });
+    const sl = toks.map((t, i) => slider(w.controls, { label: "logit z ·" + t, min: -8, max: 8, step: 0.1, value: init[i], fmt: v => v.toFixed(1), onInput: v => { z[i] = v; draw(); } }));
+    const row = el("div", { class: "btnrow" });
+    row.appendChild(el("button", { class: "btn primary", text: "take one gradient step", onclick: () => {
+      const q = softmax(z);
+      z.forEach((v, i) => { z[i] = clamp(+(v - (q[i] - (i === target ? 1 : 0))).toFixed(2), -8, 8); sl[i].value = z[i]; });
+      draw();
+    } }));
+    row.appendChild(el("button", { class: "btn", text: "reset logits", onclick: () => { init.forEach((v, i) => { z[i] = v; sl[i].value = v; }); draw(); } }));
+    w.controls.appendChild(row);
+    const wrap1 = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap1);
+    const Bp = bars(wrap1, { width: 760, height: 200, max: 1 });
+    w.body.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 4px" }, text: "Gradient ∂L/∂z = q − y (negative = descent pushes this logit up):" }));
+    const wrap2 = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap2);
+    const Bg = bars(wrap2, { width: 760, height: 170, max: 1 });
+    const wrap3 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap3);
+    const P = plot(wrap3, { width: 760, height: 220, x: [0, 1], y: [0, 6], xlabel: "probability given to the target, q(y)", ylabel: "loss −ln q(y)" });
+    const set = stats(w.body, [{ key: "p", label: "q(target)" }, { key: "nats", label: "Loss" }, { key: "bits", label: "Loss in bits" }, { key: "g", label: "∂L/∂z(target)" }]);
+    function draw() {
+      const q = softmax(z);
+      const g = q.map((v, i) => v - (i === target ? 1 : 0));
+      Bp.draw(toks, q, { max: 1, colors: q.map((_, i) => i === target ? palette.green : palette.blue), fmt: v => v.toFixed(3) });
+      Bg.draw(toks, g, { max: 1, colors: g.map((_, i) => i === target ? palette.green : palette.brick), fmt: v => (v >= 0 ? "+" : "") + v.toFixed(3) });
+      const pt = q[target], L = -Math.log(pt);
+      P.draw([
+        { fn: x => -Math.log(x), color: palette.ink, width: 2, samples: 300 },
+        { hline: Math.log(6), color: palette.muted, label: "uniform over 6: ln 6 = 1.79" },
+        { marker: [pt, Math.min(L, 5.9)], color: palette.green, label: "loss " + L.toFixed(2) }
+      ]);
+      set("p", pt.toFixed(3), pt > 0.5 ? "good" : pt > 0.15 ? "warn" : "bad", "softmax output");
+      set("nats", L.toFixed(3) + " nats", pt > 0.5 ? "good" : pt > 0.15 ? "warn" : "bad", "−ln q(y)");
+      set("bits", (L / LN2).toFixed(3) + " bits", null, "−log₂ q(y)");
+      set("g", g[target].toFixed(3), null, "q(y) − 1; Σ over all = " + Math.abs(g.reduce((a, b) => a + b, 0)).toFixed(3));
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- entropy widget */
+  (function () {
+    const w = widget("w-entropy", { title: "Entropy of a next-token distribution", kicker: "Interactive", note: "A Zipf-shaped distribution, p_k ∝ 1/k^s, over V tokens. s = 0 is uniform, which gives the maximum entropy log V. Large s is nearly one-hot, with entropy near 0. \"Effective choices\" is e^H (or 2^H in bits): the number of equally likely tokens with the same entropy. That's the perplexity of this distribution." });
+    let unit = "bits";
+    const Vs = slider(w.controls, { label: "Vocabulary size V", min: 2, max: 64, step: 1, value: 16, fmt: v => String(v), onInput: draw });
+    const ss = slider(w.controls, { label: "Sharpness s", min: 0, max: 6, step: 0.05, value: 1, fmt: v => v.toFixed(2), onInput: draw });
+    const cu = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Units" })));
+    seg(cu, { options: [{ value: "bits", label: "bits (log₂)" }, { value: "nats", label: "nats (ln)" }], value: "bits", onChange: v => { unit = v; draw(); } });
+    w.controls.appendChild(cu);
+    const row = el("div", { class: "btnrow" });
+    row.appendChild(el("button", { class: "btn", text: "uniform", onclick: () => { ss.value = 0; draw(); } }));
+    row.appendChild(el("button", { class: "btn", text: "nearly one-hot", onclick: () => { ss.value = 6; draw(); } }));
+    w.controls.appendChild(row);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 220 });
+    const set = stats(w.body, [{ key: "H", label: "Entropy H" }, { key: "max", label: "Maximum log V" }, { key: "frac", label: "H / log V" }, { key: "eff", label: "Effective choices" }]);
+    function draw() {
+      const V = Vs.value, s = ss.value;
+      const raw = Array.from({ length: V }, (_, k) => 1 / Math.pow(k + 1, s));
+      const Z = raw.reduce((a, b) => a + b, 0);
+      const p = raw.map(v => v / Z);
+      const Hn = entropyOf(p);
+      const k = unit === "bits" ? 1 / LN2 : 1;
+      const labels = p.map((_, i) => (V <= 16 || i % 4 === 0) ? String(i + 1) : "");
+      B.draw(labels, p, { max: Math.max(p[0], 0.05), colors: p.map((_, i) => i === 0 ? palette.green : palette.blue), fmt: v => v.toFixed(2) });
+      set("H", (Hn * k).toFixed(3) + " " + unit, null, unit === "bits" ? (Hn).toFixed(3) + " nats" : (Hn / LN2).toFixed(3) + " bits");
+      set("max", (Math.log(V) * k).toFixed(3) + " " + unit, null, "uniform over " + V);
+      const fr = Hn / Math.log(V);
+      set("frac", fmtNum(100 * fr, 1) + "%", null, fr > 0.8 ? "close to uniform" : fr < 0.2 ? "confident" : "");
+      set("eff", fmtNum(Math.exp(Hn), 2), null, "e^H tokens, out of " + V);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- KL asymmetry figure */
+  (function () {
+    const host = document.getElementById("fig-kl");
+    const m1 = -2, m2 = 2, s0 = 0.6;
+    const p = x => 0.5 * gauss(x, m1, s0) + 0.5 * gauss(x, m2, s0);
+    const xs = [], dx = 0.02;
+    for (let x = -9; x <= 9; x += dx) xs.push(x);
+    const px = xs.map(p);
+    const kl = (a, b) => { let s = 0; for (let i = 0; i < xs.length; i++) { if (a[i] < 1e-300) continue; s += a[i] * Math.log(a[i] / Math.max(b[i], 1e-300)) * dx; } return s; };
+    // forward KL(p||q) over Gaussians is minimized by moment matching
+    const muF = 0, sdF = Math.sqrt(s0 * s0 + 0.5 * (m1 * m1 + m2 * m2));
+    const qF = xs.map(x => gauss(x, muF, sdF));
+    // reverse KL(q||p): grid search (restrict to μ ≥ 0; the mirror solution at μ < 0 is equally good)
+    let best = { v: Infinity };
+    for (let mu = 0; mu <= 3.001; mu += 0.05) for (let sd = 0.3; sd <= 3.001; sd += 0.02) {
+      const q = xs.map(x => gauss(x, mu, sd));
+      const v = kl(q, px);
+      if (v < best.v) best = { v, mu, sd };
+    }
+    const qR = xs.map(x => gauss(x, best.mu, best.sd));
+    const fwdOnF = kl(px, qF), revOnR = best.v, revOnF = kl(qF, px), fwdOnR = kl(px, qR);
+    const P = plot(host, { width: 760, height: 320, x: [-6, 6], y: [0, 0.8], xlabel: "x", ylabel: "density", yfmt: v => (+v.toFixed(1)).toString() });
+    P.draw([
+      { fn: p, color: palette.ink, width: 2, area: true, areaOpacity: 0.1, label: "target p: two-hump mixture" },
+      { fn: x => gauss(x, muF, sdF), color: palette.blue, width: 2.2, dash: "6 4", label: `forward KL(p‖q) fit: μ = ${muF.toFixed(2)}, σ = ${sdF.toFixed(2)}` },
+      { fn: x => gauss(x, best.mu, best.sd), color: palette.brick, width: 2.2, label: `reverse KL(q‖p) fit: μ = ${best.mu.toFixed(2)}, σ = ${best.sd.toFixed(2)}` },
+      { text: [0, 0.235], label: "forward fit puts its peak here,", anchor: "middle", color: palette.blue },
+      { text: [0, 0.205], label: "where p is nearly empty", anchor: "middle", color: palette.blue },
+      { text: [-2, 0.42], label: "ignored by the reverse fit", anchor: "middle", color: palette.brick },
+      { text: [-5.85, 0.57], label: `forward fit: KL(p‖q) = ${fwdOnF.toFixed(2)}, KL(q‖p) = ${revOnF.toFixed(2)}`, anchor: "start", color: palette.blue },
+      { text: [-5.85, 0.53], label: `reverse fit: KL(p‖q) = ${fwdOnR.toFixed(1)}, KL(q‖p) = ${revOnR.toFixed(2)}`, anchor: "start", color: palette.brick },
+      { text: [-5.85, 0.49], label: "(nats; each fit wins its own objective)", anchor: "start", color: palette.muted }
+    ]);
+  })();
+
+  /* ---------------------------------------------------------- perplexity widget */
+  (function () {
+    const w = widget("w-ppl", { title: "Loss ↔ perplexity", kicker: "Calculator", note: "Perplexity grows exponentially with loss, so this plot uses a log scale on the vertical axis. A constant Δloss is always the same <em>percentage</em> drop in perplexity, 1 − e^(−Δ). The dashed line at 50,257 is the perplexity of a uniform guess over GPT-2's vocabulary, i.e. an untrained model." });
+    const L = slider(w.controls, { label: "Eval loss (mean NLL, nats/token)", min: 0, max: 11, step: 0.01, value: 2.0, fmt: v => v.toFixed(2), onInput: draw });
+    const D = slider(w.controls, { label: "Improvement Δloss", min: 0, max: 0.5, step: 0.01, value: 0.05, fmt: v => v.toFixed(2) + " nats", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 280, x: [0, 11.5], y: [1, 2e5], logy: true, xlabel: "loss (nats/token)", ylabel: "perplexity", yfmt: v => v >= 1e3 ? fmtNum(v / 1e3, 0) + "K" : String(v) });
+    const set = stats(w.body, [{ key: "ppl", label: "Perplexity" }, { key: "bits", label: "Bits per token" }, { key: "after", label: "Perplexity after Δ" }, { key: "rel", label: "Relative change" }]);
+    function draw() {
+      const l = L.value, d = Math.min(D.value, l), a = Math.exp(l), b = Math.exp(l - d);
+      P.draw([
+        { fn: x => Math.exp(x), color: palette.green, width: 2.2, label: "PPL = e^loss" },
+        { hline: 50257, color: palette.muted, label: "uniform over 50,257 tokens (loss 10.82)" },
+        { marker: [l, a], color: palette.ink, label: "PPL " + fmtNum(a, a < 100 ? 2 : 0) },
+        { marker: [l - d, b], color: palette.green, r: 4 }
+      ]);
+      set("ppl", fmtNum(a, a < 100 ? 2 : 0), null, "like a fair " + fmtNum(a, a < 10 ? 1 : 0) + "-way choice");
+      set("bits", (l / LN2).toFixed(3), null, "loss ÷ ln 2");
+      set("after", fmtNum(b, b < 100 ? 2 : 0), "good", "loss " + (l - d).toFixed(2));
+      set("rel", "−" + fmtNum(100 * (1 - Math.exp(-d)), 1) + "%", null, "1 − e^(−" + d.toFixed(2) + "), independent of the start");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- decoding / temperature figure */
+  (function () {
+    const s = document.getElementById("fig-decode");
+    const toks = ["tea", "coffee", "water", "milk", "wine"];
+    const z = [3.0, 2.6, 1.4, 0.9, 0.1];
+    const panels = [["greedy (T → 0)", 0], ["T = 0.5", 0.5], ["T = 1.0", 1], ["T = 1.5", 1.5]];
+    const pw = 200, gap = 13, base = 190, hmax = 130, bw = 28, step = 37;
+    panels.forEach(([title, T], k) => {
+      const px = 14 + k * (pw + gap);
+      s.appendChild(svg("rect", { x: px, y: 8, width: pw, height: 236, rx: 10, fill: "#fbfaf7", stroke: "rgba(28,27,25,.14)" }));
+      s.appendChild(svg("text", { x: px + pw / 2, y: 30, "text-anchor": "middle", "font-size": 13, "font-weight": 600, fill: palette.ink, text: title }));
+      const p = T === 0 ? z.map((_, i) => i === 0 ? 1 : 0) : softmax(z, T);
+      s.appendChild(svg("line", { x1: px + 8, x2: px + pw - 8, y1: base, y2: base, stroke: palette.ink }));
+      p.forEach((v, i) => {
+        const bx = px + 10 + i * step, h = hmax * v;
+        s.appendChild(svg("rect", { x: bx, y: base - h, width: bw, height: Math.max(h, 0.5), rx: 2, fill: i === 0 ? palette.green : palette.blue, opacity: 0.85 }));
+        s.appendChild(svg("text", { x: bx + bw / 2, y: base - h - 4, "text-anchor": "middle", "font-size": 9.5, class: "mono", fill: palette.muted, text: v < 0.005 ? "0" : v.toFixed(2) }));
+        s.appendChild(svg("text", { x: bx + bw / 2, y: base + 13, "text-anchor": "middle", "font-size": 9.5, class: "mono", fill: palette.ink, text: toks[i] }));
+      });
+      const H = entropyOf(p) / LN2;
+      s.appendChild(svg("text", { x: px + pw / 2, y: 232, "text-anchor": "middle", "font-size": 11.5, class: "mono", fill: palette.brick, text: "H = " + H.toFixed(2) + " bits" }));
+    });
+  })();
+})();
+</script>
+</body>
+</html>

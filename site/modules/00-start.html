@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>00 · Start here — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  #fig-map a { cursor: pointer; }
+  #fig-map a:focus { outline: none; }
+  #fig-map a:focus rect.node { stroke: #1c1b19; stroke-width: 2; }
+  .route-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 12px; }
+  .route-row .lbl { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .calib-q { font-family: var(--serif); font-size: 19px; line-height: 1.4; margin: 0 0 12px; color: var(--ink); }
+  .calib-out { min-height: 54px; font-size: 14.5px; color: var(--ink-soft); }
+  table.t td .katex { font-size: 1.02em; }
+</style>
+</head>
+<body data-module="00">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 00 · Foundations</p>
+<h1 class="title">Start here: a map and a <span class="it">napkin</span></h1>
+<p class="lede">Most questions about running a language model come down to four numbers you can work out on a napkin: how many bytes the weights take, how many FLOPs one token costs, how large the KV cache grows, and how fast the memory system can stream all of it.</p>
+<div class="meta"><span class="tag">~1.5 hours</span><span class="tag n">prereqs: none</span><span class="tag g">hands-on: napkin math, one benchmark</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Predict a widget's readout before moving its slider, and commit to a think-first answer before opening it.</li>
+    <li>Estimate a model's weight memory, KV-cache size, FLOPs per token, and decode-speed ceiling from five numbers in its config.</li>
+    <li>Trace one request from text to the next token and name the module that covers each stage.</li>
+    <li>Read the notation used across the course and follow tensor shapes through an attention layer.</li>
+    <li>Run a predict → measure → explain loop on your own machine and say why the numbers differ.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="how">How this course works</h2>
+
+<p>Every module follows the same order: the plain-language idea, then the technical version, then the part most tutorials skip: worked numbers and the cases where the simple story breaks. Nothing here needs a network connection. The pages, the math renderer, and the fonts all live in this folder, and your progress sits in this browser's local storage.</p>
+
+<p>The pieces you'll meet on every page:</p>
+
+<table class="t">
+  <thead><tr><th>Component</th><th>What it is</th><th>How to get the most from it</th></tr></thead>
+  <tbody>
+    <tr><td>Formula card</td><td>Every equation that matters, with each symbol colour-coded and explained in a legend</td><td>Hover a coloured symbol or a legend row and both light up. Read the <em>In words</em> line before you stare at the math.</td></tr>
+    <tr><td>Widget</td><td>A small working model of the idea, with sliders and readouts</td><td>Before you move a control, guess which way the readout will go. Change one thing at a time.</td></tr>
+    <tr><td>Think first</td><td>A question with the answer folded away</td><td>Commit to an answer on paper, then open it. Being wrong here is cheap and sticks better than reading.</td></tr>
+    <tr><td>Callouts</td><td>Definitions, intuitions, caveats (gold), pitfalls (brick), and the MLE angle (green)</td><td>The pitfalls are mistakes working engineers actually make. The MLE boxes are what you'd say in a design review.</td></tr>
+    <tr><td>Code</td><td>Snippets written against current libraries: PyTorch, transformers, llama.cpp, MLX, vLLM</td><td>Run them, then break them on purpose. A copy button sits on each block.</td></tr>
+    <tr><td>Quiz</td><td>Five to seven questions at the end of each module, most of them small calculations</td><td>Answers are saved here. Use <em>Reset quiz</em> a week later to see what stuck.</td></tr>
+    <tr><td>Labs</td><td>Module 22: projects with exit criteria you can measure</td><td>Do at least one lab per part. Reading without building fades within weeks.</td></tr>
+    <tr><td>Progress</td><td>A <em>Mark module complete</em> button at the bottom of each page; ticks in the sidebar</td><td>Mark a module only when you can pass its quiz without scrolling up.</td></tr>
+  </tbody>
+</table>
+
+<h3>A live formula card</h3>
+<p>Here's the first one. Move your pointer over the coloured symbols.</p>
+
+<div class="formula" data-name="Dot product">
+  <div class="tex">$$\htmlClass{t4}{s} = \htmlClass{t1}{\mathbf{a}} \cdot \htmlClass{t2}{\mathbf{b}} = \sum_{i=1}^{\htmlClass{t3}{d}} \htmlClass{t1}{a_i}\,\htmlClass{t2}{b_i}$$</div>
+  <dl class="legend">
+    <div data-t="t4"><dt>\(s\)</dt><dd>the result: a single number (a scalar)</dd></div>
+    <div data-t="t1"><dt>\(\mathbf{a}, a_i\)</dt><dd>first vector (bold), and its \(i\)-th entry (plain, with a subscript)</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{b}, b_i\)</dt><dd>second vector, same length as \(\mathbf{a}\)</dd></div>
+    <div data-t="t3"><dt>\(d\)</dt><dd>length of each vector. Llama-3-8B's hidden vectors have \(d = 4096\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Multiply the two lists entry by entry and add up the products. The \(\Sigma\) is just a for-loop that sums.</p>
+  <p class="why"><b>Why it matters</b>Attention scores, embedding similarity, and every matrix multiplication are dot products. A matmul of an \([m, k]\) matrix by a \([k, n]\) matrix is \(m \cdot n\) dot products of length \(k\), which is where most of a model's compute goes.</p>
+</div>
+
+<details class="think"><summary>Think first: how many arithmetic operations is one dot product of two 4096-long vectors?</summary>
+<div>4096 multiplies and 4095 additions, so about \(2d = 8192\) floating-point operations (FLOPs). Hold on to that factor of 2: one multiply and one add per pair. Section 3 turns it into the rule that a forward pass costs about 2 FLOPs per parameter per token.</div>
+</details>
+
+<div class="pitfall"><b>Pitfall · reading on autopilot</b>
+<p>The most common way to waste this course is to read it like a blog post: nod along, move every slider, remember nothing. The widgets only teach when you predict the readout first. If you were surprised, write down why. That sentence is worth more than the page.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="map">The course map</h2>
+
+<p>Eighteen modules in seven parts. Parts I and II build the math and then the model. Part III makes it run, from what training costs to how fast inference goes and how few bits it can survive on. Parts IV and V are what you do with a trained model; Part VI leaves text behind, and in Part VII you build. The arrows show real dependencies, not just reading order, so you can take a shorter route if you have a specific goal.</p>
+
+<figure class="fig wide"><div id="fig-map"></div>
+<figcaption>Every module and its prerequisites. An arrow from A to B means B uses ideas from A. Hover a module to light up what it needs and what needs it; click to open it. Pick a route to see a shorter path. The boxes are drawn from the course manifest at page load, so they always match the sidebar, and modules you've marked complete get a green tick.</figcaption></figure>
+
+<div class="grid2">
+  <div class="card"><div class="k">If you serve or run models</div><h4>Inference track</h4><p>00 → 01 → 03 → 05 → 06 → 08 → 09 → 13. You'll be able to size hardware, pick a quantization, and explain a latency graph. Come back for 07 when someone asks what a training run costs.</p></div>
+  <div class="card blue"><div class="k">If you build products on models</div><h4>Applied track</h4><p>00 → 01 → 03 → 05 → 06 → 08 → 11 → 12 → 13. Retrieval and agents, plus the evaluation that tells you when they break, with enough of the internals to debug them.</p></div>
+</div>
+
+<div class="flag"><b>On skipping</b>
+<p>The tracks skip Module 02 (gradients) and Module 04 (backprop). That's fine for inference work. It isn't fine for fine-tuning (10) or for understanding why training needs so much more memory than inference (07). If a later module references a gradient and it feels like magic, that's your cue to go back.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="mental-model">The one mental model: bytes and FLOPs per token</h2>
+
+<p>When a model generates text, it produces one token at a time. For each token the hardware does two kinds of work. It <strong>moves bytes</strong>: every weight has to travel from memory to the compute units, along with the cached keys and values of every earlier token. And it <strong>does arithmetic</strong>: roughly one multiply and one add per weight. Whichever of the two takes longer sets the speed.</p>
+
+<p>Four formulas cover most of the sizing questions you'll be asked: will it fit, how fast will it go, and what happens when the context gets long or the batch gets big. Learn these by heart. The rest of the course explains where each one comes from and when it bends.</p>
+
+<div class="formula" data-name="Weight memory">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{w}}} = \htmlClass{t2}{N} \times \frac{\htmlClass{t3}{b}}{8}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{w}}\)</dt><dd>bytes needed to hold the weights</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>number of parameters (Llama-3-8B: \(8.03 \times 10^9\))</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bits per weight: 16 for bf16, about 4.5 to 4.9 for common 4-bit formats once scales are counted (Module 09)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Count the numbers, multiply by bits per number, divide by 8 bits per byte.</p>
+  <p class="why"><b>Why it matters</b>This is the first question for any model on any device: do the weights fit at all? An 8B model is 16 GB in bf16 and under 5 GB at 4 bits.</p>
+</div>
+
+<div class="formula" data-name="Forward FLOPs per token">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{fwd}}} \approx 2\,\htmlClass{t2}{N} \;+\; 4\,\htmlClass{t3}{L}\,\htmlClass{t4}{T}\,\htmlClass{t5}{d}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{fwd}}\)</dt><dd>floating-point operations to push one token through the model</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameters used in matrix multiplies: one multiply and one add each, hence the 2</dd></div>
+    <div data-t="t3"><dt>\(L\)</dt><dd>number of transformer layers (Llama-3-8B: 32)</dd></div>
+    <div data-t="t4"><dt>\(T\)</dt><dd>how many tokens are already in the context</dd></div>
+    <div data-t="t5"><dt>\(d\)</dt><dd>attention width, the number of query heads × head size (4096 for Llama-3-8B)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>About two FLOPs per parameter, plus an attention term for comparing the new token against every earlier one. The attention term only catches up with \(2N\) once \(T \approx N/(2Ld)\): about 30,000 tokens for Llama-3-8B.</p>
+  <p class="why"><b>Why it matters</b>Training costs about three times the forward pass (forward plus a backward pass that is roughly twice as expensive), which gives the famous \(6ND\) of Module 07. This form comes from Kaplan et al. (2020).</p>
+</div>
+
+<div class="formula" data-name="KV cache bytes per token">
+  <div class="tex">$$\htmlClass{t1}{m_{\text{KV}}} = \htmlClass{t6}{2} \cdot \htmlClass{t2}{L} \cdot \htmlClass{t3}{n_{\text{kv}}} \cdot \htmlClass{t4}{d_{\text{head}}} \cdot \htmlClass{t5}{\beta}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(m_{\text{KV}}\)</dt><dd>bytes of cache added for each token in the context</dd></div>
+    <div data-t="t6"><dt>\(2\)</dt><dd>one key vector and one value vector</dd></div>
+    <div data-t="t2"><dt>\(L\)</dt><dd>layers: every layer keeps its own cache</dd></div>
+    <div data-t="t3"><dt>\(n_{\text{kv}}\)</dt><dd>number of key/value heads. With grouped-query attention this is smaller than the query-head count (Llama-3-8B: 8 KV heads serve 32 query heads)</dd></div>
+    <div data-t="t4"><dt>\(d_{\text{head}}\)</dt><dd>size of each head (usually 128)</dd></div>
+    <div data-t="t5"><dt>\(\beta\)</dt><dd>bytes per number in the cache: 2 for bf16, 1 for 8-bit</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>For each token, every layer stores a key and a value for every KV head. Multiply by context length \(T\) and batch size \(B\) to get the whole cache: \(M_{\text{KV}} = m_{\text{KV}}\, T\, B\).</p>
+  <p class="why"><b>Why it matters</b>Weights are a fixed cost. The cache grows with every token and every concurrent user, and at long context or high batch it becomes the larger of the two.</p>
+</div>
+
+<div class="formula" data-name="Decode speed ceiling (batch 1)">
+  <div class="tex">$$\htmlClass{t1}{\text{tok/s}} \;\lesssim\; \frac{\htmlClass{t2}{\text{BW}}}{\htmlClass{t3}{M_{\text{w}}} + \htmlClass{t4}{T}\cdot\htmlClass{t5}{m_{\text{KV}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>tok/s</dt><dd>upper bound on generation speed for a single sequence</dd></div>
+    <div data-t="t2"><dt>\(\text{BW}\)</dt><dd>memory bandwidth in bytes per second (M4 Max: 546 GB/s; H100 SXM: 3.35 TB/s)</dd></div>
+    <div data-t="t3"><dt>\(M_{\text{w}}\)</dt><dd>weight bytes, all read once per generated token</dd></div>
+    <div data-t="t4"><dt>\(T\)</dt><dd>current context length in tokens</dd></div>
+    <div data-t="t5"><dt>\(m_{\text{KV}}\)</dt><dd>cache bytes per token, also read in full every step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each new token requires streaming every weight and the whole cache through the chip once. You can't go faster than the memory can deliver them.</p>
+  <p class="why"><b>Why it matters</b>It explains three things people find surprising: why 4-bit models generate faster even though the arithmetic isn't cheaper, why a Mac with lots of bandwidth keeps up with some GPUs, and why batching is nearly free at first (the weights read for one step serve every sequence in the batch).</p>
+</div>
+
+<h3>Worked example: Llama-3-8B</h3>
+<p>Config: 32 layers, 32 query heads, 8 KV heads, head size 128, hidden size 4096, \(8.03\times10^9\) parameters. Here is the whole napkin.</p>
+
+<table class="t">
+  <thead><tr><th>Quantity</th><th>Arithmetic</th><th class="num">Result</th></tr></thead>
+  <tbody>
+    <tr><td>Weights, bf16</td><td>\(8.03\times10^9 \times 16/8\)</td><td class="num">16.1 GB</td></tr>
+    <tr><td>Weights, Q4_K_M (~4.85 bits)</td><td>\(8.03\times10^9 \times 4.85/8\)</td><td class="num">4.9 GB</td></tr>
+    <tr><td>KV cache per token, bf16</td><td>\(2 \times 32 \times 8 \times 128 \times 2\) bytes</td><td class="num">128 KiB</td></tr>
+    <tr><td>KV cache at 8,192 tokens</td><td>\(131{,}072 \times 8{,}192\) bytes</td><td class="num">1 GiB (1.07 GB)</td></tr>
+    <tr><td>FLOPs per token, short context</td><td>\(2 \times 8.03\times10^9\)</td><td class="num">≈ 16 GFLOP</td></tr>
+    <tr><td>Decode ceiling, M4 Max, bf16</td><td>546 GB/s ÷ 16.1 GB</td><td class="num">≈ 34 tok/s</td></tr>
+    <tr><td>Decode ceiling, H100 SXM, bf16</td><td>3,350 GB/s ÷ 16.1 GB</td><td class="num">≈ 208 tok/s</td></tr>
+    <tr><td>Arithmetic actually used on the H100</td><td>208 tok/s × 16 GFLOP, vs ~989 TFLOP/s dense bf16 peak</td><td class="num">≈ 3.3 TFLOP/s (0.3%)</td></tr>
+  </tbody>
+</table>
+
+<p>At batch 1 in bf16, decoding does about 2 FLOPs for every 2 bytes it reads: one FLOP per byte. An H100 can do roughly 295 FLOPs in the time it takes to read one byte. So single-stream decode leaves more than 99% of the arithmetic idle, and the whole speed question turns into a memory question. Prefill, where hundreds of prompt tokens share each weight read, is the opposite: it's limited by compute. Module 08 draws this as a roofline.</p>
+
+<div id="w-napkin"></div>
+
+<details class="think"><summary>Think first: Llama-2-7B has the same 32 layers and head size 128, but 32 KV heads (no grouped-query attention). How much KV cache per token?</summary>
+<div>\(2 \times 32 \times 32 \times 128 \times 2 = 524{,}288\) bytes, which is 512 KiB per token, four times Llama-3-8B. At 8K context that's 4 GiB for a single conversation, a quarter of the weights. Grouped-query attention (Ainslie et al., 2023), covered in Modules 06 and 08, was adopted largely to shrink this number. Select Llama-2-7B in the calculator and watch the KV bar.</div>
+</details>
+
+<div class="flag"><b>Caveats you'll meet later</b>
+<p><strong>Mixture-of-experts</strong> models break the "one N" assumption. Mixtral 8x7B stores about 47B parameters but each token only passes through about 13B of them. Use the total for memory and the active count for FLOPs and for bytes read per token. <strong>Units:</strong> this course writes GB for \(10^9\) bytes and GiB for \(2^{30}\). The 7% difference stops being a rounding error at 70B scale. <strong>Ceilings are ceilings:</strong> as a rule of thumb, well-tuned engines reach roughly 60–85% of the bandwidth bound at batch 1, never all of it.</p>
+</div>
+
+<div class="intuition"><b>Intuition</b>
+<p>Think of the weights as a long book the model must read cover to cover for every word it writes, with the KV cache as its notes on the conversation so far. Generation speed is reading speed. Quantization prints the book in a smaller font (Module 09). Batching lets one reading serve many writers at once (Module 08). Long context makes the notes thicker than the book.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="request">Life of a request</h2>
+
+<p>Here's what happens between pressing enter and seeing the first word, with the module that explains each stage. Every later module zooms into one box.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 1000 548" id="fig-request"></svg>
+<figcaption>One request, end to end. The prompt goes through the stack once in parallel (prefill). After that the green loop runs once per generated token: the new id is embedded, passes through all \(L\) blocks, and reads every earlier token's keys and values from the per-layer KV cache instead of recomputing them. Token ids shown are illustrative. Images and audio join the same sequence as extra vectors (Module 14). Numbers in the corner of each box are the module that covers it.</figcaption></figure>
+
+<ol>
+  <li><strong>Tokenize (05).</strong> The text becomes a list of integer ids, using a vocabulary learned with byte-pair encoding. "The capital of France is" is about five tokens. Llama 3's vocabulary has 128,256 entries.</li>
+  <li><strong>Embed (05).</strong> Each id selects one row of an embedding matrix, giving a vector of size \(d\). The prompt is now a \([T, d]\) array: the start of the <em>residual stream</em>.</li>
+  <li><strong>Transform, \(L\) times (06).</strong> Each block normalizes the stream, runs attention (which lets positions read from each other) and adds the result back, then does the same with an MLP that works on each position separately. The stream keeps its shape \([T, d]\) all the way up.</li>
+  <li><strong>Unembed (05, 06).</strong> A final norm and one more matrix turn the last position's vector into <em>logits</em>: one score for every token in the vocabulary.</li>
+  <li><strong>Softmax and sample (03, 08).</strong> Softmax turns scores into probabilities. A sampler picks one, greedily or with temperature and top-p.</li>
+  <li><strong>Detokenize and loop (05, 08).</strong> The id is turned back into text and streamed to you. It's also appended to the input, and the stack runs again for one token, reading the cache for everything before it.</li>
+</ol>
+
+<details class="think"><summary>Think first: why does the first token usually take noticeably longer than each one after it?</summary>
+<div>The first token has to wait for <em>prefill</em>: the whole prompt must pass through every layer, filling the KV cache, before the model can score anything. A 2,000-token prompt is about 2,000 times the arithmetic of one decode step, though it runs efficiently because it's one big batch of matmuls. After that, each step processes just one new token. Serving dashboards report the two separately: time to first token (TTFT) and time per output token (TPOT), Module 13.</div>
+</details>
+
+<div class="mle"><b>MLE angle · where the time goes</b>
+<p>When someone says "the model is slow", ask which half. Slow TTFT with a long prompt is a compute problem: shorter prompts, prefix caching, a faster GPU. Slow tokens after the first is a bandwidth problem: smaller weights (09), a smaller KV cache (08), better batching, or speculative decoding. They need different fixes, and mixing them up is the most common sizing mistake.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="notation">Notation primer</h2>
+
+<p>The course uses the same notation everywhere, close to what papers use. You don't need to memorize it now; come back to this table when a symbol stops you. The right-hand column is how to say it in your head.</p>
+
+<table class="t">
+  <thead><tr><th>Symbol</th><th>Read it as</th><th>Where you'll see it</th></tr></thead>
+  <tbody>
+    <tr><td>\(x,\ \eta,\ T\)</td><td>plain italic: a single number (scalar)</td><td>learning rate \(\eta\), sequence length \(T\)</td></tr>
+    <tr><td>\(\mathbf{x}\)</td><td>bold lower-case: a vector, a list of numbers</td><td>a token's hidden state \(\mathbf{x} \in \mathbb{R}^{d}\)</td></tr>
+    <tr><td>\(\mathbf{W}\)</td><td>bold upper-case: a matrix, a grid of numbers</td><td>query projection \(\mathbf{W}_Q \in \mathbb{R}^{d \times d}\)</td></tr>
+    <tr><td>\(x_i,\ W_{ij}\)</td><td>"entry \(i\) of x"; "row \(i\), column \(j\) of W"</td><td>the dot product above</td></tr>
+    <tr><td>\(\mathbb{R}^{m \times n}\)</td><td>"real m-by-n": the set of all matrices of that shape</td><td>shapes of weights</td></tr>
+    <tr><td><code>[B, T, d]</code></td><td>tensor shape: batch, tokens, width, in that order</td><td>every code block and the shape tracker below</td></tr>
+    <tr><td>\(\mathbf{x}^{\top},\ \mathbf{A}\mathbf{B}\)</td><td>"x transpose" (flip rows and columns); matrix product</td><td>\(\mathbf{Q}\mathbf{K}^{\top}\) in attention</td></tr>
+    <tr><td>\(\mathbf{a} \odot \mathbf{b}\)</td><td>element-wise product: multiply matching entries, no sum</td><td>SwiGLU gating in the MLP (06)</td></tr>
+    <tr><td>\(\sum_{i=1}^{n}\)</td><td>"sum over i from 1 to n": a loop that adds</td><td>dot products, losses</td></tr>
+    <tr><td>\(\prod_{t=1}^{T}\)</td><td>"product over t": a loop that multiplies</td><td>probability of a sequence, \(\prod_t p(x_t \mid x_{\lt t})\)</td></tr>
+    <tr><td>\(p(y \mid x)\)</td><td>"probability of y given x"</td><td>next-token distributions (03)</td></tr>
+    <tr><td>\(\mathbb{E}_{x \sim p}[f(x)]\)</td><td>"expected f when x is drawn from p": a probability-weighted average</td><td>losses, KL divergence (03)</td></tr>
+    <tr><td>\(\log\)</td><td>natural log (base \(e\)) unless written \(\log_2\). \(\ln\) gives nats, \(\log_2\) gives bits</td><td>cross-entropy, perplexity (03)</td></tr>
+    <tr><td>\(\partial f / \partial x\)</td><td>"partial f by x": how f changes if only x moves</td><td>backprop (02, 04)</td></tr>
+    <tr><td>\(\nabla_{\theta} \mathcal{L}\)</td><td>"gradient of the loss with respect to θ": all the partials stacked into one vector, pointing uphill</td><td>every optimizer step (02)</td></tr>
+    <tr><td>\(\arg\min_{\theta} f(\theta)\)</td><td>"the θ that makes f smallest" (the location, not the minimum value)</td><td>training objectives, GPTQ (09)</td></tr>
+    <tr><td>\(\lVert \mathbf{x} \rVert\)</td><td>"norm of x": its length, \(\sqrt{\sum_i x_i^2}\)</td><td>cosine similarity (01, 11), RMSNorm (06)</td></tr>
+    <tr><td>\(\mathrm{softmax}(\mathbf{z})_i\)</td><td>\(e^{z_i} / \sum_j e^{z_j}\): turn scores into probabilities that sum to 1</td><td>attention, sampling (03, 06, 08)</td></tr>
+    <tr><td>\(\theta,\ \mathcal{L}\)</td><td>all the model's parameters; the loss being minimized</td><td>training (02, 07)</td></tr>
+    <tr><td>\(\approx\) vs \(\lesssim\)</td><td>"about equal" vs "at most about": an upper bound, give or take a constant</td><td>the decode ceiling above</td></tr>
+    <tr><td>\(\mathcal{O}(T^2)\)</td><td>"grows like T squared", ignoring constant factors</td><td>attention cost (06, 08)</td></tr>
+  </tbody>
+</table>
+
+<div class="pitfall"><b>Pitfall · row vs column vectors</b>
+<p>Papers often write \(\mathbf{y} = \mathbf{W}\mathbf{x}\) with \(\mathbf{x}\) as a column. PyTorch stores a batch as rows and computes <code>y = x @ W.T</code> inside <code>nn.Linear</code>, whose weight has shape <code>[out, in]</code>. Same math, transposed bookkeeping. When a shape error appears, write the shapes next to each operand before changing any code.</p>
+</div>
+
+<p>Shapes are the fastest way to catch bugs and the fastest way to estimate memory. The widget follows one attention layer (standard multi-head attention, every head with its own K and V) from token ids to output.</p>
+
+<div id="w-shapes"></div>
+
+<!-- ================================================================== -->
+<h2 id="study">How to study to get really good</h2>
+
+<p>Build one habit above all others: never run an experiment without first writing down what you expect. A wrong prediction points straight at the broken piece of your mental model, and a right one tells you which formula you can trust next time.</p>
+
+<figure class="fig"><svg viewBox="0 0 760 300" id="fig-loop"></svg>
+<figcaption>The loop behind every lab. Predict with the napkin formulas, measure on real hardware, then explain the gap. The gap is where the learning happens. A result at 70% of the bandwidth ceiling is usually healthy. A result at 10% means something else is the bottleneck, such as Python overhead, the wrong dtype, or a model that spilled out of GPU memory.</figcaption></figure>
+
+<div id="w-calib"></div>
+
+<h3>Build it from scratch, once</h3>
+<p>Using a library and understanding it are different skills. For each core idea, write a small version yourself, in plain NumPy or PyTorch, usually under 150 lines: a BPE tokenizer (05), attention from raw matmuls checked against <code>torch.nn.functional.scaled_dot_product_attention</code> (06), a KV cache that makes generation faster (08), a group-wise quantizer (09), a LoRA layer (10), BM25 plus vector search with reciprocal-rank fusion (11), an agent loop with two tools (12). Then go back to the production library and read how it does the same thing. Andrej Karpathy's <a href="https://karpathy.ai/zero-to-hero.html">Zero to Hero</a> series is the best-known model of this approach.</p>
+
+<h3>A weekly rhythm</h3>
+<figure class="fig"><svg viewBox="0 0 760 190" id="fig-week"></svg>
+<figcaption>One way to split a week of about seven hours. Reading takes less than a third of the time. Most of it goes to building, measuring, and writing down what you found. Module 22 turns this rhythm into a week-by-week plan.</figcaption></figure>
+
+<p>Keep one page per week: what you predicted, what you measured, and the one-sentence explanation of the difference. After twelve weeks you have a notebook of real numbers from your own hardware, which beats any blog post when you need to size a deployment.</p>
+
+<h3>How to use the labs</h3>
+<p>Module 22 collects the labs. Each one has <strong>exit criteria</strong>: a table to fill or a number to reach, plus an explanation you should be able to give. "I ran the notebook" isn't an exit criterion. "I can explain why token generation sped up 3.2× and prompt processing only 1.1×" is. Do the labs on whatever you have. A laptop with 16 GB or more covers most of them, and the napkin tells you in advance what will fit.</p>
+
+<h3>Your first predict → measure</h3>
+<p>Do this today. Look up your machine's memory bandwidth, predict the decode ceiling for a 0.5B model with the calculator above, then measure it. Expect to land well below the ceiling with plain <code>transformers</code>. A model this small is limited by per-step Python and kernel-launch overhead, not bandwidth. Explaining that gap is your first lab.</p>
+
+<div class="code" data-lang="python" data-title="first_measurement.py"><pre><code>
+import time
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(device)  # older transformers: torch_dtype=
+
+n = sum(p.numel() for p in model.parameters())
+print(f"{n / 1e9:.2f}B params -&gt; {2 * n / 1e9:.2f} GB of bf16 weights read per token")
+
+inputs = tok("The capital of France is", return_tensors="pt").to(device)
+model.generate(**inputs, max_new_tokens=8)  # warm-up: the first call pays one-off costs
+
+t0 = time.perf_counter()
+out = model.generate(**inputs, max_new_tokens=128, min_new_tokens=128, do_sample=False)
+dt = time.perf_counter() - t0
+new = out.shape[1] - inputs["input_ids"].shape[1]
+print(f"measured: {new / dt:.1f} tok/s")
+print(tok.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="the same model through optimized engines"><pre><code>
+# llama.cpp: separate prompt-processing (pp) and token-generation (tg) throughput
+brew install llama.cpp
+hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF qwen2.5-0.5b-instruct-q4_k_m.gguf --local-dir .   # older huggingface_hub: huggingface-cli download
+llama-bench -m qwen2.5-0.5b-instruct-q4_k_m.gguf -p 512 -n 128
+
+# Apple silicon: MLX prints prompt and generation tokens-per-sec after each run
+pip install mlx-lm
+mlx_lm.generate --model mlx-community/Qwen2.5-0.5B-Instruct-4bit --prompt "The capital of France is" --max-tokens 128
+</code></pre></div>
+
+<div class="mle"><b>Exit criteria for this module</b>
+<p>You're done when you have three numbers for one model on your machine (predicted ceiling, <code>transformers</code> tok/s, llama.cpp or MLX tok/s) and a sentence explaining each gap. Then you can predict, within a factor of two, the memory and decode speed of any dense model from its config.</p>
+</div>
+
+<h3>Reading to keep nearby</h3>
+<ul>
+  <li>Kipply, <a href="https://kipp.ly/transformer-inference-arithmetic/">Transformer Inference Arithmetic</a> (2022): the napkin math of this module, worked out in detail.</li>
+  <li>Anthony, Biderman and Schoelkopf, <a href="https://blog.eleuther.ai/transformer-math/">Transformer Math 101</a> (EleutherAI, 2023): training memory and compute.</li>
+  <li>Austin et al., <a href="https://jax-ml.github.io/scaling-book/">How to Scale Your Model</a> (Google DeepMind, 2025): rooflines and parallelism on accelerators.</li>
+  <li>Kaplan et al., <a href="https://arxiv.org/abs/2001.08361">Scaling Laws for Neural Language Models</a> (2020): the source of the \(2N\) and \(6N\) FLOP counts.</li>
+  <li>Vaswani et al., <a href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a> (2017): read it after Module 06, when it will make sense on the first pass.</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="00-main" data-title="Check yourself · The napkin">
+  <div class="q" data-answer="1"><p>Llama-3-8B stores 128 KiB of KV cache per token in bf16. How much cache does one 32,768-token conversation need?</p>
+    <ol><li>~1 GiB</li><li>~4 GiB</li><li>~16 GiB</li><li>~32 GiB</li></ol>
+    <div class="explain">128 KiB × 32,768 = 4,194,304 KiB = 4 GiB. That's a quarter of the bf16 weights for a single user, and it scales linearly with batch size: 16 such conversations need 64 GiB of cache.</div></div>
+  <div class="q" data-answer="2"><p>A 14B-parameter model is quantized to 4.5 bits per weight. Roughly how much memory do the weights take?</p>
+    <ol><li>~3.5 GB</li><li>~14 GB</li><li>~7.9 GB</li><li>~28 GB</li></ol>
+    <div class="explain">14 × 10⁹ × 4.5 / 8 = 7.9 × 10⁹ bytes. 28 GB would be bf16 and 14 GB would be 8-bit. A useful shortcut: at 16 bits it's 2 bytes per parameter, at 8 bits it's 1, at about 4.5 bits it's a little over half a byte.</div></div>
+  <div class="q" data-answer="3"><p>A laptop with 400 GB/s of memory bandwidth runs an 8B model in bf16 at short context, batch 1. What's the decode-speed ceiling?</p>
+    <ol><li>~250 tok/s</li><li>~50 tok/s</li><li>~2.5 tok/s</li><li>~25 tok/s</li></ol>
+    <div class="explain">Each token reads all 16 GB of weights: 400 / 16 = 25 tok/s. The 50 tok/s option forgets that bf16 is 2 bytes per parameter. A 4-bit version (~4.9 GB) would raise the ceiling to about 80 tok/s.</div></div>
+  <div class="q" data-answer="0"><p>Roughly how many FLOPs does one forward pass of a dense 70B model cost per token at short context?</p>
+    <ol><li>~140 GFLOP</li><li>~70 GFLOP</li><li>~420 GFLOP</li><li>~1.4 TFLOP</li></ol>
+    <div class="explain">2 FLOPs per parameter (one multiply, one add): 2 × 70 × 10⁹ = 1.4 × 10¹¹. 420 GFLOP is the 6N cost of a <em>training</em> step per token (forward plus backward).</div></div>
+  <div class="q" data-answer="2"><p>Batch 2, 32 heads, 4,096 tokens, bf16. If one attention layer materializes the full score tensor \([B, h, T, T]\), how big is it?</p>
+    <ol><li>~32 MiB</li><li>~256 MiB</li><li>~2 GiB</li><li>~64 GiB</li></ol>
+    <div class="explain">2 × 32 × 4,096 × 4,096 = 2³⁰ elements × 2 bytes = 2 GiB, for one layer. This quadratic term is why FlashAttention (Dao et al., 2022) computes attention in tiles and never stores the full matrix.</div></div>
+  <div class="q" data-answer="1"><p>On one GPU at short context, going from batch 1 to batch 16 raises total decode throughput almost 16×. Why?</p>
+    <ol><li>The GPU raises its clock speed under load</li><li>Decode is bandwidth-bound, and the weights read for one step are shared by all 16 sequences, so the step takes about as long as before</li><li>Batching reduces the number of FLOPs per token</li><li>The KV cache is shared between the requests</li></ol>
+    <div class="explain">At batch 1 the chip does about 1 FLOP per byte read and the arithmetic units sit idle. Sixteen sequences reuse each weight 16 times per read, so step time barely moves until the cache reads add up or compute becomes the limit. Each request still has its own KV cache; that's what eventually caps the batch.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, bars, widget, fmtNum, palette, clamp } = C;
+
+  /* ---------------------------------------------------------- shared formatters */
+  const GB = 1e9;
+  const fmtGB = b => { const g = b / GB; return (g >= 100 ? fmtNum(g, 0) : g >= 10 ? fmtNum(g, 1) : fmtNum(g, 2)) + " GB"; };
+  const fmtBin = b => {
+    const u = [[2 ** 40, "TiB"], [2 ** 30, "GiB"], [2 ** 20, "MiB"], [2 ** 10, "KiB"]];
+    for (const [v, s] of u) if (b >= v) { const x = b / v; return fmtNum(x, x >= 100 ? 0 : x >= 10 ? 1 : 2) + " " + s; }
+    return fmtNum(b, 0) + " B";
+  };
+  const fmtFlop = f => {
+    const u = [[1e18, "EFLOP"], [1e15, "PFLOP"], [1e12, "TFLOP"], [1e9, "GFLOP"], [1e6, "MFLOP"]];
+    for (const [v, s] of u) if (f >= v) { const x = f / v; return fmtNum(x, x >= 100 ? 0 : x >= 10 ? 1 : 2) + " " + s; }
+    return fmtNum(f, 0) + " FLOP";
+  };
+  const fmtCount = n => n >= 1e12 ? fmtNum(n / 1e12, 2) + "T" : n >= 1e9 ? fmtNum(n / 1e9, 2) + "B" : n >= 1e6 ? fmtNum(n / 1e6, 2) + "M" : n >= 1e3 ? fmtNum(n / 1e3, 1) + "K" : String(n);
+  const arrowMarker = (s, id, color) => {
+    const defs = svg("defs");
+    defs.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color })));
+    s.appendChild(defs);
+  };
+
+  /* ---------------------------------------------------------- course map (from window.COURSE) */
+  (function () {
+    const host = document.getElementById("fig-map");
+    const M = window.COURSE;
+    if (!host || !M) return;
+    const COLX = [280, 490, 700, 910], NW = 180, NH = 58, TOP = 56, RH = 104, LX = 172;
+    const W = 1010;
+    // preferred column per module; unknown modules fall back to the first free column in their part's row
+    const COL = { "00": 0, "01": 1, "02": 2, "03": 3, "04": 3, "05": 2, "06": 1, "07": 0, "08": 1, "09": 3, "10": 0, "11": 1, "12": 2, "13": 2, "14": 1, "15": 2, "16": 0, "17": 2, "18": 1, "19": 1, "20": 2, "21": 3 };
+    const WIDE = { "22": true };
+    const EDGES = [
+      ["00", "01"], ["00", "03", "arcTop"], ["01", "02"], ["02", "04"], ["03", "04"], ["04", "05"], ["05", "06"],
+      ["06", "07"], ["06", "08"], ["08", "09"], ["06", "10", "trunkSide"], ["07", "10"], ["05", "11", "gapRight"], ["08", "11"],
+      ["11", "12"], ["09", "13", "rightIn"], ["10", "13"], ["11", "13"], ["12", "13"], ["06", "14", "trunkTop"], ["14", "15"],
+      ["07", "16", "left"], ["10", "16"],
+      ["09", "17", "rightIn"], ["17", "18"], ["18", "19"], ["19", "20"], ["20", "21"]
+    ];
+    const ROUTES = {
+      all: { label: "Everything", list: M.modules.map(m => m.n) },
+      infer: { label: "Inference engineering", list: ["00", "01", "03", "05", "06", "08", "09", "13", "17", "18", "19", "20", "21", "22"] },
+      applied: { label: "Applied (RAG, agents)", list: ["00", "01", "03", "05", "06", "08", "11", "12", "13", "22"] },
+      train: { label: "Training & fine-tuning", list: ["00", "01", "02", "03", "04", "05", "06", "07", "10", "13", "22"] },
+      media: { label: "Beyond text", list: ["00", "01", "02", "03", "04", "05", "06", "14", "15", "16"] }
+    };
+
+    const row = el("div", { class: "route-row" }, el("span", { class: "lbl", text: "Route" }));
+    host.appendChild(row);
+    seg(row, { options: Object.entries(ROUTES).map(([k, r]) => ({ value: k, label: r.label })), value: "all", onChange: v => applyRoute(v) });
+
+    const H = TOP + (M.parts.length - 1) * RH + NH + 22;
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Course dependency map" });
+    host.appendChild(s);
+    arrowMarker(s, "map-arr", palette.faint);
+    arrowMarker(s, "map-arr-hl", palette.green);
+
+    // layout
+    const nodes = {};
+    M.parts.forEach((p, r) => {
+      const y = TOP + r * RH;
+      s.appendChild(svg("rect", { x: 0, y: y - 18, width: W, height: NH + 36, fill: r % 2 ? "rgba(239,237,230,.55)" : "rgba(239,237,230,0)" }));
+      s.appendChild(svg("text", { x: 14, y: y + NH / 2 - 5, "font-size": 10.5, class: "mono", fill: palette.faint, "letter-spacing": "1.5", text: "PART " + p.id }));
+      s.appendChild(svg("text", { x: 14, y: y + NH / 2 + 13, "font-size": 15.5, class: "serif", fill: palette.ink, text: p.name }));
+      const mods = M.modules.filter(m => m.part === p.id);
+      const used = new Set(mods.filter(m => COL[m.n] != null).map(m => COL[m.n]));
+      mods.forEach((m, k) => {
+        if (WIDE[m.n] || (mods.length === 1 && COL[m.n] == null && r === M.parts.length - 1)) {
+          nodes[m.n] = { m, r, x: COLX[0] - NW / 2, y, w: COLX[3] + NW / 2 - (COLX[0] - NW / 2), h: NH, wide: true };
+        } else {
+          let c = COL[m.n];
+          if (c == null) { c = [0, 1, 2, 3].find(x => !used.has(x)); if (c == null) c = k % 4; used.add(c); }
+          nodes[m.n] = { m, r, x: COLX[c] - NW / 2, y, w: NW, h: NH };
+        }
+        const n = nodes[m.n]; n.cx = n.x + n.w / 2; n.cy = n.y + n.h / 2;
+      });
+    });
+
+    // edges
+    const edges = EDGES.filter(([a, b]) => nodes[a] && nodes[b]).map(([a, b, hint]) => ({ a: nodes[a], b: nodes[b], hint: hint || "" }));
+    const outs = {}, ins = {};
+    edges.forEach(e => {
+      if (e.a.r === e.b.r) return;
+      if (e.hint === "" || e.hint === "gapRight") (outs[e.a.m.n] = outs[e.a.m.n] || []).push(e);
+      if (e.hint === "" || e.hint === "gapRight" || e.hint === "trunkTop") (ins[e.b.m.n] = ins[e.b.m.n] || []).push(e);
+    });
+    Object.values(outs).forEach(list => { list.sort((p, q) => p.b.cx - q.b.cx); list.forEach((e, i) => e.x1 = e.a.cx + (i - (list.length - 1) / 2) * 22); });
+    Object.values(ins).forEach(list => { list.sort((p, q) => p.a.cx - q.a.cx); list.forEach((e, i) => e.x2 = e.b.cx + (i - (list.length - 1) / 2) * 22); });
+    const gapL = (COLX[0] + NW / 2 + COLX[1] - NW / 2) / 2;   // channel between columns 0 and 1
+    const gapR = (COLX[1] + NW / 2 + COLX[2] - NW / 2) / 2;   // channel between columns 1 and 2
+    function pathFor(e) {
+      const a = e.a, b = e.b, y1 = a.y + a.h, yT = b.y - 2;
+      const sideX = gx => gx > b.cx ? b.x + b.w + 2 : b.x - 2;
+      switch (e.hint) {
+        case "arcTop": { const x1 = a.cx + 44, x2 = b.cx - 44; return `M${x1},${a.y} C${x1},${a.y - 38} ${x2},${a.y - 38} ${x2},${b.y - 2}`; }
+        case "trunkSide": { const gx = gapL, sy = a.cy + 10; return `M${a.x},${sy} L${gx + 8},${sy} Q${gx},${sy} ${gx},${sy + 8} L${gx},${b.cy - 12} Q${gx},${b.cy} ${sideX(gx)},${b.cy}`; }
+        case "trunkTop": { const gx = gapL, sy = a.cy + 10, x2 = e.x2 != null ? e.x2 : b.cx; return `M${a.x},${sy} L${gx + 8},${sy} Q${gx},${sy} ${gx},${sy + 8} L${gx},${b.y - 34} C${gx},${b.y - 14} ${x2},${b.y - 20} ${x2},${yT}`; }
+        case "gapRight": { const x1 = e.x1, gx = gapR, x2 = e.x2; return `M${x1},${y1} C${x1},${y1 + 18} ${gx},${y1 + 14} ${gx},${y1 + 34} L${gx},${b.y - 34} C${gx},${b.y - 14} ${x2},${b.y - 20} ${x2},${yT}`; }
+        case "rightIn": return `M${a.cx},${y1} L${a.cx},${b.cy - 12} Q${a.cx},${b.cy} ${a.cx - 12},${b.cy} L${b.x + b.w + 2},${b.cy}`;
+        case "left": return `M${a.x},${a.cy} L${LX + 10},${a.cy} Q${LX},${a.cy} ${LX},${a.cy + 10} L${LX},${b.cy - 10} Q${LX},${b.cy} ${LX + 10},${b.cy} L${b.x - 2},${b.cy}`;
+        default:
+          if (a.r === b.r) return b.cx > a.cx ? `M${a.x + a.w},${a.cy} L${b.x - 2},${b.cy}` : `M${a.x},${a.cy} L${b.x + b.w + 2},${b.cy}`;
+          { const ym = (y1 + yT) / 2; return `M${e.x1},${y1} C${e.x1},${ym} ${e.x2},${ym} ${e.x2},${yT}`; }
+      }
+    }
+    const gEdges = svg("g"); s.appendChild(gEdges);
+    edges.forEach(e => {
+      e.el = svg("path", { d: pathFor(e), fill: "none", stroke: palette.faint, "stroke-width": 1.3, "marker-end": "url(#map-arr)" });
+      gEdges.appendChild(e.el);
+    });
+    // "everything feeds the labs" bus
+    const labs = Object.values(nodes).find(n => n.wide);
+    if (labs) {
+      const by = labs.y - 14;
+      gEdges.appendChild(svg("line", { x1: labs.x, x2: labs.x + labs.w, y1: by, y2: by, stroke: palette.faint, "stroke-width": 1.2, "stroke-dasharray": "3 4" }));
+      gEdges.appendChild(svg("path", { d: `M${labs.cx},${by} L${labs.cx},${labs.y - 2}`, stroke: palette.faint, "stroke-width": 1.3, "marker-end": "url(#map-arr)" }));
+      gEdges.appendChild(svg("text", { x: labs.cx + 10, y: by - 5, "font-size": 10.5, class: "mono", fill: palette.muted, text: "every module feeds the labs" }));
+    }
+
+    // nodes
+    const done = new Set((C.store && C.store.get("done", [])) || []);
+    const current = document.body.dataset.module;
+    const wrap = (t, n) => {
+      const lines = [""];
+      t.split(" ").forEach(wd => { const cur = lines[lines.length - 1]; if (cur && (cur + " " + wd).length > n) lines.push(wd); else lines[lines.length - 1] = cur ? cur + " " + wd : wd; });
+      return lines.length > 2 ? [lines[0], lines.slice(1).join(" ").slice(0, n - 1) + "…"] : lines;
+    };
+    const gNodes = svg("g"); s.appendChild(gNodes);
+    Object.values(nodes).forEach(n => {
+      const a = svg("a", { href: n.m.file, "aria-label": `Module ${n.m.n}: ${n.m.title}` });
+      const isCur = n.m.n === current;
+      n.rect = svg("rect", { class: "node", x: n.x, y: n.y, width: n.w, height: n.h, rx: 9, fill: isCur ? "rgba(26,122,82,.08)" : "#fff", stroke: isCur ? palette.green : "rgba(28,27,25,.25)", "stroke-width": isCur ? 1.8 : 1.1 });
+      a.appendChild(n.rect);
+      a.appendChild(svg("text", { x: n.x + 12, y: n.y + 18, "font-size": 11, class: "mono", fill: palette.muted, text: n.m.n + (isCur ? " · you are here" : "") }));
+      if (n.wide) {
+        a.appendChild(svg("text", { x: n.x + 12, y: n.y + 40, "font-size": 15, class: "serif", fill: palette.ink, text: n.m.title }));
+        a.appendChild(svg("text", { x: n.x + 210, y: n.y + 40, "font-size": 12, fill: palette.muted, text: n.m.short }));
+      } else {
+        wrap(n.m.title, 22).forEach((ln, i) => a.appendChild(svg("text", { x: n.x + 12, y: n.y + 35 + i * 15, "font-size": 13, fill: palette.ink, "font-weight": 500, text: ln })));
+      }
+      if (done.has(n.m.n)) {
+        a.appendChild(svg("circle", { cx: n.x + n.w - 14, cy: n.y + 14, r: 7, fill: palette.green }));
+        a.appendChild(svg("path", { d: `M${n.x + n.w - 17.5},${n.y + 14} l2.5,2.6 l4.6,-5`, stroke: "#fff", "stroke-width": 1.6, fill: "none" }));
+      }
+      n.step = svg("text", { x: n.x + n.w - 12, y: n.y + n.h - 9, "text-anchor": "end", "font-size": 10.5, class: "mono", fill: palette.green, text: "" });
+      a.appendChild(n.step);
+      a.appendChild(svg("title", { text: `${n.m.n} · ${n.m.title}: ${n.m.short}` }));
+      a.addEventListener("mouseenter", () => hover(n.m.n));
+      a.addEventListener("mouseleave", () => hover(null));
+      a.addEventListener("focus", () => hover(n.m.n));
+      a.addEventListener("blur", () => hover(null));
+      n.a = a;
+      gNodes.appendChild(a);
+    });
+
+    let route = "all";
+    function paint(nodeOn, edgeOn) {
+      Object.values(nodes).forEach(n => { n.a.setAttribute("opacity", nodeOn(n) ? 1 : 0.35); });
+      edges.forEach(e => {
+        const on = edgeOn(e);
+        e.el.setAttribute("stroke", on === 2 ? palette.green : palette.faint);
+        e.el.setAttribute("stroke-width", on === 2 ? 2.2 : 1.3);
+        e.el.setAttribute("marker-end", on === 2 ? "url(#map-arr-hl)" : "url(#map-arr)");
+        e.el.setAttribute("opacity", on ? 1 : 0.18);
+      });
+    }
+    function hover(id) {
+      if (id == null) return applyRoute(route);
+      const near = new Set([id]);
+      edges.forEach(e => { if (e.a.m.n === id) near.add(e.b.m.n); if (e.b.m.n === id) near.add(e.a.m.n); });
+      paint(n => near.has(n.m.n) || n.wide, e => (e.a.m.n === id || e.b.m.n === id) ? 2 : 0);
+    }
+    function applyRoute(k) {
+      route = k;
+      const list = ROUTES[k].list, inR = new Set(list);
+      Object.values(nodes).forEach(n => { const i = list.indexOf(n.m.n); n.step.textContent = k !== "all" && i >= 0 ? "step " + (i + 1) : ""; });
+      if (k === "all") return paint(() => true, () => 1);
+      paint(n => inR.has(n.m.n), e => (inR.has(e.a.m.n) && inR.has(e.b.m.n)) ? 2 : 0);
+    }
+    applyRoute("all");
+  })();
+
+  /* ---------------------------------------------------------- napkin calculator */
+  (function () {
+    const w = widget("w-napkin", { title: "Napkin calculator", kicker: "Calculator", note: "Dense models, decode phase. Each step reads all weights once plus every sequence's whole KV cache. The ceiling ignores compute limits: at large batch or very long context, arithmetic eventually becomes the bottleneck (Module 08), and real engines reach some fraction of the bound. KV cache assumes standard attention with no sliding window. Device figures are vendor peak bandwidths; the 8-GPU row assumes perfect tensor parallelism." });
+    const MODELS = [
+      { v: "l32-1b", l: "Llama-3.2-1B", N: 1.24, L: 16, kv: 8, dh: 64, d: 2048 },
+      { v: "l32-3b", l: "Llama-3.2-3B", N: 3.21, L: 28, kv: 8, dh: 128, d: 3072 },
+      { v: "l2-7b", l: "Llama-2-7B (no GQA)", N: 6.74, L: 32, kv: 32, dh: 128, d: 4096 },
+      { v: "l31-8b", l: "Llama-3.1-8B", N: 8.03, L: 32, kv: 8, dh: 128, d: 4096 },
+      { v: "q25-14b", l: "Qwen2.5-14B", N: 14.7, L: 48, kv: 8, dh: 128, d: 5120 },
+      { v: "q25-32b", l: "Qwen2.5-32B", N: 32.5, L: 64, kv: 8, dh: 128, d: 5120 },
+      { v: "l31-70b", l: "Llama-3.1-70B", N: 70.6, L: 80, kv: 8, dh: 128, d: 8192 },
+      { v: "l31-405b", l: "Llama-3.1-405B", N: 405, L: 126, kv: 8, dh: 128, d: 16384 },
+      { v: "custom", l: "Custom (edited)" }
+    ];
+    const BITS = [["fp32", 32], ["bf16 / fp16", 16], ["Q8_0 (8.5)", 8.5], ["Q6_K (6.56)", 6.56], ["Q4_K_M (~4.85)", 4.85], ["MLX 4-bit (4.5)", 4.5], ["Q3_K_M (~3.9)", 3.9]];
+    const DEVICES = [
+      { v: "ddr5", l: "Desktop CPU · DDR5 dual-channel · 64 GB · ~90 GB/s", mem: 64, bw: 90 },
+      { v: "air", l: "MacBook Air M3 · 16 GB · 100 GB/s", mem: 16, bw: 100 },
+      { v: "m4pro", l: "MacBook Pro M4 Pro · 48 GB · 273 GB/s", mem: 48, bw: 273 },
+      { v: "m4max", l: "MacBook Pro M4 Max (40-core GPU) · 64 GB · 546 GB/s", mem: 64, bw: 546 },
+      { v: "ultra", l: "Mac Studio M2 Ultra · 192 GB · 800 GB/s", mem: 192, bw: 800 },
+      { v: "4090", l: "RTX 4090 · 24 GB · 1,008 GB/s", mem: 24, bw: 1008 },
+      { v: "h100", l: "H100 SXM · 80 GB · 3,350 GB/s", mem: 80, bw: 3350 },
+      { v: "h200", l: "H200 · 141 GB · 4,800 GB/s", mem: 141, bw: 4800 },
+      { v: "8h100", l: "8× H100 SXM (ideal) · 640 GB · 26,800 GB/s", mem: 640, bw: 26800 }
+    ];
+    const CTX = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+    const BATCH = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+    let bits = 16, kvBytes = 2, dev = DEVICES[3], syncing = false;
+
+    const row1 = w.controls;
+    const mSel = select(row1, { label: "Model preset", options: MODELS.map(m => ({ value: m.v, label: m.l })), value: "l31-8b", onChange: v => loadPreset(v) });
+    select(row1, { label: "Weight format (bits/weight)", options: BITS.map(([l, b]) => ({ value: String(b), label: l })), value: "16", onChange: v => { bits = +v; draw(); } });
+    const cKV = el("div", { class: "ctl" }, el("label", null, el("span", { text: "KV cache precision" })));
+    seg(cKV, { options: [{ value: 2, label: "16-bit" }, { value: 1, label: "8-bit" }], value: 2, onChange: v => { kvBytes = v; draw(); } });
+    row1.appendChild(cKV);
+
+    const row2 = el("div", { class: "controls" }); w.body.appendChild(row2);
+    const edited = () => { if (!syncing) { mSel.value = "custom"; draw(); } };
+    const sN = slider(row2, { label: "Parameters N", min: -0.7, max: 2.7, step: 0.01, value: Math.log10(8.03), fmt: v => { const n = 10 ** v; return (n < 10 ? n.toFixed(2) : n < 100 ? n.toFixed(1) : n.toFixed(0)) + "B"; }, onInput: edited });
+    const sL = slider(row2, { label: "Layers L", min: 8, max: 128, step: 1, value: 32, onInput: edited });
+    const sKV = slider(row2, { label: "KV heads n_kv", min: 1, max: 64, step: 1, value: 8, onInput: edited });
+    const sDH = slider(row2, { label: "Head size d_head", min: 64, max: 256, step: 32, value: 128, onInput: edited });
+    const sD = slider(row2, { label: "Attention width d", min: 512, max: 16384, step: 256, value: 4096, fmt: v => fmtNum(v, 0), onInput: edited });
+
+    const row3 = el("div", { class: "controls" }); w.body.appendChild(row3);
+    const sT = slider(row3, { label: "Context length T", min: 0, max: CTX.length - 1, step: 1, value: 4, fmt: i => fmtNum(CTX[i], 0) + " tokens", onInput: draw });
+    const sB = slider(row3, { label: "Batch B (concurrent sequences)", min: 0, max: BATCH.length - 1, step: 1, value: 0, fmt: i => String(BATCH[i]), onInput: draw });
+    select(row3, { label: "Device", options: DEVICES.map(d => ({ value: d.v, label: d.l })), value: "m4max", onChange: v => { dev = DEVICES.find(d => d.v === v); draw(); } });
+
+    const cw = el("div", { class: "canvas-wrap" }); w.body.appendChild(cw);
+    const B = bars(cw, { width: 760, height: 150, horizontal: true, labelWidth: 120 });
+    const set = stats(w.body, [
+      { key: "w", label: "Weights" }, { key: "kv", label: "KV cache" }, { key: "tot", label: "Total memory" },
+      { key: "tps", label: "Ceiling per sequence" }, { key: "agg", label: "Ceiling, whole batch" }, { key: "fl", label: "FLOPs per token" }
+    ]);
+
+    function loadPreset(v) {
+      const m = MODELS.find(x => x.v === v);
+      if (!m || m.v === "custom") return;
+      syncing = true;
+      sN.value = Math.log10(m.N); sL.value = m.L; sKV.value = m.kv; sDH.value = m.dh; sD.value = m.d;
+      syncing = false;
+      draw();
+    }
+    function draw() {
+      const N = 10 ** sN.value * 1e9, L = sL.value, nkv = sKV.value, dh = sDH.value, d = sD.value;
+      const T = CTX[sT.value], Bn = BATCH[sB.value];
+      const Mw = N * bits / 8;
+      const kvTok = 2 * L * nkv * dh * kvBytes;
+      const Mkv = kvTok * T * Bn;
+      const tot = Mw + Mkv;
+      const memB = dev.mem * GB, bw = dev.bw * GB;
+      const perSeq = bw / (Mw + Mkv);        // one step reads weights once + all caches
+      const agg = perSeq * Bn;
+      const attn = 4 * L * T * d, fl = 2 * N + attn;
+      const fits = tot <= memB * 0.9;
+      B.draw(["weights", "KV cache", "total", "device memory"], [Mw / GB, Mkv / GB, tot / GB, dev.mem], {
+        max: Math.max(tot / GB, dev.mem) * 1.02,
+        colors: [palette.blue, palette.gold, fits ? palette.green : tot <= memB ? palette.gold : palette.brick, palette.faint],
+        fmt: v => (v >= 100 ? fmtNum(v, 0) : v >= 10 ? fmtNum(v, 1) : fmtNum(v, 2)) + " GB"
+      });
+      set("w", fmtGB(Mw), null, `${fmtNum(N / 1e9, N < 1e10 ? 2 : 1)}B × ${bits} bits / 8`);
+      set("kv", fmtGB(Mkv), Mkv > Mw ? "warn" : null, `${fmtBin(kvTok)} per token × ${fmtNum(T, 0)} × ${Bn}`);
+      set("tot", fmtGB(tot), fits ? "good" : "bad", fits ? `fits in ${dev.mem} GB (≤90%)` : tot <= memB ? "barely: no room for activations" : `exceeds ${dev.mem} GB`);
+      set("tps", tot <= memB ? fmtNum(perSeq, perSeq < 10 ? 1 : 0) + " tok/s" : "—", tot <= memB ? null : "bad", `${dev.bw.toLocaleString("en-US")} GB/s ÷ ${fmtGB(Mw + Mkv)} per step`);
+      set("agg", tot <= memB ? fmtNum(agg, agg < 10 ? 1 : 0) + " tok/s" : "—", tot <= memB && Bn > 1 ? "good" : null, Bn > 1 ? `${Bn} sequences share each weight read` : "set B > 1 to see batching");
+      set("fl", fmtFlop(fl), null, `2N = ${fmtFlop(2 * N)}; attention adds ${fmtNum(100 * attn / (2 * N), 0)}% at T`);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- life of a request */
+  (function () {
+    const s = document.getElementById("fig-request");
+    arrowMarker(s, "req-arr", palette.ink);
+    arrowMarker(s, "req-arr-g", palette.green);
+    arrowMarker(s, "req-arr-m", palette.muted);
+    const T = (x, y, t, o = {}) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 11.5, fill: palette.muted, text: t }, o)));
+    const badge = (x, y, n) => {
+      const w = 12 + 7 * n.length;
+      s.appendChild(svg("rect", { x: x - w, y, width: w, height: 16, rx: 8, fill: "rgba(26,122,82,.12)" }));
+      s.appendChild(svg("text", { x: x - w / 2, y: y + 11.5, "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.green, "font-weight": 600, text: n }));
+    };
+    const box = (x, y, w, h, title, lines, mod, o = {}) => {
+      s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 9, fill: o.fill || "#fff", stroke: o.stroke || "rgba(28,27,25,.28)", "stroke-width": 1.2, "stroke-dasharray": o.dash || null }));
+      T(x + 10, y + 20, title, { "font-size": 13, fill: palette.ink, "font-weight": 600 });
+      (lines || []).forEach((ln, i) => T(x + 10, y + 37 + i * 14, ln, { "font-size": 11, class: o.mono ? "mono" : null }));
+      if (mod) badge(x + w - 6, y + 6, mod);
+    };
+    const arrow = (d, o = {}) => s.appendChild(svg("path", { d, fill: "none", stroke: o.color || palette.ink, "stroke-width": o.width || 1.4, "stroke-dasharray": o.dash || null, "marker-end": `url(#${o.marker || "req-arr"})` }));
+
+    // ---- top row: text -> tokenizer -> ids -> embedding
+    box(16, 40, 120, 72, "Text in", ["\u201cThe capital of", "France is\u201d"], null);
+    box(156, 40, 112, 72, "Tokenizer", ["BPE: text \u2192", "subword pieces"], "05");
+    box(288, 40, 150, 72, "Token ids", [], "05");
+    [464, 3139, 286, 4881, 318].forEach((id, i) => {
+      s.appendChild(svg("rect", { x: 296 + i * 28, y: 72, width: 26, height: 22, rx: 3, fill: "rgba(47,93,138,.12)", stroke: "rgba(47,93,138,.45)" }));
+      s.appendChild(svg("text", { x: 309 + i * 28, y: 87, "text-anchor": "middle", "font-size": 8.5, class: "mono", fill: palette.blue, text: id }));
+    });
+    T(296, 106, "T = 5  \u00b7  [T]", { "font-size": 10, class: "mono" });
+    box(458, 40, 122, 72, "Embedding", ["row lookup E[id]", "\u2192 [T, d]"], "05");
+    arrow("M136,76 L154,76"); arrow("M268,76 L286,76"); arrow("M438,76 L456,76");
+
+    // ---- multimodal input
+    box(446, 150, 144, 64, "Image or audio", ["encoder + projector", "\u2192 extra vectors"], "14", { dash: "4 3", fill: "#fbfaf7" });
+    arrow("M519,150 L519,114", { color: palette.muted, marker: "req-arr-m", dash: "4 3" });
+
+    // ---- transformer stack
+    s.appendChild(svg("rect", { x: 604, y: 22, width: 380, height: 372, rx: 12, fill: "rgba(239,237,230,.6)", stroke: "rgba(28,27,25,.22)" }));
+    s.appendChild(svg("rect", { x: 610, y: 28, width: 380, height: 372, rx: 12, fill: "none", stroke: "rgba(28,27,25,.10)" }));
+    T(618, 44, "\u00d7 L transformer blocks", { "font-size": 13.5, fill: palette.ink, "font-weight": 600, class: "serif" });
+    badge(978, 30, "06");
+    T(618, 60, "Llama-3-8B: L = 32, d = 4096", { "font-size": 10.5, class: "mono" });
+    const SX = 940;
+    // entry from embedding into the stream
+    arrow(`M580,76 L${SX - 8},76`);
+    s.appendChild(svg("line", { x1: SX, x2: SX, y1: 70, y2: 428, stroke: "rgba(47,93,138,.55)", "stroke-width": 7, "stroke-linecap": "round" }));
+    s.appendChild(svg("text", { x: SX + 22, y: 230, "font-size": 10.5, class: "mono", fill: palette.blue, "text-anchor": "middle", transform: `rotate(90 ${SX + 22} 230)`, text: "residual stream  [T, d]" }));
+    const sub = (y, title, lines, mod) => {
+      box(770, y, 132, 80, title, lines, mod);
+      arrow(`M${SX - 5},${y + 18} L904,${y + 18}`);
+      T(921, y + 13, "norm", { "font-size": 9.5, class: "mono", "text-anchor": "middle" });
+      arrow(`M902,${y + 62} L${SX - 10},${y + 62}`);
+      s.appendChild(svg("circle", { cx: SX, cy: y + 62, r: 8, fill: "#fff", stroke: palette.ink, "stroke-width": 1.2 }));
+      s.appendChild(svg("path", { d: `M${SX - 4.5},${y + 62} h9 M${SX},${y + 57.5} v9`, stroke: palette.ink, "stroke-width": 1.3 }));
+    };
+    sub(96, "Attention", ["softmax(QK\u1d40/\u221ad)\u00b7V", "positions read", "from each other"], "06");
+    sub(236, "MLP (SwiGLU)", ["each position alone;", "holds most of", "the parameters"], "06");
+    // KV cache (per layer)
+    box(620, 96, 128, 80, "KV cache", ["K, V of every", "past token, per layer", "128 KiB/token (8B)"], "08", { fill: "rgba(154,123,34,.08)", stroke: "rgba(154,123,34,.55)" });
+    arrow("M770,124 L750,124", { color: palette.gold, marker: "req-arr-m" });
+    arrow("M748,150 L768,150", { color: palette.gold, marker: "req-arr-m" });
+    T(620, 194, "each step writes the new token's K,V", { "font-size": 10.5 });
+    T(620, 208, "and reads every earlier one back", { "font-size": 10.5 });
+    // weights note
+    T(620, 250, "Weights live here:", { "font-size": 11, fill: palette.ink, "font-weight": 600 });
+    T(620, 265, "W_Q, W_K, W_V, W_O", { "font-size": 11 });
+    T(620, 279, "and the MLP matrices,", { "font-size": 11 });
+    T(620, 293, "all read once per", { "font-size": 11 });
+    T(620, 307, "decode step", { "font-size": 11 });
+    T(620, 340, "07 trains them \u00b7 10 adapts them \u00b7 09 shrinks them", { "font-size": 10.5, class: "mono", fill: palette.green });
+
+    // ---- bottom row, right to left
+    const BY = 438;
+    box(846, BY, 138, 72, "Unembed", ["final norm, then", "W_U: d \u2192 V"], "05");
+    box(686, BY, 138, 72, "Logits z", ["one score per id", "V = 128,256 (Llama 3)"], "06");
+    box(526, BY, 138, 72, "Softmax", ["p = softmax(z / \u03c4)", "sums to 1"], "03");
+    box(366, BY, 138, 72, "Sample", ["greedy, \u03c4, top-p", "\u2192 next id"], "08");
+    box(206, BY, 138, 72, "Detokenize", ["id \u2192 bytes \u2192 text"], "05");
+    box(16, BY, 168, 72, "Text out", ["\u201c Paris\u201d", "streamed token by token"], null, { fill: "rgba(26,122,82,.06)" });
+    arrow(`M${SX},428 L${SX},${BY - 2}`);
+    arrow(`M846,${BY + 36} L826,${BY + 36}`); arrow(`M686,${BY + 36} L666,${BY + 36}`); arrow(`M526,${BY + 36} L506,${BY + 36}`);
+    arrow(`M366,${BY + 36} L346,${BY + 36}`); arrow(`M206,${BY + 36} L186,${BY + 36}`);
+
+    // ---- decode loop
+    arrow(`M435,${BY} C435,330 363,230 363,114`, { color: palette.green, width: 2, dash: "6 4", marker: "req-arr-g" });
+    T(448, 252, "decode loop", { "font-size": 12.5, fill: palette.green, "font-weight": 600 });
+    badge(560, 241, "08");
+    T(448, 270, "append the new id;", { "font-size": 11 });
+    T(448, 284, "only that one token", { "font-size": 11 });
+    T(448, 298, "runs through the stack;", { "font-size": 11 });
+    T(448, 312, "past K,V come from", { "font-size": 11 });
+    T(448, 326, "the cache", { "font-size": 11 });
+
+    // ---- prefill vs decode callouts
+    box(16, 150, 300, 84, "Prefill: the whole prompt at once", ["all T prompt tokens in one pass", "each weight read serves T tokens", "compute-bound \u00b7 sets time to first token"], "08", { fill: "#fbfaf7" });
+    box(16, 250, 300, 84, "Decode: one token per step", ["every weight and the cache re-read", "per token: ~1 FLOP per byte", "bandwidth-bound \u00b7 sets tokens/s"], "08", { fill: "#fbfaf7" });
+    T(16, 370, "Prefill runs once per request, then decode repeats", { "font-size": 11 });
+    T(16, 384, "until an end-of-sequence token or the length limit.", { "font-size": 11 });
+    T(16, 538, "Green pills = the module that covers each stage. Dashed = optional input.", { "font-size": 10.5, fill: palette.faint });
+  })();
+
+  /* ---------------------------------------------------------- shape tracker */
+  (function () {
+    const w = widget("w-shapes", { title: "Shape tracker: one attention layer", kicker: "Interactive", note: "Standard multi-head attention, so K and V have h heads like Q. Real models such as Llama 3 use fewer KV heads (grouped-query attention, Modules 06 and 08), which shrinks the K and V rows but not the scores. FlashAttention computes the S and A rows in tiles and never stores them whole; they are shown to make the T² term visible." });
+    let Bv = 1, d = 4096, h = 32, bp = 2;
+    const cB = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Batch B" })));
+    seg(cB, { options: [1, 2, 4, 8, 16].map(v => ({ value: v, label: String(v) })), value: 1, onChange: v => { Bv = v; draw(); } });
+    w.controls.appendChild(cB);
+    const sT = slider(w.controls, { label: "Sequence length T", min: 4, max: 17, step: 1, value: 12, fmt: v => fmtNum(2 ** v, 0), onInput: draw });
+    select(w.controls, { label: "d_model", options: [512, 768, 1024, 2048, 4096, 8192].map(v => ({ value: String(v), label: String(v) })), value: "4096", onChange: v => { d = +v; draw(); } });
+    const cH = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Heads h" })));
+    seg(cH, { options: [8, 12, 16, 32, 64].map(v => ({ value: v, label: String(v) })), value: 32, onChange: v => { h = v; draw(); } });
+    w.controls.appendChild(cH);
+    const cP = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Activation dtype" })));
+    seg(cP, { options: [{ value: 2, label: "bf16 · 2 B" }, { value: 4, label: "fp32 · 4 B" }], value: 2, onChange: v => { bp = v; draw(); } });
+    w.controls.appendChild(cP);
+
+    const tHost = el("div", { style: { overflowX: "auto" } }); w.body.appendChild(tHost);
+    const cw = el("div", { class: "canvas-wrap", style: { marginTop: "12px" } }); w.body.appendChild(cw);
+    const Bar = bars(cw, { width: 760, height: 250, horizontal: true, labelWidth: 70 });
+    const set = stats(w.body, [{ key: "dh", label: "Head size d_h = d / h" }, { key: "s", label: "Score tensor S" }, { key: "ratio", label: "S ÷ X" }, { key: "kv", label: "K + V (this layer)" }]);
+
+    function draw() {
+      const T = 2 ** sT.value, ok = d % h === 0, dh = d / h;
+      const rows = [
+        { k: "ids", step: "token ids", sym: "[B, T]", dims: [Bv, T], bytes: 4, note: "int32" },
+        { k: "X", step: "X = embed(ids)", sym: "[B, T, d]", dims: [Bv, T, d] },
+        { k: "Q", step: "Q = X·W_Q, split into heads", sym: "[B, h, T, d_h]", dims: [Bv, h, T, dh] },
+        { k: "K+V", step: "K = X·W_K, V = X·W_V", sym: "2 × [B, h, T, d_h]", dims: [Bv, h, T, dh], mult: 2 },
+        { k: "S", step: "S = Q·Kᵀ / √d_h", sym: "[B, h, T, T]", dims: [Bv, h, T, T] },
+        { k: "A", step: "A = softmax(S + causal mask)", sym: "[B, h, T, T]", dims: [Bv, h, T, T] },
+        { k: "O", step: "O = A·V", sym: "[B, h, T, d_h]", dims: [Bv, h, T, dh] },
+        { k: "Y", step: "merge heads, Y = O·W_O", sym: "[B, T, d]", dims: [Bv, T, d] },
+        { k: "W", step: "weights W_Q, W_K, W_V, W_O", sym: "4 × [d, d]", dims: [d, d], mult: 4, weight: true }
+      ];
+      rows.forEach(r => { r.n = r.dims.reduce((a, b) => a * b, 1) * (r.mult || 1); r.b = r.n * (r.bytes || bp); });
+      const maxB = Math.max(...rows.map(r => r.b));
+      tHost.innerHTML = "";
+      const table = el("table", { class: "t", style: { margin: "0" } });
+      table.appendChild(el("thead", null, el("tr", null, ["Step", "Shape", "Numbers", "Elements", "Bytes"].map((x, i) => el("th", { class: i > 2 ? "num" : "", text: x })))));
+      const tb = el("tbody"); table.appendChild(tb);
+      rows.forEach(r => {
+        const hot = r.b === maxB;
+        const nums = (r.mult ? r.mult + " × " : "") + "[" + r.dims.map(v => fmtNum(v, 0)).join(", ") + "]";
+        tb.appendChild(el("tr", null, [
+          el("td", { text: r.step + (r.weight ? "  (parameters)" : "") }),
+          el("td", { class: "mono", style: { fontSize: "12.5px", whiteSpace: "nowrap" }, text: r.sym }),
+          el("td", { class: "mono", style: { fontSize: "12.5px", whiteSpace: "nowrap", color: ok ? null : palette.brick }, text: ok ? nums : "d not divisible by h" }),
+          el("td", { class: "num", text: fmtCount(r.n) }),
+          el("td", { class: "num", html: `<span style="color:${hot ? palette.brick : palette.ink};font-weight:${hot ? 600 : 400}">${fmtBin(r.b)}${r.note ? " · " + r.note : ""}</span>` })
+        ]));
+      });
+      tHost.appendChild(table);
+      Bar.draw(rows.map(r => r.k), rows.map(r => r.b), { colors: rows.map(r => r.k === "S" || r.k === "A" ? palette.brick : r.weight ? palette.faint : r.k === "K+V" ? palette.gold : palette.blue), fmt: v => fmtBin(v) });
+      const S = rows[4].b, X = rows[1].b;
+      set("dh", ok ? String(dh) : "not an integer", ok ? null : "bad", ok ? `${d} / ${h}` : "choose h dividing d");
+      set("s", fmtBin(S), S > 2 ** 30 ? "bad" : S > 2 ** 27 ? "warn" : null, "per layer, if materialized");
+      set("ratio", fmtNum(S / X, S / X >= 10 ? 0 : 2) + "×", S > X ? "warn" : "good", `= h·T / d = ${h}·${fmtNum(T, 0)} / ${d}`);
+      set("kv", fmtBin(rows[3].b), null, "kept across decode steps");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- predict -> measure loop figure */
+  (function () {
+    const s = document.getElementById("fig-loop");
+    arrowMarker(s, "loop-arr", palette.ink);
+    const box = (x, y, w, h, k, title, lines, col) => {
+      s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 10, fill: "#fff", stroke: col, "stroke-width": 1.4 }));
+      s.appendChild(svg("text", { x: x + 14, y: y + 20, "font-size": 10.5, class: "mono", fill: col, "letter-spacing": "1.2", text: k }));
+      s.appendChild(svg("text", { x: x + 14, y: y + 41, "font-size": 16, class: "serif", fill: palette.ink, text: title }));
+      lines.forEach((t, i) => s.appendChild(svg("text", { x: x + 14, y: y + 60 + i * 14, "font-size": 11.5, fill: palette.muted, text: t })));
+    };
+    box(30, 20, 250, 100, "1 · PREDICT", "Write a number down", ["bytes, FLOPs, tok/s from the napkin,", "before you run anything"], palette.green);
+    box(480, 20, 250, 100, "2 · MEASURE", "Run it on real hardware", ["llama-bench, a timer, a profiler;", "warm up first, repeat 3+ times"], palette.blue);
+    box(480, 180, 250, 100, "3 · EXPLAIN THE GAP", "Why isn't it the ceiling?", ["overhead, compute-bound phase, wrong", "dtype, swapped memory, thermals"], palette.brick);
+    box(30, 180, 250, 100, "4 · UPDATE", "Fix the system or the model", ["either the code was wrong or", "your mental model was; write which"], palette.gold);
+    const a = (d) => s.appendChild(svg("path", { d, fill: "none", stroke: palette.ink, "stroke-width": 1.5, "marker-end": "url(#loop-arr)" }));
+    a("M282,70 L476,70"); a("M605,122 L605,176"); a("M478,230 L284,230"); a("M155,178 L155,124");
+    s.appendChild(svg("text", { x: 380, y: 140, "text-anchor": "middle", "font-size": 13, class: "serif", fill: palette.ink, "font-style": "italic", text: "the gap is the lesson" }));
+    s.appendChild(svg("text", { x: 380, y: 160, "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted, text: "e.g. predicted 34 tok/s, measured 27: 79% of the ceiling" }));
+    s.appendChild(svg("text", { x: 380, y: 62, "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted, text: "prediction" }));
+    s.appendChild(svg("text", { x: 380, y: 222, "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted, text: "explanation" }));
+  })();
+
+  /* ---------------------------------------------------------- calibration widget */
+  (function () {
+    const w = widget("w-calib", { title: "Calibrate your napkin", kicker: "Predict, then reveal", note: "Answers use this module's formulas with decimal GB (10⁹ bytes). Within 2× is good napkin math; within 20% is excellent. The slider is logarithmic, so each notch is a ratio, not a fixed step." });
+    const QS = [
+      { q: "Weight memory of a 70B-parameter model in bf16?", unit: "GB", lo: 0, hi: 4, ans: 140, work: "70 × 10⁹ parameters × 2 bytes = 140 × 10⁹ bytes." },
+      { q: "KV cache for one 8,192-token conversation on Llama-3.1-70B (80 layers, 8 KV heads, head size 128, bf16)?", unit: "GB", lo: -1, hi: 3, ans: 2.68, work: "2 × 80 × 8 × 128 × 2 B = 320 KiB per token; × 8,192 tokens = 2.5 GiB ≈ 2.7 GB." },
+      { q: "Batch-1 decode ceiling for an 8B model in bf16 on a 100 GB/s laptop, short context?", unit: "tok/s", lo: -0.5, hi: 3, ans: 6.2, work: "100 GB/s ÷ 16.1 GB per token ≈ 6 tok/s. The same model at Q4_K_M (~4.9 GB) gets a ceiling of about 20." },
+      { q: "Forward-pass FLOPs to generate 1,000 tokens with a dense 7B model (ignore attention)?", unit: "FLOP", lo: 10, hi: 16, ans: 1.4e13, work: "2 × 7 × 10⁹ × 1,000 = 1.4 × 10¹³ FLOP = 14 TFLOP. An H100 at full speed would need about 14 ms; decode takes far longer because it's bandwidth-bound." },
+      { q: "File size of a 32B model quantized to Q4_K_M (~4.85 bits per weight)?", unit: "GB", lo: 0, hi: 3, ans: 19.4, work: "32 × 10⁹ × 4.85 / 8 ≈ 19.4 × 10⁹ bytes. Real files differ slightly because some tensors use other formats." },
+      { q: "Llama-2-7B has 32 KV heads, Llama-3-8B has 8; same layers and head size. How many times more KV cache per token does Llama-2-7B need?", unit: "×", lo: 0, hi: 2, ans: 4, work: "KV bytes scale linearly with n_kv: 32 / 8 = 4×, so 512 KiB vs 128 KiB per token." }
+    ];
+    let qi = 0, revealed = false;
+    const log = [];
+    const fmtV = (v, unit) => unit === "FLOP" ? fmtFlop(v) : unit === "×" ? fmtNum(v, v < 10 ? 1 : 0) + "×" : (v >= 100 ? fmtNum(v, 0) : v >= 10 ? fmtNum(v, 1) : fmtNum(v, 2)) + " " + unit;
+    const qEl = el("p", { class: "calib-q" });
+    const counter = el("span", { class: "mono small muted" });
+    w.controls.style.gridTemplateColumns = "1fr";
+    w.controls.appendChild(el("div", null, [counter, qEl]));
+    const sl = slider(w.controls, { label: "Your guess", min: 0, max: 4, step: 0.01, value: 2, fmt: v => fmtV(10 ** v, QS[qi].unit), onInput: () => { if (revealed) return; } });
+    const btns = el("div", { class: "btnrow" });
+    const bReveal = el("button", { class: "btn primary", text: "Reveal", onclick: reveal });
+    const bNext = el("button", { class: "btn", text: "Next question →", onclick: () => { qi = (qi + 1) % QS.length; load(); } });
+    btns.appendChild(bReveal); btns.appendChild(bNext);
+    w.controls.appendChild(btns);
+    const out = el("div", { class: "calib-out" }); w.body.appendChild(out);
+    const set = stats(w.body, [{ key: "n", label: "Answered" }, { key: "two", label: "Within 2×" }, { key: "twenty", label: "Within 20%" }, { key: "med", label: "Median miss" }]);
+    function load() {
+      const q = QS[qi];
+      revealed = false;
+      counter.textContent = `Question ${qi + 1} of ${QS.length}`;
+      qEl.textContent = q.q;
+      sl.input.min = q.lo; sl.input.max = q.hi; sl.input.disabled = false;
+      sl.value = (q.lo + q.hi) / 2;
+      out.innerHTML = "";
+      out.appendChild(el("p", { class: "small muted", style: { margin: "4px 0" }, text: "Set the slider to your estimate, then reveal. No calculator: the point is the napkin." }));
+      bReveal.disabled = false;
+    }
+    function reveal() {
+      if (revealed) return;
+      revealed = true;
+      const q = QS[qi], g = 10 ** sl.value, r = g / q.ans, miss = Math.max(r, 1 / r);
+      log[qi] = miss;
+      sl.input.disabled = true; bReveal.disabled = true;
+      const cls = miss <= 1.2 ? palette.green : miss <= 2 ? palette.gold : palette.brick;
+      out.innerHTML = "";
+      out.appendChild(el("p", { style: { margin: "4px 0" }, html: `Answer: <b>${fmtV(q.ans, q.unit)}</b>. You guessed ${fmtV(g, q.unit)}, <b style="color:${cls}">${miss < 1.01 ? "spot on" : fmtNum(miss, miss < 10 ? 1 : 0) + "× " + (r > 1 ? "high" : "low")}</b>.` }));
+      out.appendChild(el("p", { class: "small muted", style: { margin: "2px 0 0" }, text: q.work }));
+      const m = log.filter(v => v != null).sort((a, b) => a - b);
+      const med = m.length ? (m.length % 2 ? m[(m.length - 1) / 2] : (m[m.length / 2 - 1] + m[m.length / 2]) / 2) : 1;
+      set("n", `${m.length} / ${QS.length}`);
+      set("two", String(m.filter(v => v <= 2).length), m.filter(v => v <= 2).length === m.length ? "good" : "warn");
+      set("twenty", String(m.filter(v => v <= 1.2).length));
+      set("med", fmtNum(med, 2) + "×", med <= 2 ? "good" : med <= 4 ? "warn" : "bad", "factor away from the truth");
+    }
+    load();
+    set("n", `0 / ${QS.length}`); set("two", "0"); set("twenty", "0"); set("med", "—");
+  })();
+
+  /* ---------------------------------------------------------- weekly rhythm figure */
+  (function () {
+    const s = document.getElementById("fig-week");
+    const blocks = [
+      ["Read + widgets", 2, "one module; predict", "before every slider", palette.blue],
+      ["Build from scratch", 2, "the core idea in", "under 150 lines", palette.green],
+      ["Lab", 1.75, "predict, measure,", "explain the gap", palette.brick],
+      ["Write-up", 0.75, "one page: numbers", "and surprises", palette.gold],
+      ["Review", 0.5, "redo an old quiz", "without notes", palette.plum]
+    ];
+    const total = blocks.reduce((a, b) => a + b[1], 0);
+    const x0 = 20, W = 720, colW = W / blocks.length;
+    let x = x0;
+    blocks.forEach(([t, hrs, l1, l2, col], i) => {
+      const w = W * hrs / total, cx = x0 + i * colW + 8;
+      s.appendChild(svg("rect", { x: x + 2, y: 40, width: w - 4, height: 40, rx: 7, fill: col, opacity: 0.16 }));
+      s.appendChild(svg("rect", { x: x + 2, y: 40, width: 4, height: 40, rx: 2, fill: col }));
+      s.appendChild(svg("text", { x: x + 12, y: 65, "font-size": 11, class: "mono", fill: col, text: hrs >= 1 ? hrs + " h" : hrs * 60 + " min" }));
+      s.appendChild(svg("path", { d: `M${x + w / 2},80 L${x + w / 2},88 L${cx},100 L${cx},106`, fill: "none", stroke: col, "stroke-width": 1, opacity: 0.7 }));
+      s.appendChild(svg("text", { x: cx, y: 122, "font-size": 12.5, "font-weight": 600, fill: palette.ink, text: t }));
+      s.appendChild(svg("text", { x: cx, y: 138, "font-size": 11, fill: palette.muted, text: l1 }));
+      s.appendChild(svg("text", { x: cx, y: 152, "font-size": 11, fill: palette.muted, text: l2 }));
+      x += w;
+    });
+    s.appendChild(svg("line", { x1: x0, x2: x0 + W, y1: 26, y2: 26, stroke: palette.ink }));
+    [0, 1, 2, 3, 4, 5, 6, 7].forEach(hh => {
+      const xx = x0 + W * hh / total;
+      s.appendChild(svg("line", { x1: xx, x2: xx, y1: 22, y2: 30, stroke: palette.ink }));
+      s.appendChild(svg("text", { x: xx, y: 16, "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.muted, text: hh + "h" }));
+    });
+    s.appendChild(svg("text", { x: x0, y: 180, "font-size": 11, fill: palette.faint, text: "Illustrative split for about 7 hours a week. Spread it over several days: short, frequent sessions beat one long one." }));
+  })();
+})();
+</script>
+</body>
+</html>

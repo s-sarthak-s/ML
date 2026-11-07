@@ -1,0 +1,1102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Training LLMs — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .pp-host svg { display: block; width: 100%; height: auto; }
+  .pp-label { font: 12px/1.4 var(--mono, monospace); color: #76736b; margin: 10px 0 4px; }
+  .mathline { margin: 10px 0 2px; overflow-x: auto; }
+</style>
+</head>
+<body data-module="07">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 07 · Running models</p>
+<h1 class="title">Training LLMs: where the <span class="it">FLOPs</span> go</h1>
+<p class="lede">GPT-3 took about 3×10²³ floating-point operations to train. Llama 3 405B took about 4×10²⁵, most of it on 16,384 H100s running for roughly two months. This module shows where numbers like that come from, how a model too big for any single GPU gets split across thousands of them, and the few formulas that let you price a training run before you launch it.</p>
+<div class="meta"><span class="tag">~3 hours</span><span class="tag n">prereqs: 02, 03, 06</span><span class="tag g">hands-on: PyTorch, torchrun, FSDP</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Estimate the FLOPs, GPU-hours, wall-clock time and rough cost of a training run from its parameter count and token count.</li>
+    <li>Use the Chinchilla scaling law to pick a compute-optimal model size, and explain why most shipped models train far past that point.</li>
+    <li>Budget per-GPU training memory (16 bytes per parameter plus activations) and choose a ZeRO/FSDP stage that fits.</li>
+    <li>Explain data, tensor, pipeline and context parallelism: what each one splits, what it sends over the wire, and how big the pipeline bubble is.</li>
+    <li>Write a bf16 training loop with AdamW, warmup plus cosine decay, gradient clipping and accumulation, then launch it on many GPUs with torchrun and FSDP.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="objective">The pretraining objective</h2>
+
+<p>Pretraining has one job: given some text, predict the next token. You take trillions of tokens of text, show the model each prefix, and nudge its weights so the token that actually came next gets a higher probability. There's no labelling step. The text supervises itself, which is why the dataset can be the size of a large fraction of the public web.</p>
+
+<p>Module 03 introduced cross-entropy. Here it is applied to a whole sequence at once:</p>
+
+<div class="formula" data-name="Next-token prediction loss">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}(\theta)} = -\frac{1}{\htmlClass{t2}{T}}\sum_{t=1}^{\htmlClass{t2}{T}} \log \htmlClass{t5}{p_\theta}\big(\htmlClass{t3}{x_t} \mid \htmlClass{t4}{x_{\lt t}}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}(\theta)\)</dt><dd>average loss in nats per token for weights \(\theta\); training minimizes its average over the corpus</dd></div>
+    <div data-t="t2"><dt>\(T\)</dt><dd>number of token positions in the sequence (e.g. 8,192)</dd></div>
+    <div data-t="t3"><dt>\(x_t\)</dt><dd>the token that actually appears at position \(t\), the "label"</dd></div>
+    <div data-t="t4"><dt>\(x_{\lt t}\)</dt><dd>every token before position \(t\), the context the model is allowed to see</dd></div>
+    <div data-t="t5"><dt>\(p_\theta\)</dt><dd>the model's softmax output: a probability for every token in the vocabulary</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>At every position, look up how much probability the model gave to the real next token, take the log, flip the sign, and average. A model that always assigns probability 1 to the right token scores 0.</p>
+  <p class="why"><b>Why it matters</b>Causal masking (Module 06) lets one forward pass over a sequence of length \(T\) produce \(T\) predictions at once. Every token in the corpus is a training example, and nothing is wasted on padding if sequences are packed.</p>
+</div>
+
+<p>Two reference points make the number readable. A model that guesses uniformly over a 128K vocabulary has loss \(\ln 128{,}000 \approx 11.8\) nats. Good open models get to roughly 1.5–2 nats on typical web text. The whole training run is the journey between those two numbers, and scaling laws (below) predict how far along it a given budget gets you.</p>
+
+<details class="think"><summary>Think first: loss falls from 11.8 to 2.0. Is the model six times better?</summary>
+<div>Not in any useful sense. Loss is a log scale: 2.0 nats means the model gives the right token an average (geometric-mean) probability of \(e^{-2}\approx 0.14\), which is a perplexity of about 7.4 (Module 03). 11.8 nats is a perplexity of 128,000. The last few tenths of a nat are where capabilities like arithmetic and instruction following tend to show up, which is why labs spend enormous compute to shave them.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="data">The data pipeline</h2>
+
+<p>Before any GPU spins up, someone has to turn the raw web into training tokens. Most quality differences between open models of the same size trace back to this step. Common Crawl publishes billions of pages per monthly snapshot; most of it is boilerplate, spam, duplicates, or text in languages you don't want. The pipeline is a long funnel of filters.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 872 256" id="fig-data"></svg>
+<figcaption>A typical web-data pipeline, in the style of RefinedWeb, FineWeb (Penedo et al., 2024) and DCLM (Li et al., 2024). Gold stages throw text away; green stages turn what survives into training sequences. The order matters: cheap filters run first so expensive ones (model classifiers, MinHash) see less data.</figcaption></figure>
+
+<p>Some details matter more than they look:</p>
+<ul>
+  <li><strong>Extraction</strong> decides what counts as the page. Navigation menus, cookie banners and comment sections become training text if you don't strip them.</li>
+  <li><strong>Quality filtering</strong> used to be hand-written rules (Gopher's rules: drop pages with too few words, too many symbols, lines that don't end in punctuation). Modern pipelines add a small classifier. FineWeb-Edu trained one on Llama-3-70B ratings of "educational value"; DCLM used a fastText classifier. Both gave large benchmark gains at the same token count.</li>
+  <li><strong>Deduplication</strong> matters because the web repeats itself. Memorized boilerplate wastes compute and raises the risk of regurgitating training data verbatim.</li>
+  <li><strong>Packing</strong> concatenates documents with an end-of-sequence token between them and cuts the stream into fixed windows (say 8,192 tokens), so no compute is spent on padding. Llama 3 also masked attention so tokens can't attend across a document boundary inside a window.</li>
+</ul>
+
+<div class="def"><b>Definition · MinHash near-duplicate detection</b>
+<p>Represent each document as its set of word 5-grams. The Jaccard similarity \(s\) of two sets is |overlap| / |union|. MinHash compresses each set into a short signature such that two signatures agree in any one position with probability exactly \(s\). Split a signature into \(b\) bands of \(r\) hashes; two documents become a duplicate candidate if any band matches completely, which happens with probability \(1-(1-s^r)^b\). With 14 bands of 8 (FineWeb's setup), a pair at \(s=0.75\) is caught about 77% of the time, at \(s=0.9\) more than 99.9%, at \(s=0.5\) only about 5%. That S-shaped curve is the point: one pass over billions of documents, no pairwise comparisons.</p>
+</div>
+
+<div class="mle"><b>MLE angle · data mixtures</b>
+<p>The final corpus isn't just web text. Labs mix web, code, math, papers, books and multilingual data in tuned proportions, and often upsample the best sources for a few epochs. Llama 3's paper reports roughly half general knowledge, a quarter math and reasoning, 17% code and 8% multilingual tokens. Choosing the mixture is usually done with small proxy models trained on candidate mixes, which is a cheap application of scaling laws.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="step">Anatomy of a training step</h2>
+
+<p>One optimizer step is the same five beats repeated hundreds of thousands of times. With data parallelism, every GPU holds a copy of the model and processes a different slice of the batch, and they only talk once per step, to agree on the gradient.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 272" id="fig-step"></svg>
+<figcaption>One data-parallel training step on two GPUs (real jobs use hundreds or thousands). Each replica runs forward, loss and backward on its own micro-batch. The all-reduce averages the gradients, so every replica applies the identical AdamW update and the copies stay in sync without ever exchanging weights.</figcaption></figure>
+
+<ol>
+  <li><strong>Forward.</strong> Run the batch through every layer, keeping the intermediate activations because backward will need them.</li>
+  <li><strong>Loss.</strong> Cross-entropy between the logits and the shifted tokens.</li>
+  <li><strong>Backward.</strong> Backprop (Module 04) produces one gradient number per weight.</li>
+  <li><strong>All-reduce.</strong> Sum gradients across replicas and divide by their count. NCCL does this over NVLink inside a node and InfiniBand or RoCE between nodes.</li>
+  <li><strong>Optimizer step.</strong> AdamW updates its moment estimates and the weights. Then zero the gradients and start again.</li>
+</ol>
+
+<p>A ring all-reduce sends and receives \(2(G-1)/G\) times the gradient size per GPU, so the per-GPU traffic barely changes as you add GPUs. For an 8B model with bf16 gradients that's about 2 × 16 GB = 32 GB per step. At a realistic 50 GB/s per GPU across nodes that would be well over half a second if done serially, which is why PyTorch DDP and FSDP split gradients into buckets and start reducing the last layers while backward is still computing the first ones.</p>
+
+<!-- ================================================================== -->
+<h2 id="compute" data-short="Compute: 6ND">Training compute: C ≈ 6ND</h2>
+
+<p>The single most useful formula in this module. Almost all of a transformer's arithmetic is matrix multiplication, and a matmul that touches a weight once per token does one multiply and one add with it. So the forward pass costs about 2 FLOPs per parameter per token.</p>
+
+<div class="formula" data-name="Training compute">
+  <div class="tex">$$\htmlClass{t1}{C} \;\approx\; (\htmlClass{t4}{2} + \htmlClass{t5}{4})\,\htmlClass{t2}{N}\,\htmlClass{t3}{D} \;=\; 6ND$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C\)</dt><dd>total training compute in FLOPs (floating-point operations, not per second)</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>number of parameters (non-embedding, strictly; the difference is small for big models)</dd></div>
+    <div data-t="t3"><dt>\(D\)</dt><dd>number of training tokens processed</dd></div>
+    <div data-t="t4"><dt>\(2\)</dt><dd>forward pass: one multiply and one add per weight per token</dd></div>
+    <div data-t="t5"><dt>\(4\)</dt><dd>backward pass: gradients with respect to activations (2) and with respect to weights (2)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every token touches every weight six times' worth of arithmetic: twice going forward, four times coming back.</p>
+  <p class="why"><b>Why it matters</b>GPT-3 (175B params, 300B tokens): 6 × 1.75×10¹¹ × 3×10¹¹ ≈ 3.15×10²³ FLOPs, matching the paper. Llama 3 405B (15.6T tokens): ≈ 3.8×10²⁵, matching Meta's report. Two numbers give you the bill.</p>
+</div>
+
+<details class="think"><summary>Think first: why is backward exactly twice the forward?</summary>
+<div>Take one linear layer \(y = Wx\) with \(W\) of shape \(m\times n\). Forward costs \(2mn\) FLOPs per token. Backward has to produce two things: the gradient for the previous layer, \(\partial L/\partial x = W^\top \partial L/\partial y\), which is another \(2mn\), and the gradient for the weights, \(\partial L/\partial W = (\partial L/\partial y)\,x^\top\), another \(2mn\). Two matmuls the size of the forward one, so 4N. Embedding lookups and elementwise ops are cheap enough to ignore.</div>
+</details>
+
+<p>6ND leaves out attention's score computation, which grows with context length. Kaplan et al. (2020) count it as an extra \(6\,n_{\text{layer}}\,n_{\text{ctx}}\,d_{\text{model}}\) FLOPs per training token. For an 8B model at 8K context that's around 13% on top of 6N before accounting for causal masking (which lets FlashAttention skip roughly half of it). It matters for long-context training; for back-of-envelope budgeting, 6ND is enough.</p>
+
+<h3>Model FLOPs utilization (MFU)</h3>
+
+<p>A GPU's spec sheet number is the peak. Real training never gets there: time goes to memory traffic, communication, non-matmul kernels, data loading and pipeline bubbles. MFU (Chowdhery et al., 2022, the PaLM paper) measures how much of the peak you actually turn into model progress.</p>
+
+<div class="formula" data-name="Model FLOPs utilization">
+  <div class="tex">$$\htmlClass{t1}{\text{MFU}} = \frac{6\,\htmlClass{t2}{N}\cdot \htmlClass{t3}{\tau}}{\htmlClass{t4}{n_{\text{gpu}}}\cdot \htmlClass{t5}{P_{\text{peak}}}} \qquad\Longrightarrow\qquad \text{wall-clock} = \frac{6ND}{\htmlClass{t4}{n_{\text{gpu}}}\cdot \htmlClass{t5}{P_{\text{peak}}}\cdot \htmlClass{t1}{\text{MFU}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>MFU</dt><dd>fraction of peak spent on the 6N model FLOPs; 35–50% is good for large dense models</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameter count</dd></div>
+    <div data-t="t3"><dt>\(\tau\)</dt><dd>measured training throughput, tokens per second for the whole job</dd></div>
+    <div data-t="t4"><dt>\(n_{\text{gpu}}\)</dt><dd>number of GPUs</dd></div>
+    <div data-t="t5"><dt>\(P_{\text{peak}}\)</dt><dd>peak dense FLOP/s per GPU at the training dtype: A100 312 T, H100 SXM ≈ 989 T (bf16)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Take the FLOPs the model strictly needed for the tokens you processed, divide by what the hardware could have done in that time.</p>
+  <p class="why"><b>Why it matters</b>Recomputing activations (see memory section) makes the GPU do 8N per token instead of 6N. That extra work counts toward <em>hardware</em> FLOPs utilization (HFU) but not MFU, which is why MFU is the honest number for comparing setups. PaLM reported 46% MFU; Llama 3 405B reported 38–43%.</p>
+</div>
+
+<div id="w-compute"></div>
+
+<div class="pitfall"><b>Pitfall · quoting sparse peak numbers</b>
+<p>NVIDIA spec sheets often lead with "with sparsity" figures (H100: ~1,979 TFLOP/s bf16), which assume 2:4 structured sparsity that dense LLM training doesn't use. Divide by two. FP8 peaks are about twice bf16 again, but only the matmuls you actually run in FP8 get that speed.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="scaling">Scaling laws</h2>
+
+<p>Given a compute budget \(C\), you still have a choice: a big model on fewer tokens, or a small model on many. Scaling laws are empirical fits that predict the loss for each choice, made by training dozens to hundreds of small models and extrapolating.</p>
+
+<h3>Kaplan et al. (2020)</h3>
+<p>OpenAI's first scaling-law paper found loss falls as a smooth power law in each resource when the others aren't the bottleneck: roughly \(L \propto N^{-0.076}\) in parameters and \(L \propto D^{-0.095}\) in tokens, over seven orders of magnitude. Their compute-optimal recipe put most extra compute into parameters (\(N_{\text{opt}} \propto C^{0.73}\)) and recommended stopping well before convergence. GPT-3's 175B parameters on only 300B tokens (1.7 tokens per parameter) followed this advice.</p>
+
+<h3>Chinchilla (Hoffmann et al., 2022)</h3>
+<p>DeepMind trained over 400 models from 70M to 16B parameters on 5B to 500B tokens, with the learning-rate schedule matched to each run's length (Kaplan's runs used one schedule length, which made shorter runs look worse than they were). Their third fitting approach models loss as an irreducible floor plus one penalty for being too small and one for seeing too little data:</p>
+
+<div class="formula" data-name="Chinchilla parametric loss">
+  <div class="tex">$$\htmlClass{t1}{L(N, D)} = \htmlClass{t2}{E} + \htmlClass{t3}{\frac{A}{N^{\alpha}}} + \htmlClass{t4}{\frac{B}{D^{\beta}}}, \qquad E=1.69,\; A=406.4,\; B=410.7,\; \alpha=0.34,\; \beta=0.28$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(L(N,D)\)</dt><dd>predicted pretraining loss (nats/token on their data) for \(N\) params trained on \(D\) tokens</dd></div>
+    <div data-t="t2"><dt>\(E\)</dt><dd>irreducible loss: the entropy of text itself, which no model can beat</dd></div>
+    <div data-t="t3"><dt>\(A/N^{\alpha}\)</dt><dd>capacity penalty: a finite model can't represent the true distribution; shrinks as \(N\) grows</dd></div>
+    <div data-t="t4"><dt>\(B/D^{\beta}\)</dt><dd>data penalty: finite training can't fully fit even the model you have; shrinks as \(D\) grows</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Loss is a floor plus two terms that decay as power laws, one in model size and one in data. Spend compute on whichever term is currently bigger.</p>
+  <p class="why"><b>Why it matters</b>Gopher (280B params, 300B tokens) and Chinchilla (70B, 1.4T tokens) used about the same compute. Chinchilla, four times smaller, beat Gopher on most benchmarks. Most models of that era were too big for their data.</p>
+</div>
+
+<p>Substitute \(D = C/6N\) and minimize over \(N\). Setting the derivative to zero gives \(\alpha A/N^\alpha = \beta B / D^\beta\): at the optimum, the marginal loss reduction per FLOP is the same in both directions. Solving:</p>
+
+<div class="formula" data-name="Compute-optimal allocation">
+  <div class="tex">$$\htmlClass{t1}{N_{\text{opt}}} = \htmlClass{t4}{G}\left(\frac{\htmlClass{t3}{C}}{6}\right)^{\frac{\beta}{\alpha+\beta}}, \qquad \htmlClass{t2}{D_{\text{opt}}} = \htmlClass{t4}{G}^{-1}\left(\frac{\htmlClass{t3}{C}}{6}\right)^{\frac{\alpha}{\alpha+\beta}}, \qquad \htmlClass{t4}{G} = \left(\frac{\alpha A}{\beta B}\right)^{\frac{1}{\alpha+\beta}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(N_{\text{opt}}\)</dt><dd>loss-minimizing parameter count for budget \(C\)</dd></div>
+    <div data-t="t2"><dt>\(D_{\text{opt}}\)</dt><dd>matching token count; \(6N_{\text{opt}}D_{\text{opt}} = C\)</dd></div>
+    <div data-t="t3"><dt>\(C\)</dt><dd>compute budget in FLOPs</dd></div>
+    <div data-t="t4"><dt>\(G\)</dt><dd>constant from the fit (≈ 1.35 with the published values)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>With the published fit the exponents are 0.45 and 0.55, both close to ½: ten times more compute should buy about 2.8× more parameters and 3.5× more tokens. Chinchilla's other two fitting methods gave almost exactly ½ and ½, which is where the famous rule of thumb comes from: about <strong>20 tokens per parameter</strong>.</p>
+</div>
+
+<div id="w-scaling"></div>
+
+<div class="flag"><b>Caveat · the published fit and "20 tokens per parameter" disagree</b>
+<p>Run the widget with the published constants and the optimum lands at 30–120 tokens per parameter depending on budget, not 20. Besiroglu et al. (2024) reconstructed the data from the paper's figures and found the published Approach-3 fit doesn't match it well; their refit (\(E=1.82, A=482, B=2085, \alpha=0.35, \beta=0.37\)) gives about 20 tokens per parameter, agreeing with Chinchilla's other two methods. Toggle the fit to compare. The practical lesson survives either way: the valley is flat. At \(10^{21}\) FLOPs, the 20N model and the fit-optimal one differ by under 0.01 nats.</p>
+</div>
+
+<h3>Why modern small models are "overtrained"</h3>
+
+<p>Chinchilla answers one question: <em>what's the lowest loss for a fixed training budget?</em> A company shipping a model asks a different one: <em>what's the cheapest model that's good enough, counting every token it will ever generate?</em> Inference costs about \(2N\) FLOPs per generated token, forever. A smaller model trained on more data costs more to train than it "should" but less every time someone uses it (Sardana et al., 2023, "Beyond Chinchilla-Optimal").</p>
+
+<p>Llama 3 8B was trained on about 15T tokens: roughly 1,900 tokens per parameter, almost 100× the Chinchilla ratio. Training compute: 6 × 8×10⁹ × 1.5×10¹³ ≈ 7.2×10²³ FLOPs. The 20N rule would spend that budget on a ~77B model with 1.5T tokens. Plug both into the published fit and you get predicted losses of about 1.95 for the 8B and 1.93 for the 77B. Giving up roughly 0.02–0.05 nats (depending on which fit you trust) buys a model that's nearly ten times cheaper to serve per token and fits on a single consumer GPU. Llama 3.2's 1B and 3B went further still, at up to 9T tokens.</p>
+
+<div class="intuition"><b>Intuition</b>
+<p>Chinchilla-optimal is the cheapest way to <em>reach</em> a loss. Overtraining is paying extra in the factory to make a product that's cheaper to run. Whenever inference volume is large, the second trade wins. Note too that these fits are extrapolated far beyond the token ratios they were measured at, so treat the exact losses as illustrative.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="memory">Training memory</h2>
+
+<p>Inference needs the weights (2 bytes per parameter in bf16) plus a KV cache. Training needs far more, because it also stores gradients, optimizer state and activations. The weights turn out to be the small part.</p>
+
+<div class="formula" data-name="Model state memory (bf16 mixed precision + Adam)">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{state}}} = \htmlClass{t2}{N}\times\big(\htmlClass{t3}{2} + \htmlClass{t4}{2} + \htmlClass{t5}{4} + \htmlClass{t6}{4 + 4}\big) = 16N \text{ bytes}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{state}}\)</dt><dd>bytes for everything that persists between steps</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameter count</dd></div>
+    <div data-t="t3"><dt>2</dt><dd>bf16 copy of the weights used in forward and backward</dd></div>
+    <div data-t="t4"><dt>2</dt><dd>bf16 gradients</dd></div>
+    <div data-t="t5"><dt>4</dt><dd>fp32 master weights, the copy the optimizer actually updates</dd></div>
+    <div data-t="t6"><dt>4 + 4</dt><dd>Adam's first moment \(m\) and second moment \(v\), both fp32</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Sixteen bytes per parameter before a single activation is stored. Twelve of them belong to the optimizer.</p>
+  <p class="why"><b>Why it matters</b>A 7B model needs 7×10⁹ × 16 = 112 GB of state. That doesn't fit on one 80 GB GPU even with zero activations, which is why full fine-tuning a 7B model needs sharding (or LoRA, Module 10). Setups that keep gradients in fp32 for accumulation use 18 bytes; FSDP with fp32 sharded parameters and bf16 compute copies works out to about 16.</p>
+</div>
+
+<h3>Activations</h3>
+<p>Backward needs the intermediate values from forward: attention inputs, MLP hidden states, normalization inputs. Those scale with tokens in flight, not with parameters. Korthikanti et al. (2022) count them for a GPT-style block in 16-bit:</p>
+
+<div class="formula" data-name="Activation memory (approximate)">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{act}}} \approx 34 \cdot \htmlClass{t2}{s}\cdot \htmlClass{t3}{b}\cdot \htmlClass{t4}{h}\cdot \htmlClass{t5}{L} \text{ bytes}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{act}}\)</dt><dd>activation bytes held for the backward pass, per GPU, no tensor parallelism</dd></div>
+    <div data-t="t2"><dt>\(s\)</dt><dd>sequence length in tokens</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>micro-batch size (sequences per forward pass)</dd></div>
+    <div data-t="t4"><dt>\(h\)</dt><dd>hidden size \(d_{\text{model}}\)</dd></div>
+    <div data-t="t5"><dt>\(L\)</dt><dd>number of layers</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>About 34 bytes per hidden unit per token per layer. The paper's full formula has an extra term that grows with \(s^2\) for the attention matrix; FlashAttention never materializes that matrix, so it drops out. Modern SwiGLU blocks differ somewhat, so treat this as an order-of-magnitude estimate.</p>
+  <p class="why"><b>Why it matters</b>Llama-3-8B shape (32 layers, \(h = 4096\)) at 4,096 tokens: 34 × 4096 × 4096 × 32 ≈ 18 GB for a <em>single</em> sequence. Activations easily rival model state.</p>
+</div>
+
+<p><strong>Activation checkpointing</strong> (also called gradient checkpointing or rematerialization) trades compute for memory. Keep only each layer's input during forward, throw away everything inside, and recompute the layer's forward pass during backward when its internals are needed. Memory drops to about \(2sbhL\) bytes plus one layer's full working set. The price is an extra forward pass: about 8N FLOPs per token instead of 6N, so roughly 33% more compute. Selective checkpointing recomputes only the cheap-but-large parts (attention softmax, activation functions) and gets most of the saving for a few percent of compute.</p>
+
+<div id="w-memory"></div>
+
+<!-- ================================================================== -->
+<h2 id="precision">Mixed precision</h2>
+
+<p>Module 09 covered the formats. The training recipe that uses them: do the expensive matmuls in a 16-bit format, at 2× or more the throughput and half the memory traffic of fp32, while keeping the numerically delicate parts in fp32.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 250" id="fig-mp"></svg>
+<figcaption>bf16 mixed-precision training. The optimizer owns an fp32 master copy; each step casts it to bf16 for compute. Matmuls accumulate in fp32 inside the tensor cores, and softmax, normalization and the loss run in fp32 under autocast. Only fp16 needs the dashed loss-scaling path.</figcaption></figure>
+
+<p>Why keep an fp32 master copy at all? bf16 has only 8 bits of precision. Near 1.0, neighbouring bf16 values are \(2^{-7}\approx 0.0078\) apart. A typical update \(\eta\,\hat g\) of \(10^{-4}\) to a weight of 1.0 is less than half a step, so it rounds away to nothing. Do that for every weight on every step and training silently stalls. In fp32 the gap near 1.0 is about \(10^{-7}\), so small updates accumulate.</p>
+
+<div class="grid2">
+  <div class="card"><div class="k">bf16 · the default</div><h4>Same range as fp32</h4><p>8 exponent bits, so gradients don't underflow. Wrap the forward pass in <code>torch.autocast(dtype=torch.bfloat16)</code>, keep parameters and optimizer in fp32, and that's it. Supported on A100, H100, TPUs and recent consumer GPUs.</p></div>
+  <div class="card warn"><div class="k">fp16 · needs loss scaling</div><h4>Narrow range, extra bookkeeping</h4><p>Max 65,504 and small gradients flush to zero. Multiply the loss by a scale \(S\) (PyTorch's <code>GradScaler</code> starts at \(2^{16}\)), so gradients are \(S\times\) larger; unscale before clipping; skip the step and halve \(S\) on inf/NaN; double \(S\) after 2,000 clean steps.</p></div>
+</div>
+
+<p><strong>FP8 training</strong> goes one step further on H100 and newer hardware: matmul inputs in FP8 (E4M3 for weights and activations, often E5M2 for gradients) with fine-grained scaling factors, everything else in bf16/fp32. DeepSeek-V3 (DeepSeek-AI, 2024) was trained this way at scale. It's real but fiddlier; bf16 remains the safe default.</p>
+
+<!-- ================================================================== -->
+<h2 id="dp" data-short="Data parallel & ZeRO">Data parallelism, ZeRO and FSDP</h2>
+
+<p>Plain data parallelism (PyTorch DDP) replicates everything: weights, gradients, optimizer state. It scales throughput but not model size. Every GPU still needs all 16N bytes. The ZeRO paper (Rajbhandari et al., 2020) noticed that this replication is pure waste: each GPU only needs the full optimizer state for the parameters it's responsible for updating. Shard the states across the \(G\) data-parallel GPUs and gather pieces only when needed.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 320" id="fig-zero"></svg>
+<figcaption>What each of 4 GPUs holds under ZeRO stages 0–3, with Ψ = parameter count and the 2 + 2 + 12 bytes from the memory formula. Dashed outline = the full tensor exists logically; solid slice = the quarter this GPU stores. Stages 1 and 2 cost no more communication than DDP (an all-reduce is a reduce-scatter plus an all-gather anyway). Stage 3 adds parameter all-gathers in forward and backward, about 1.5× DDP traffic.</figcaption></figure>
+
+<div class="formula" data-name="Per-GPU state memory under ZeRO">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{GPU}}} = \frac{2\htmlClass{t2}{N}}{\htmlClass{t3}{G_w}} + \frac{2\htmlClass{t2}{N}}{\htmlClass{t4}{G_g}} + \frac{12\htmlClass{t2}{N}}{\htmlClass{t5}{G_o}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{GPU}}\)</dt><dd>model-state bytes on each GPU (activations not included)</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameter count</dd></div>
+    <div data-t="t3"><dt>\(G_w\)</dt><dd>\(G\) if weights are sharded (stage 3), else 1</dd></div>
+    <div data-t="t4"><dt>\(G_g\)</dt><dd>\(G\) if gradients are sharded (stage 2+), else 1</dd></div>
+    <div data-t="t5"><dt>\(G_o\)</dt><dd>\(G\) if optimizer state is sharded (stage 1+), else 1</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each stage divides one more term by the number of GPUs. At stage 3, a 70B model's 1.12 TB of state spread over 64 GPUs is 17.5 GB each.</p>
+  <p class="why"><b>Why it matters</b>PyTorch's FSDP is ZeRO-3 (its <code>SHARD_GRAD_OP</code> mode is ZeRO-2). DeepSpeed exposes all stages plus CPU/NVMe offload. In practice: try DDP if it fits, else FSDP, and add tensor or pipeline parallelism only when FSDP alone stops scaling.</p>
+</div>
+
+<p>ZeRO-3 / FSDP works layer by layer. Before a layer's forward, all-gather its full weights from the shards, compute, then free them. Backward does the same again, then reduce-scatters the gradients so each GPU ends up with only its shard's summed gradient, and updates only its shard. Prefetching the next layer's all-gather while the current one computes hides most of the cost, as long as layers are big enough relative to network bandwidth.</p>
+
+<div class="pitfall"><b>Pitfall · ZeRO doesn't shard activations</b>
+<p>All ZeRO stages divide model state. Activations stay per-GPU because each GPU processes its own micro-batch. If activations are your problem (long sequences, big micro-batches), sharding more aggressively won't help. Activation checkpointing, smaller micro-batches with gradient accumulation, or sequence/context parallelism will.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="mp" data-short="Tensor, pipeline, context">Model parallelism: tensor, pipeline, context</h2>
+
+<p>FSDP shards storage, but each GPU still runs every layer on its full micro-batch. At the largest scales that hits limits: the global batch gets too big to train well, all-gathers stop hiding behind compute, and a single sequence's activations overflow memory. The next tools split the <em>computation</em> itself.</p>
+
+<h3>Tensor parallelism</h3>
+<p>Megatron-LM (Shoeybi et al., 2019) splits individual weight matrices across GPUs. The trick is pairing a column split with a row split so the two matmuls of an MLP need only one communication between them.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 300" id="fig-tp"></svg>
+<figcaption>Tensor-parallel MLP on 2 GPUs: \(Z = \mathrm{GeLU}(XA)\,B\). Split \(A\) by columns, so each GPU computes half the hidden units, and GeLU applies to each half independently. Split \(B\) by rows, so each GPU produces a partial sum of the full output. One all-reduce adds the partials. Attention splits the same way, by heads.</figcaption></figure>
+
+<p>Tensor parallelism communicates inside every layer, twice per layer in forward and twice in backward, with activation-sized messages. That's only affordable over NVLink, so TP is almost always confined to the 8 GPUs of one node. It also splits activation memory across the TP group, which FSDP can't do.</p>
+
+<h3>Pipeline parallelism</h3>
+<p>Pipeline parallelism splits the model by depth: GPU 0 holds layers 1–20, GPU 1 holds 21–40, and so on. Only activations cross stage boundaries, point-to-point, which tolerates slower inter-node links. The catch is idle time. With one batch, stage 3 waits while stages 0–2 run forward, and stage 0 waits while the gradients travel back. Splitting the batch into \(m\) micro-batches lets stages work on different micro-batches at once (GPipe; Huang et al., 2019).</p>
+
+<figure class="fig wide"><div id="fig-pp" class="pp-host"></div>
+<figcaption>GPipe schedules for 4 stages. Blue = forward, green = backward (twice as long), brick background = idle. With one micro-batch, each stage idles 75% of the time. With 8 micro-batches the idle fraction falls to 3/11 ≈ 27%. Numbers inside blocks are micro-batch indices.</figcaption></figure>
+
+<div class="formula" data-name="Pipeline bubble fraction">
+  <div class="tex">$$\htmlClass{t1}{\text{bubble}} = \frac{\htmlClass{t2}{p} - 1}{\htmlClass{t3}{m} + \htmlClass{t2}{p} - 1}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>bubble</dt><dd>fraction of total step time a stage sits idle</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>number of pipeline stages</dd></div>
+    <div data-t="t3"><dt>\(m\)</dt><dd>number of micro-batches per optimizer step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Filling and draining the pipeline costs \(p-1\) slots of idle time per stage, out of \(m + p - 1\) total. Keep \(m\) several times larger than \(p\).</p>
+  <p class="why"><b>Why it matters</b>\(p = 8\), \(m = 8\): 47% idle. \(m = 32\): 18%. But more micro-batches means a bigger global batch. Some papers write the bubble as \((p-1)/m\), relative to useful compute rather than total time; same physics.</p>
+</div>
+
+<p>GPipe runs all forwards, then all backwards, so stage 0 holds activations for all \(m\) micro-batches at once. The <strong>1F1B</strong> schedule (PipeDream-Flush; Narayanan et al., 2021) starts each micro-batch's backward as soon as possible, alternating one forward with one backward. The bubble is identical, but stage \(i\) holds at most \(p-i\) micro-batches of activations instead of \(m\). Interleaved schedules (several small stages per GPU) and zero-bubble schedules shrink the bubble further at the cost of more communication.</p>
+
+<div id="w-pp"></div>
+
+<h3>Sequence and context parallelism</h3>
+<p>Two different things share similar names. <strong>Sequence parallelism</strong> (Korthikanti et al., 2022) is a companion to tensor parallelism: the layer norms and dropouts that TP leaves replicated get split along the sequence dimension instead, removing the remaining duplicated activations. <strong>Context parallelism</strong> splits one long sequence across GPUs for the whole layer, including attention. Each GPU keeps its chunk of queries, and key/value blocks rotate around a ring of GPUs so every query sees every key (Ring Attention; Liu et al., 2023). It's how 128K–1M-token training fits: Llama 3 used it for its long-context stage.</p>
+
+<h3>Putting it together: 3D (and 4D) parallelism</h3>
+
+<figure class="fig wide"><svg viewBox="0 0 880 330" id="fig-3d"></svg>
+<figcaption>Combining strategies on 32 GPUs: tensor parallelism of 4 inside each node (NVLink), 4 pipeline stages across nodes, and 2 data-parallel replicas. Each axis matches its communication pattern to the link that can carry it: the chattiest (TP) gets the fastest wires.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Strategy</th><th>Splits</th><th>Communication</th><th>Typical placement</th></tr></thead>
+  <tbody>
+    <tr><td>Data parallel (DDP)</td><td>the batch</td><td>gradient all-reduce once per step</td><td>anywhere; overlaps with backward</td></tr>
+    <tr><td>FSDP / ZeRO-3</td><td>batch + all model state</td><td>param all-gather per layer, grad reduce-scatter</td><td>within and across nodes</td></tr>
+    <tr><td>Tensor parallel</td><td>each weight matrix</td><td>activation all-reduce, several per layer</td><td>inside a node (NVLink), size ≤ 8</td></tr>
+    <tr><td>Pipeline parallel</td><td>layers (depth)</td><td>point-to-point activations between stages</td><td>across nodes</td></tr>
+    <tr><td>Context parallel</td><td>the sequence</td><td>K/V blocks passed around a ring</td><td>long-context phases</td></tr>
+    <tr><td>Expert parallel</td><td>MoE experts</td><td>all-to-all token routing</td><td>MoE models only</td></tr>
+  </tbody>
+</table>
+
+<p>Llama 3 405B's main pretraining phase used TP 8 × PP 16 × DP 128 = 16,384 GPUs at 8K context, and switched on context parallelism of 16 for the 128K-context phase (Dubey et al., 2024). The product of all the parallel degrees always equals the GPU count.</p>
+
+<!-- ================================================================== -->
+<h2 id="optim" data-short="Batch, LR & stability">Batch size, schedules and stability</h2>
+
+<h3>Batch size</h3>
+<p>The quantity that matters is tokens per optimizer step: \(B_{\text{tokens}} = b_{\text{micro}} \times k_{\text{accum}} \times G_{\text{DP}} \times s\). For example 1 sequence × 16 accumulation steps × 128 replicas × 8,192 tokens ≈ 16.8M tokens. Gradient accumulation lets a single GPU emulate a large batch by running several micro-batches before stepping.</p>
+<p>Bigger batches give less noisy gradients, but past a <em>critical batch size</em> (McCandlish et al., 2018) the extra noise reduction stops buying faster progress per token, and you're just burning compute. The critical size grows as loss falls, which is why runs often ramp the batch up: GPT-3 used 3.2M tokens per batch for 175B; Llama 3 405B started at 4M tokens and grew to 16M.</p>
+
+<h3>Learning-rate schedule</h3>
+<p>Nearly every LLM uses AdamW (β₁ = 0.9, β₂ = 0.95, weight decay 0.1 are common choices) with a schedule: a short linear warmup from near zero, then a decay. Warmup matters because Adam's second-moment estimate \(v\) starts at zero and is unreliable for the first few hundred steps, so large early updates can blow the model up.</p>
+
+<div class="formula" data-name="Warmup + cosine decay">
+  <div class="tex">$$\htmlClass{t1}{\eta_t} = \htmlClass{t3}{\eta_{\min}} + \tfrac{1}{2}\big(\htmlClass{t2}{\eta_{\max}} - \htmlClass{t3}{\eta_{\min}}\big)\left(1 + \cos\!\left(\pi\,\frac{t - \htmlClass{t4}{t_w}}{\htmlClass{t5}{T} - \htmlClass{t4}{t_w}}\right)\right), \qquad t \ge t_w$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\eta_t\)</dt><dd>learning rate at step \(t\)</dd></div>
+    <div data-t="t2"><dt>\(\eta_{\max}\)</dt><dd>peak learning rate, smaller for bigger models (GPT-3: 6×10⁻⁴ at 125M, 0.6×10⁻⁴ at 175B)</dd></div>
+    <div data-t="t3"><dt>\(\eta_{\min}\)</dt><dd>floor, often 10% of peak</dd></div>
+    <div data-t="t4"><dt>\(t_w\)</dt><dd>warmup steps (hundreds to a few thousand); before \(t_w\), \(\eta_t = \eta_{\max}\, t/t_w\)</dd></div>
+    <div data-t="t5"><dt>\(T\)</dt><dd>total steps, fixed in advance</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Ramp up, then glide down along half a cosine wave to the floor exactly at the last step.</p>
+  <p class="why"><b>Why it matters</b>Cosine forces you to choose \(T\) up front; stopping early leaves the model at a high learning rate and a worse loss. Warmup-stable-decay (WSD) schedules hold the peak flat and decay only in the last 10–20%, so you can branch a decay off any checkpoint. That's convenient for scaling-law sweeps and for extending a run.</p>
+</div>
+
+<div id="w-lr"></div>
+
+<h3>Training stability</h3>
+<p>Large runs sometimes show <strong>loss spikes</strong>: the loss jumps sharply, then either recovers or diverges. Common culprits are attention logits growing until softmax saturates, output logits drifting to huge magnitudes, a bad batch, or simply a learning rate too high for the current scale. A diverged run at 10,000 GPUs costs real money, so the standard recipe stacks several defences:</p>
+<ul>
+  <li><strong>Gradient clipping</strong>: if the global gradient norm exceeds \(c\) (usually 1.0), scale it down, \(g \leftarrow g\cdot\min(1, c/\lVert g\rVert)\). Log the pre-clip norm; a rising trend often precedes a spike.</li>
+  <li><strong>QK-norm</strong>: apply RMSNorm to queries and keys per head before the dot product, which bounds attention logits (Dehghani et al., 2023; used in OLMo 2 and Gemma 3).</li>
+  <li><strong>Lower β₂</strong>: 0.95 instead of Adam's default 0.999 lets the second moment react faster when gradient scale shifts.</li>
+  <li><strong>Rewind and skip</strong>: PaLM's response to a spike was to restart from a checkpoint about 100 steps earlier and skip a few hundred batches around it.</li>
+</ul>
+
+<div class="formula" data-name="z-loss (PaLM)">
+  <div class="tex">$$\mathcal{L}_{z} = \htmlClass{t1}{\lambda}\,\log^2 \htmlClass{t2}{Z}, \qquad \htmlClass{t2}{Z} = \sum_{i} e^{\htmlClass{t3}{z_i}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\lambda\)</dt><dd>small coefficient; PaLM used \(10^{-4}\)</dd></div>
+    <div data-t="t2"><dt>\(Z\)</dt><dd>softmax normalizer over the vocabulary</dd></div>
+    <div data-t="t3"><dt>\(z_i\)</dt><dd>output logit for token \(i\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Softmax doesn't care if you add a constant to every logit, so logits can drift upward without changing the loss until bf16 runs out of precision. This auxiliary term pulls \(\log Z\) toward 0 and keeps logits anchored.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="ops" data-short="Checkpoints, evals, after">Checkpoints, evals, and what comes after</h2>
+
+<h3>Checkpointing</h3>
+<p>At this scale hardware fails constantly. Llama 3's report counted 466 job interruptions in a 54-day window, 419 of them unexpected, mostly GPU and host failures: about one every three hours. So the job saves checkpoints regularly and restarts from the last one. A full checkpoint is model plus optimizer state: about 16 bytes per parameter, roughly 6.5 TB for 405B. Each rank writes its own shards in parallel (<code>torch.distributed.checkpoint</code>), often asynchronously so training continues while files flush to storage.</p>
+<p>How often? A classic approximation (Young, 1974) sets the interval near \(\sqrt{2\,\delta\, M}\), where \(\delta\) is the time to write a checkpoint and \(M\) the mean time between failures. With \(\delta = 2\) minutes and \(M = 3\) hours, that's about 27 minutes. Checkpoint more often and you waste time writing; less often and each failure throws away more work.</p>
+
+<h3>Evals during training</h3>
+<p>Training loss alone can mislead: it's on data the model is currently seeing, and a data-mixture change moves it for reasons unrelated to quality. Runs track held-out loss per domain (web, code, math, each language), plus cheap downstream evals every few thousand steps, typically multiple-choice tasks scored by comparing log-probabilities, since a base model can't follow instructions yet. Sudden drops in one domain's held-out loss, or a gradient-norm spike, are what wake someone up at 3 a.m.</p>
+
+<div class="mle"><b>MLE angle · read a loss curve like a pro</b>
+<p>A healthy curve falls fast, then follows a smooth power law on a log-log plot. Plateaus that break suddenly often mean a learning-rate or data-ordering issue. Steady upward drift in gradient norm means instability is coming. A sharp drop near the end of a cosine or WSD schedule is normal: that's the decay phase cashing in. When comparing runs, compare at equal tokens, not equal steps.</p>
+</div>
+
+<h3>After pretraining</h3>
+<p>The pretrained base model is a superb text predictor and a poor assistant. A few more phases turn it into a product:</p>
+<ol>
+  <li><strong>Mid-training (annealing).</strong> Continue pretraining while the LR decays, on upsampled high-quality data: math, code, curated documents, and long documents to extend context. Llama 3 stretched its context from 8K to 128K in stages over roughly 800B tokens.</li>
+  <li><strong>Supervised fine-tuning (SFT).</strong> Train on prompt/response pairs so the model follows instructions and uses a chat template.</li>
+  <li><strong>Preference tuning and RL.</strong> RLHF, DPO, and RL with verifiable rewards (GRPO and relatives) shape helpfulness, safety and reasoning.</li>
+</ol>
+<p>These phases use a tiny fraction of pretraining compute but change behaviour enormously. Module 10 covers them in depth, including LoRA, which sidesteps most of this module's memory problems.</p>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. A minimal single-GPU training loop</h3>
+<p>Everything from this module in one file: packed token windows, bf16 autocast over fp32 weights, AdamW with decoupled weight decay on matrices only, warmup plus cosine, gradient accumulation, clipping, and an MFU readout. Use a small config (e.g. Llama-3.2-1B's shape, randomly initialized) on a single 24–80 GB GPU.</p>
+<div class="code" data-lang="python" data-title="train.py"><pre><code>
+import math, time
+import numpy as np
+import torch
+import torch.nn.functional as F
+from transformers import AutoConfig, AutoModelForCausalLM
+
+torch.manual_seed(0)
+device = "cuda"
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# --- data: one long stream of token ids (docs joined with EOS), memory-mapped
+tokens = np.memmap("train.bin", dtype=np.uint32, mode="r")   # uint32: vocab is 128K
+seq_len, micro_bs, accum_steps = 2048, 4, 8                 # 64K tokens per optimizer step
+
+def get_batch():
+    ix = torch.randint(len(tokens) - seq_len - 1, (micro_bs,))
+    buf = torch.stack([torch.from_numpy(tokens[i:i + seq_len + 1].astype(np.int64)) for i in ix])
+    buf = buf.pin_memory().to(device, non_blocking=True)
+    return buf[:, :-1], buf[:, 1:]                           # inputs, next-token targets
+
+# --- model: architecture only, random init, fp32 master weights
+config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B")
+model = AutoModelForCausalLM.from_config(config).to(device)
+model.gradient_checkpointing_enable(                          # trade ~33% compute for memory
+    gradient_checkpointing_kwargs={"use_reentrant": False})
+n_params = sum(p.numel() for p in model.parameters())
+
+# --- AdamW: decay matrices, not norms/biases
+decay = [p for p in model.parameters() if p.dim() >= 2]
+no_decay = [p for p in model.parameters() if p.dim() &lt; 2]
+opt = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}],
+    lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=True)
+
+# --- warmup + cosine to 10% of peak
+total_steps, warmup, min_ratio = 20_000, 1_000, 0.1
+def lr_lambda(step):
+    if step &lt; warmup:
+        return (step + 1) / warmup
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+model.train()
+for step in range(total_steps):
+    t0 = time.time()
+    for _ in range(accum_steps):
+        x, y = get_batch()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(input_ids=x).logits
+        # loss in fp32; divide so accumulated grads equal the mean over the big batch
+        loss = F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.reshape(-1))
+        (loss / accum_steps).backward()
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    opt.step()
+    sched.step()
+    opt.zero_grad(set_to_none=True)
+
+    if step % 50 == 0:
+        torch.cuda.synchronize()
+        dt = time.time() - t0
+        tok_s = micro_bs * seq_len * accum_steps / dt
+        mfu = 6 * n_params * tok_s / 989e12                   # H100 bf16 dense peak; 312e12 for A100
+        print(f"step {step} loss {loss.item():.3f} gnorm {gnorm:.2f} "
+              f"lr {sched.get_last_lr()[0]:.2e} {tok_s:,.0f} tok/s MFU {mfu:.1%}")
+</code></pre></div>
+
+<div class="flag"><b>Notes on the loop</b>
+<p>The MFU printed here uses 6N, so with gradient checkpointing on it under-reports how busy the GPU is (the hardware does about 8N). <code>logits.float()</code> for a 128K vocabulary is about 1 GB per 2K-token sequence; fused or chunked cross-entropy kernels avoid materializing it. Add <code>model = torch.compile(model)</code> once everything works for a typical 10–30% speedup.</p>
+</div>
+
+<h3>2. Many GPUs with torchrun and FSDP</h3>
+<p>The same loop, sharded with FSDP2's <code>fully_shard</code> (PyTorch 2.6+). Each transformer block becomes its own shard unit, so only one block's full weights are ever gathered at once. The mixed-precision policy replaces autocast: sharded parameters stay in fp32, are all-gathered in bf16 for compute, and gradients are reduced in fp32.</p>
+<div class="code" data-lang="python" data-title="train_fsdp.py"><pre><code>
+import os
+import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+import torch.nn.functional as F
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.checkpoint.state_dict import get_state_dict
+from transformers import AutoConfig, AutoModelForCausalLM
+from data import get_batch                 # train.py's memmap get_batch(), moved into data.py
+
+total_steps = 20_000
+dist.init_process_group("nccl")
+rank, world = dist.get_rank(), dist.get_world_size()
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+
+torch.manual_seed(0)                       # same init on every rank before sharding
+config = AutoConfig.from_pretrained("meta-llama/Llama-3.1-8B")
+with torch.device("cuda"):                 # 8B fp32 = 32 GB, fits before sharding on 80 GB GPUs;
+    model = AutoModelForCausalLM.from_config(config)   # beyond ~13B, build on "meta" and init shards
+model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+for block in model.model.layers:           # one FSDP unit per transformer block
+    fully_shard(block, mp_policy=mp)
+fully_shard(model, mp_policy=mp)           # root: embeddings, final norm, lm_head
+
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+torch.manual_seed(1234 + rank)             # different data on every rank
+
+for step in range(total_steps):
+    x, y = get_batch()                     # each rank samples its own windows
+    logits = model(input_ids=x).logits     # FSDP casts params to bf16; no autocast needed
+    loss = F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.reshape(-1))
+    loss.backward()                        # grads reduce-scattered to their owning shard
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+    if step % 1000 == 0:                   # every rank writes its own shards in parallel
+        msd, osd = get_state_dict(model, opt)
+        dcp.save({"model": msd, "optim": osd}, checkpoint_id=f"ckpt/step{step:07d}")
+
+dist.destroy_process_group()
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="launch"><pre><code>
+# one node, 8 GPUs
+torchrun --standalone --nproc_per_node=8 train_fsdp.py
+
+# four nodes: run the same command on each node
+torchrun --nnodes=4 --nproc_per_node=8 \
+  --rdzv_backend=c10d --rdzv_endpoint=$HEAD_NODE:29500 --rdzv_id=run42 \
+  train_fsdp.py
+</code></pre></div>
+
+<p>For anything beyond FSDP (tensor, pipeline or context parallelism, FP8, async checkpointing), don't hand-roll it. Read and adapt <a href="https://github.com/pytorch/torchtitan">torchtitan</a>, <a href="https://github.com/NVIDIA/Megatron-LM">Megatron-LM</a> or <a href="https://github.com/deepspeedai/DeepSpeed">DeepSpeed</a>. For a readable end-to-end small-scale reference, see Karpathy's <a href="https://github.com/karpathy/nanoGPT">nanoGPT</a>.</p>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>Train a ~125M-parameter model on 2.5B tokens (Chinchilla-optimal at 20 tokens/param) of a public dataset such as FineWeb-Edu. You're done when you can (1) predict the run's wall-clock time within 25% from 6ND and a measured MFU, (2) show a loss curve with warmup, decay and no unexplained spikes, (3) report peak GPU memory with and without gradient checkpointing and explain the difference from the activation formula, and (4) run the FSDP version on 2+ GPUs and match single-GPU loss at equal tokens.</p>
+</div>
+
+<h3>Further reading</h3>
+<ul>
+  <li>Kaplan et al., 2020, <a href="https://arxiv.org/abs/2001.08361">Scaling Laws for Neural Language Models</a>.</li>
+  <li>Hoffmann et al., 2022, <a href="https://arxiv.org/abs/2203.15556">Training Compute-Optimal Large Language Models</a> (Chinchilla); Besiroglu et al., 2024, <a href="https://arxiv.org/abs/2404.10102">Chinchilla Scaling: A replication attempt</a>.</li>
+  <li>Rajbhandari et al., 2020, <a href="https://arxiv.org/abs/1910.02054">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a>.</li>
+  <li>Shoeybi et al., 2019, <a href="https://arxiv.org/abs/1909.08053">Megatron-LM</a>; Narayanan et al., 2021, <a href="https://arxiv.org/abs/2104.04473">Efficient Large-Scale Language Model Training on GPU Clusters</a>; Korthikanti et al., 2022, <a href="https://arxiv.org/abs/2205.05198">Reducing Activation Recomputation</a>.</li>
+  <li>Dubey et al., 2024, <a href="https://arxiv.org/abs/2407.21783">The Llama 3 Herd of Models</a>: the most detailed public account of a frontier-scale run.</li>
+  <li>Hugging Face, <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook">The Ultra-Scale Playbook</a>: parallelism explained with benchmarks.</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="07-main" data-title="Check yourself · Training LLMs">
+  <div class="q" data-answer="1"><p>Roughly how many FLOPs does it take to train a 7B-parameter model on 2T tokens?</p>
+    <ol><li>2.8 × 10²²</li><li>8.4 × 10²²</li><li>1.4 × 10²²</li><li>8.4 × 10²¹</li></ol>
+    <div class="explain">C ≈ 6ND = 6 × 7×10⁹ × 2×10¹² = 8.4×10²². 2.8×10²² is 2ND, the forward pass only, which is what <em>inference</em> over 2T tokens would cost.</div></div>
+  <div class="q" data-answer="3"><p>That 8.4 × 10²² FLOP run goes on 512 H100s (989 TFLOP/s bf16 dense) at 40% MFU. About how long does it take?</p>
+    <ol><li>About 12 hours</li><li>About 48 days</li><li>About 1.2 days</li><li>About 4.8 days</li></ol>
+    <div class="explain">Cluster rate = 512 × 989×10¹² × 0.40 ≈ 2.0×10¹⁷ FLOP/s. 8.4×10²² / 2.0×10¹⁷ ≈ 4.2×10⁵ s ≈ 4.8 days, or about 59,000 GPU-hours.</div></div>
+  <div class="q" data-answer="3"><p>You want to fully fine-tune a 7B model with AdamW in bf16 mixed precision. How much memory does the model state alone (weights, gradients, master copy, Adam moments) need?</p>
+    <ol><li>14 GB</li><li>28 GB</li><li>56 GB</li><li>112 GB</li></ol>
+    <div class="explain">16 bytes/param × 7×10⁹ = 112 GB: 2 (bf16 weights) + 2 (bf16 grads) + 4 (fp32 master) + 4 + 4 (Adam m, v). 14 GB is just the bf16 weights, what inference needs. It won't fit on one 80 GB GPU before you even count activations.</div></div>
+  <div class="q" data-answer="0"><p>Same 7B model, 8 GPUs, ZeRO stage 2. What's the per-GPU model-state memory?</p>
+    <ol><li>About 26 GB</li><li>About 14 GB</li><li>About 56 GB</li><li>About 112 GB</li></ol>
+    <div class="explain">Stage 2 shards gradients and optimizer state but keeps full bf16 weights: 2N + (2 + 12)N/8 = 14 + 12.25 ≈ 26 GB. Stage 3 would shard the weights too: 112/8 = 14 GB.</div></div>
+  <div class="q" data-answer="2"><p>Using the "20 tokens per parameter" rule, how many tokens is Chinchilla-optimal for a 1B-parameter model, and what does that cost?</p>
+    <ol><li>1B tokens, about 6 × 10¹⁸ FLOPs</li><li>2T tokens, about 1.2 × 10²² FLOPs</li><li>20B tokens, about 1.2 × 10²⁰ FLOPs</li><li>200B tokens, about 1.2 × 10²¹ FLOPs</li></ol>
+    <div class="explain">20 × 1B = 20B tokens; 6 × 10⁹ × 2×10¹⁰ = 1.2×10²⁰ FLOPs, about 10 hours on one 8×H100 node at 40% MFU. Real 1B models (Llama 3.2 1B) train on trillions of tokens on purpose, trading training compute for a cheaper-to-serve model.</div></div>
+  <div class="q" data-answer="1"><p>A pipeline has 8 stages and you use 32 micro-batches per step. What fraction of time is each stage idle?</p>
+    <ol><li>About 3%</li><li>About 18%</li><li>About 47%</li><li>About 88%</li></ol>
+    <div class="explain">(p − 1)/(m + p − 1) = 7/39 ≈ 18%. With only 8 micro-batches it would be 7/15 ≈ 47%. Switching GPipe to 1F1B doesn't change this number; it reduces activation memory.</div></div>
+  <div class="q" data-answer="2"><p>Why does fp16 training need loss scaling while bf16 training usually doesn't?</p>
+    <ol><li>bf16 has more mantissa bits, so it's more precise</li><li>bf16 gradients are computed in fp32 automatically</li><li>fp16's 5-bit exponent can't represent very small gradients, so they flush to zero unless scaled up</li><li>fp16 can't be used on tensor cores</li></ol>
+    <div class="explain">bf16 shares fp32's 8-bit exponent and covers the same range; it's actually <em>less</em> precise than fp16 (7 vs 10 mantissa bits). fp16's smallest normal value is about 6×10⁻⁵, and many gradients are smaller, so you multiply the loss by a large S, then unscale before the update.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, widget, fmtNum, fmtSI, palette, clamp } = C;
+  const kx = C.katex;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const SUP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "-": "⁻" };
+  const sci = (x, d = 2) => {
+    if (!isFinite(x) || x <= 0) return "—";
+    const e = Math.floor(Math.log10(x)), m = x / 10 ** e;
+    return m.toFixed(d) + " × 10" + String(e).split("").map(c => SUP[c]).join("");
+  };
+  const texSci = (x, d = 2) => { const e = Math.floor(Math.log10(x)), m = x / 10 ** e; return m.toFixed(d) + "\\times 10^{" + e + "}"; };
+  const segCtl = (parent, label, options, value, onChange) => {
+    const c = el("div", { class: "ctl" }, el("label", null, el("span", { text: label })));
+    const s = seg(c, { options, value, onChange });
+    parent.appendChild(c);
+    return s;
+  };
+  const defsArrow = (s, id, color) => {
+    const d = svg("defs");
+    d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color || palette.ink })));
+    s.appendChild(d);
+  };
+  const T = (s, x, y, text, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, "text-anchor": "middle", text }, o || {})));
+  const TINT = { blue: "rgba(47,93,138,.12)", green: "rgba(26,122,82,.12)", brick: "rgba(176,67,46,.10)", gold: "rgba(154,123,34,.15)", plum: "rgba(122,63,110,.12)", none: "#fff" };
+  const EDGE = { blue: "rgba(47,93,138,.55)", green: "rgba(26,122,82,.55)", brick: "rgba(176,67,46,.55)", gold: "rgba(154,123,34,.6)", plum: "rgba(122,63,110,.55)", none: "rgba(28,27,25,.28)" };
+  const box = (s, x, y, w, h, title, sub, tone, o) => {
+    o = o || {};
+    tone = tone || "none";
+    s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 8, fill: TINT[tone], stroke: EDGE[tone], "stroke-width": 1.2, "stroke-dasharray": o.dash || null }));
+    const lines = sub ? sub.split("|") : [];
+    const ty = y + h / 2 - (lines.length * 13) / 2 + 4;
+    T(s, x + w / 2, ty, title, { "font-size": 13, "font-weight": 600 });
+    lines.forEach((l, i) => T(s, x + w / 2, ty + 15 + i * 13, l, { "font-size": 10.5, fill: palette.muted }));
+  };
+  const arrow = (s, d, id, o) => { o = o || {}; s.appendChild(svg("path", { d, stroke: o.color || palette.ink, "stroke-width": o.width || 1.3, fill: "none", "stroke-dasharray": o.dash || null, "marker-end": `url(#${id})`, "marker-start": o.both ? `url(#${id})` : null })); };
+  const fmtGB = b => b >= 1e12 ? fmtNum(b / 1e12, 2) + " TB" : fmtNum(b / 1e9, b < 1e10 ? 1 : 0) + " GB";
+
+  /* ---------------------------------------------------------- fig: data pipeline */
+  (function () {
+    const s = document.getElementById("fig-data");
+    defsArrow(s, "arr-data", palette.muted);
+    const st = [
+      ["Crawl", "Common Crawl WARC|raw HTML + metadata", "none"],
+      ["Extract", "HTML → main text|trafilatura, resiliparse", "none"],
+      ["Language ID", "fastText classifier|keep target languages", "gold"],
+      ["Quality filter", "heuristic rules +|model-based classifier", "gold"],
+      ["Dedup", "exact hashes +|MinHash LSH near-dups", "gold"],
+      ["PII / toxicity", "scrub emails, IPs, keys|drop toxic documents", "gold"],
+      ["Tokenize", "BPE → token ids|(Module 05)", "green"],
+      ["Shuffle + pack", "concat docs with EOS|cut fixed-length windows", "green"]
+    ];
+    const W = 176, H = 66, xs = [24, 240, 456, 672], ys = [30, 150];
+    st.forEach(([t, sub, tone], i) => {
+      const row = i < 4 ? 0 : 1, col = row === 0 ? i : 7 - i, x = xs[col], y = ys[row];
+      box(s, x, y, W, H, t, sub, tone);
+      s.appendChild(svg("circle", { cx: x + 4, cy: y + 4, r: 10, fill: palette.ink }));
+      T(s, x + 4, y + 8, String(i + 1), { "font-size": 11, fill: "#fff", class: "mono" });
+    });
+    for (let c = 0; c < 3; c++) {
+      arrow(s, `M${xs[c] + W + 4},${ys[0] + H / 2} L${xs[c + 1] - 6},${ys[0] + H / 2}`, "arr-data", { color: palette.muted });
+      arrow(s, `M${xs[c + 1] - 4},${ys[1] + H / 2} L${xs[c] + W + 6},${ys[1] + H / 2}`, "arr-data", { color: palette.muted });
+    }
+    arrow(s, `M${xs[3] + W / 2},${ys[0] + H + 2} L${xs[3] + W / 2},${ys[1] - 6}`, "arr-data", { color: palette.muted });
+    T(s, 436, 246, "billions of raw pages in → a much smaller set of clean, deduplicated, packed token sequences out", { "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: training step */
+  (function () {
+    const s = document.getElementById("fig-step");
+    defsArrow(s, "arr-step", palette.ink);
+    const lanes = [40, 150], h = 56;
+    const cols = { data: [70, 100], fwd: [190, 112], loss: [322, 76], bwd: [418, 118], ar: [558, 112], opt: [692, 150] };
+    lanes.forEach((y, k) => {
+      T(s, 8, y + h / 2 + 4, "GPU " + k, { "text-anchor": "start", class: "mono", "font-size": 12 });
+      box(s, cols.data[0], y, cols.data[1], h, "Micro-batch", "different tokens|on each GPU", "none");
+      box(s, cols.fwd[0], y, cols.fwd[1], h, "Forward", "save activations", "blue");
+      box(s, cols.loss[0], y, cols.loss[1], h, "Loss", "cross-entropy", "gold");
+      box(s, cols.bwd[0], y, cols.bwd[1], h, "Backward", "local gradients", "brick");
+      box(s, cols.opt[0], y, cols.opt[1], h, "Optimizer step", "AdamW, identical|update everywhere", "green");
+      const mid = y + h / 2;
+      arrow(s, `M${cols.data[0] + cols.data[1] + 2},${mid} L${cols.fwd[0] - 5},${mid}`, "arr-step");
+      arrow(s, `M${cols.fwd[0] + cols.fwd[1] + 2},${mid} L${cols.loss[0] - 5},${mid}`, "arr-step");
+      arrow(s, `M${cols.loss[0] + cols.loss[1] + 2},${mid} L${cols.bwd[0] - 5},${mid}`, "arr-step");
+      arrow(s, `M${cols.bwd[0] + cols.bwd[1] + 2},${mid} L${cols.ar[0] - 5},${mid}`, "arr-step");
+      arrow(s, `M${cols.ar[0] + cols.ar[1] + 2},${mid} L${cols.opt[0] - 5},${mid}`, "arr-step");
+    });
+    box(s, cols.ar[0], lanes[0], cols.ar[1], lanes[1] + h - lanes[0], "All-reduce", "sum gradients|across GPUs,|divide by G", "plum");
+    const ny = 232;
+    T(s, cols.fwd[0] + cols.fwd[1] / 2, ny, "≈ 2N FLOPs/token", { "font-size": 11, class: "mono", fill: palette.muted });
+    T(s, cols.bwd[0] + cols.bwd[1] / 2, ny, "≈ 4N FLOPs/token", { "font-size": 11, class: "mono", fill: palette.muted });
+    T(s, cols.ar[0] + cols.ar[1] / 2, ny, "2(G−1)/G × grad bytes", { "font-size": 11, class: "mono", fill: palette.muted });
+    T(s, cols.opt[0] + cols.opt[1] / 2, ny, "fp32 master, m, v", { "font-size": 11, class: "mono", fill: palette.muted });
+    T(s, 440, 260, "In practice the all-reduce overlaps with backward: the last layers' gradients are sent while earlier layers are still computing.", { "font-size": 11.5, fill: palette.ink });
+  })();
+
+  /* ---------------------------------------------------------- fig: mixed precision */
+  (function () {
+    const s = document.getElementById("fig-mp");
+    defsArrow(s, "arr-mp", palette.ink);
+    defsArrow(s, "arr-mp-g", palette.gold);
+    box(s, 20, 30, 170, 70, "fp32 master weights", "4 bytes/param|owned by the optimizer", "blue");
+    box(s, 225, 30, 120, 70, "Cast", "fp32 → bf16|(2 bytes/param)", "none");
+    box(s, 380, 30, 250, 70, "Forward + backward", "bf16 matmuls, fp32 accumulate|softmax, norms, loss in fp32", "brick");
+    box(s, 665, 30, 195, 70, "Gradients", "bf16 (or fp32 for|accumulation)", "gold");
+    box(s, 380, 160, 250, 70, "AdamW update in fp32", "m, v: 4 + 4 bytes/param|clip grad norm first", "green");
+    box(s, 665, 160, 195, 70, "fp16 only: unscale", "÷ S, skip step on inf/NaN|then adjust S", "gold", { dash: "4 3" });
+    arrow(s, "M192,65 L219,65", "arr-mp");
+    arrow(s, "M347,65 L374,65", "arr-mp");
+    arrow(s, "M632,65 L659,65", "arr-mp");
+    arrow(s, "M700,102 C700,130 520,125 520,154", "arr-mp");
+    arrow(s, "M800,102 L800,154", "arr-mp-g", { color: palette.gold, dash: "4 3" });
+    arrow(s, "M663,195 L636,195", "arr-mp-g", { color: palette.gold, dash: "4 3" });
+    arrow(s, "M378,195 L105,195 L105,106", "arr-mp");
+    T(s, 240, 188, "write updated fp32 weights", { "font-size": 11, fill: palette.muted });
+    T(s, 505, 20, "fp16 only: loss × S before backward", { "font-size": 11, fill: palette.gold });
+  })();
+
+  /* ---------------------------------------------------------- fig: ZeRO stages */
+  (function () {
+    const s = document.getElementById("fig-zero");
+    const stages = [
+      ["Stage 0 · plain DDP", [0, 0, 0], "16Ψ", "traffic: 1× DDP"],
+      ["Stage 1 · shard optimizer", [0, 0, 1], "4Ψ + 12Ψ/4 = 7Ψ", "traffic: 1× DDP"],
+      ["Stage 2 · + shard grads", [0, 1, 1], "2Ψ + 14Ψ/4 = 5.5Ψ", "traffic: 1× DDP"],
+      ["Stage 3 · + shard weights", [1, 1, 1], "16Ψ / 4 = 4Ψ", "traffic: ≈1.5× DDP"]
+    ];
+    const segs = [[2, "rgba(47,93,138,.72)", "bf16 weights (2Ψ)"], [2, "rgba(154,123,34,.78)", "bf16 grads (2Ψ)"], [12, "rgba(26,122,82,.62)", "fp32 master + Adam m, v (12Ψ)"]];
+    const u = 11;
+    stages.forEach(([title, sh, mem, comm], k) => {
+      const px = 10 + k * 217;
+      s.appendChild(svg("rect", { x: px, y: 6, width: 207, height: 280, rx: 10, fill: "#fbfaf7", stroke: palette.line }));
+      T(s, px + 103, 26, title, { "font-size": 12.5, "font-weight": 600 });
+      for (let g = 0; g < 4; g++) {
+        const bx = px + 22 + g * 44, bw = 30;
+        let y = 220;
+        segs.forEach(([n, col], si) => {
+          const hh = n * u;
+          y -= hh;
+          if (!sh[si]) s.appendChild(svg("rect", { x: bx, y, width: bw, height: hh - 1, rx: 2, fill: col }));
+          else {
+            s.appendChild(svg("rect", { x: bx + 0.5, y: y + 0.5, width: bw - 1, height: hh - 2, rx: 2, fill: "none", stroke: col, "stroke-dasharray": "3 2" }));
+            s.appendChild(svg("rect", { x: bx, y: y + (3 - g) * hh / 4, width: bw, height: hh / 4 - 1, rx: 2, fill: col }));
+          }
+        });
+        T(s, bx + bw / 2, 236, "GPU" + g, { "font-size": 10.5, class: "mono", fill: palette.muted });
+      }
+      T(s, px + 103, 256, "per GPU: " + mem, { "font-size": 11.5, class: "mono" });
+      T(s, px + 103, 274, comm, { "font-size": 11, fill: k === 3 ? palette.brick : palette.muted });
+    });
+    segs.forEach(([, col, lab], i) => {
+      const x = 60 + i * 250;
+      s.appendChild(svg("rect", { x, y: 298, width: 12, height: 12, rx: 2, fill: col }));
+      T(s, x + 18, 308, lab, { "text-anchor": "start", "font-size": 11.5, fill: palette.muted });
+    });
+  })();
+
+  /* ---------------------------------------------------------- fig: tensor parallel */
+  (function () {
+    const s = document.getElementById("fig-tp");
+    defsArrow(s, "arr-tp", palette.ink);
+    const mat = (x, y, w, h, label, sub, tone) => {
+      s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 4, fill: TINT[tone], stroke: EDGE[tone], "stroke-width": 1.2 }));
+      T(s, x + w / 2, y + h / 2 + 5, label, { "font-size": 14, "font-weight": 600 });
+      if (sub) T(s, x + w / 2, y + h + 14, sub, { "font-size": 10.5, class: "mono", fill: palette.muted });
+    };
+    const op = (x, y, t) => T(s, x, y, t, { "font-size": 16, fill: palette.muted });
+    const rows = [50, 170], sub = ["₁", "₂"];
+    rows.forEach((y, r) => {
+      T(s, 8, y + 44, "GPU " + r, { "text-anchor": "start", class: "mono", "font-size": 12 });
+      mat(66, y, 56, 80, "X", "s × h", "none");
+      op(138, y + 46, "×");
+      mat(154, y, 40, 80, "A" + sub[r], "h × f/2", "blue");
+      op(210, y + 46, "=");
+      mat(226, y, 40, 80, "Y" + sub[r], "GeLU(XA" + sub[r] + ")", "blue");
+      op(284, y + 46, "×");
+      mat(300, y + 20, 82, 40, "B" + sub[r], "", "green");
+      T(s, 341, y + 74, "f/2 × h", { "font-size": 10.5, class: "mono", fill: palette.muted });
+      op(398, y + 46, "=");
+      mat(414, y, 56, 80, "Z" + sub[r], "partial sum", "gold");
+      arrow(s, `M${474},${y + 40} L${512},${y + 40}`, "arr-tp");
+      arrow(s, `M${652},${y + 40} L${690},${y + 40}`, "arr-tp");
+      mat(696, y, 56, 80, "Z", "full output", "none");
+    });
+    box(s, 518, 50, 128, 200, "All-reduce", "Z = Z₁ + Z₂|(sum of partials)", "plum");
+    T(s, 210, 30, "column-parallel: no communication", { "font-size": 11.5, fill: palette.blue });
+    T(s, 390, 30, "row-parallel", { "font-size": 11.5, fill: palette.green });
+    T(s, 440, 290, "Forward: one all-reduce per MLP and one per attention block. Backward: the same again for the input gradients.", { "font-size": 11.5, fill: palette.ink });
+  })();
+
+  /* ---------------------------------------------------------- pipeline simulator */
+  function simPP(p, m, mode) {
+    const ops = [];
+    for (let i = 0; i < p; i++) {
+      const L = [];
+      if (mode === "gpipe") { for (let j = 0; j < m; j++) L.push(["F", j]); for (let j = 0; j < m; j++) L.push(["B", j]); }
+      else {
+        const warm = Math.min(p - i - 1, m);
+        let f = 0, b = 0;
+        for (; f < warm; f++) L.push(["F", f]);
+        while (f < m) { L.push(["F", f++]); L.push(["B", b++]); }
+        while (b < m) L.push(["B", b++]);
+      }
+      ops.push(L);
+    }
+    const fin = {}, free = Array(p).fill(0), ptr = Array(p).fill(0), blocks = [];
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (let i = 0; i < p; i++) {
+        while (ptr[i] < ops[i].length) {
+          const [t, j] = ops[i][ptr[i]];
+          const dep = t === "F" ? (i === 0 ? 0 : fin[`F,${i - 1},${j}`]) : (i === p - 1 ? fin[`F,${i},${j}`] : fin[`B,${i + 1},${j}`]);
+          if (dep === undefined) break;
+          const st = Math.max(free[i], dep), d = t === "F" ? 1 : 2;
+          fin[`${t},${i},${j}`] = st + d;
+          free[i] = st + d;
+          blocks.push({ i, j, t, st, d });
+          ptr[i]++;
+          progress = true;
+        }
+      }
+    }
+    const peak = ops.map(L => { let n = 0, mx = 0; L.forEach(([t]) => { n += t === "F" ? 1 : -1; mx = Math.max(mx, n); }); return mx; });
+    const Ttot = Math.max(...free);
+    return { blocks, T: Ttot, busy: 3 * m, peak };
+  }
+  function drawPP(host, p, m, mode, o) {
+    o = o || {};
+    const r = simPP(p, m, mode);
+    const W = o.width || 760, lw = 66, rh = p > 10 ? 15 : p > 6 ? 20 : 26, top = 4;
+    const H = top + p * rh + 22;
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}` });
+    const u = (W - lw - 8) / r.T;
+    for (let i = 0; i < p; i++) {
+      s.appendChild(svg("rect", { x: lw, y: top + i * rh, width: r.T * u, height: rh - 3, fill: "rgba(176,67,46,.11)" }));
+      s.appendChild(svg("text", { x: lw - 8, y: top + i * rh + rh / 2 + 2, "text-anchor": "end", "font-size": rh < 18 ? 9.5 : 11, class: "mono", fill: palette.ink, text: "stage " + i }));
+    }
+    r.blocks.forEach(b => {
+      s.appendChild(svg("rect", { x: lw + b.st * u + 0.5, y: top + b.i * rh, width: Math.max(0.5, b.d * u - 1), height: rh - 3, rx: 2, fill: b.t === "F" ? "rgba(47,93,138,.8)" : "rgba(26,122,82,.78)" }));
+      if (u >= 13 && rh >= 18) s.appendChild(svg("text", { x: lw + (b.st + b.d / 2) * u, y: top + b.i * rh + rh / 2 + 2, "text-anchor": "middle", "font-size": 10, class: "mono", fill: "#fff", text: b.j + 1 }));
+    });
+    s.appendChild(svg("text", { x: lw, y: H - 5, "font-size": 10.5, class: "mono", fill: palette.muted, text: "time →   forward = 1 unit, backward = 2 units" }));
+    host.appendChild(s);
+    return r;
+  }
+
+  /* ---------------------------------------------------------- fig: pipeline (static) */
+  (function () {
+    const host = document.getElementById("fig-pp");
+    host.appendChild(el("div", { class: "pp-label", text: "p = 4 stages, m = 1 (no micro-batching): bubble = 3/4 = 75%" }));
+    drawPP(host, 4, 1, "gpipe");
+    host.appendChild(el("div", { class: "pp-label", text: "p = 4 stages, m = 8 micro-batches (GPipe): bubble = 3/11 ≈ 27%" }));
+    drawPP(host, 4, 8, "gpipe");
+  })();
+
+  /* ---------------------------------------------------------- fig: 3D parallelism */
+  (function () {
+    const s = document.getElementById("fig-3d");
+    defsArrow(s, "arr-3d", palette.ink);
+    defsArrow(s, "arr-3d-p", palette.plum);
+    const nx = c => 40 + c * 205, ny = r => 40 + r * 140, NW = 170, NH = 96;
+    for (let r = 0; r < 2; r++) {
+      T(s, 40, ny(r) - 10, "DP replica " + r, { "text-anchor": "start", "font-size": 12, "font-weight": 600, fill: palette.plum });
+      for (let c = 0; c < 4; c++) {
+        const x = nx(c), y = ny(r);
+        s.appendChild(svg("rect", { x, y, width: NW, height: NH, rx: 10, fill: "#fbfaf7", stroke: "rgba(28,27,25,.3)", "stroke-width": 1.2 }));
+        T(s, x + NW / 2, y + 18, "node · PP stage " + c, { "font-size": 11.5, class: "mono" });
+        for (let g = 0; g < 4; g++) {
+          s.appendChild(svg("rect", { x: x + 14 + g * 38, y: y + 30, width: 30, height: 30, rx: 4, fill: TINT.blue, stroke: EDGE.blue }));
+          T(s, x + 29 + g * 38, y + 49, "tp" + g, { "font-size": 9.5, class: "mono", fill: palette.blue });
+        }
+        T(s, x + NW / 2, y + 82, "TP all-reduce · NVLink", { "font-size": 10.5, fill: palette.blue });
+        if (c < 3) {
+          arrow(s, `M${x + NW + 3},${y + 45} L${nx(c + 1) - 5},${y + 45}`, "arr-3d");
+          T(s, x + NW + 17, y + 38, "acts", { "font-size": 10, class: "mono", fill: palette.muted });
+        }
+        if (r === 0) {
+          arrow(s, `M${x + NW / 2},${y + NH + 6} L${x + NW / 2},${ny(1) - 20}`, "arr-3d-p", { color: palette.plum, dash: "4 3", both: true });
+          T(s, x + NW / 2 + 8, y + NH + 26, "grads", { "text-anchor": "start", "font-size": 10, class: "mono", fill: palette.plum });
+        }
+      }
+    }
+    T(s, 440, 306, "TP: all-reduce inside every layer, needs NVLink · PP: point-to-point activations between nodes", { "font-size": 11.5 });
+    T(s, 440, 323, "DP / FSDP: gradient reduce-scatter (and parameter all-gather) across replicas, overlapped with compute", { "font-size": 11.5 });
+  })();
+
+  /* ---------------------------------------------------------- widget: compute & cost */
+  (function () {
+    const w = widget("w-compute", { title: "What does a training run cost?", kicker: "Calculator", note: "C = 6ND ignores the attention term and any recomputation. GPU-hours assume the MFU you set for the whole run; real runs also lose time to failures, restarts and evals. Presets take N and D from the papers; the hardware is a hypothetical choice except Llama 3 405B (16,384 H100s, reported MFU 38–43%). Price per GPU-hour is yours to set: cloud list prices vary several-fold." });
+    const GPUS = { h100: { l: "H100 SXM · ~989 TFLOP/s bf16 dense", peak: 989e12 }, a100: { l: "A100 · 312 TFLOP/s bf16 dense", peak: 312e12 } };
+    let gpu = "h100";
+    const nS = slider(w.controls, { label: "Parameters N", min: 8, max: 12, step: 0.01, value: 9, fmt: v => fmtSI(10 ** v, 1), onInput: draw });
+    const dS = slider(w.controls, { label: "Training tokens D", min: 9, max: 13.5, step: 0.01, value: Math.log10(20e9), fmt: v => fmtSI(10 ** v, 1), onInput: draw });
+    const gSel = select(w.controls, { label: "GPU", options: Object.entries(GPUS).map(([k, g]) => ({ value: k, label: g.l })), value: gpu, onChange: v => { gpu = v; draw(); } });
+    const mS = slider(w.controls, { label: "MFU", min: 10, max: 65, step: 1, value: 40, fmt: v => v + "%", onInput: draw });
+    const cS = slider(w.controls, { label: "Number of GPUs", min: 0, max: 15, step: 1, value: 3, fmt: v => fmtNum(2 ** v, 0), onInput: draw });
+    const pS = slider(w.controls, { label: "Price per GPU-hour", min: 0.5, max: 8, step: 0.1, value: 2.5, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const presets = el("div", { class: "btnrow" });
+    [
+      ["1B · 20B tokens", 1e9, 20e9, "h100", 3, 40],
+      ["GPT-3 · 175B / 300B", 175e9, 300e9, "a100", 10, 40],
+      ["Chinchilla · 70B / 1.4T", 70e9, 1.4e12, "a100", 10, 40],
+      ["Llama 3 8B · 15T", 8e9, 15e12, "h100", 11, 40],
+      ["Llama 3 405B · 15.6T", 405e9, 15.6e12, "h100", 14, 40]
+    ].forEach(([lab, N, D, g, lg, mfu]) => presets.appendChild(el("button", { class: "btn", text: lab, onclick: () => {
+      nS.value = Math.log10(N); dS.value = Math.log10(D); gpu = g; gSel.value = g; cS.value = lg; mS.value = mfu; draw();
+    } })));
+    w.controls.appendChild(presets);
+    const line = el("div", { class: "mathline" }); w.body.appendChild(line);
+    const set = stats(w.body, [
+      { key: "c", label: "Total compute" }, { key: "gh", label: "GPU-hours" }, { key: "wall", label: "Wall-clock" },
+      { key: "cost", label: "Rough cost" }, { key: "tput", label: "Cluster throughput" }, { key: "ratio", label: "Tokens / param" }
+    ]);
+    function draw() {
+      const N = 10 ** nS.value, D = 10 ** dS.value, peak = GPUS[gpu].peak, mfu = mS.value / 100, n = 2 ** cS.value, price = pS.value;
+      const Cc = 6 * N * D, gpuSec = Cc / (peak * mfu), gpuH = gpuSec / 3600, days = gpuSec / n / 86400, cost = gpuH * price;
+      line.innerHTML = kx(`C = 6 \\times ${texSci(N)} \\times ${texSci(D)} = ${texSci(Cc)}\\ \\text{FLOPs}, \\quad t = \\frac{C}{${fmtNum(n, 0).replace(/,/g, "{,}")} \\times ${fmtNum(peak / 1e12, 0)}\\text{T} \\times ${mfu.toFixed(2)}}`, false);
+      set("c", sci(Cc), null, "FLOPs");
+      set("gh", fmtSI(gpuH, 1), null, fmtSI(gpuH / 24, 1) + " GPU-days");
+      const wall = days < 1 ? fmtNum(days * 24, 1) + " hours" : days > 730 ? fmtNum(days / 365, 1) + " years" : fmtNum(days, days < 10 ? 1 : 0) + " days";
+      set("wall", wall, days > 180 ? "bad" : days > 60 ? "warn" : "good", "on " + fmtNum(n, 0) + " GPUs");
+      set("cost", "$" + fmtSI(cost, 1), null, "at $" + price.toFixed(2) + "/GPU-hour");
+      set("tput", fmtSI(n * peak * mfu / (6 * N), 1) + " tok/s", null, "n·P·MFU / 6N");
+      const r = D / N;
+      set("ratio", fmtNum(r, r < 10 ? 1 : 0), null, fmtNum(r / 20, r / 20 < 10 ? 1 : 0) + "× the 20:1 Chinchilla rule");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: scaling laws */
+  (function () {
+    const w = widget("w-scaling", { title: "Iso-FLOP curves: the same compute, spent differently", kicker: "Interactive", note: "Each grey curve fixes a compute budget C and sweeps model size N, with tokens D = C/6N. Small N on the left means too little capacity; large N on the right means too few tokens. Dots mark each curve's minimum. Losses are on Chinchilla's MassiveText data, so they're not comparable to other models' reported numbers, and budgets above ~10²⁴ are extrapolations." });
+    const FITS = {
+      h: { E: 1.69, A: 406.4, B: 410.7, a: 0.34, b: 0.28 },
+      e: { E: 1.82, A: 482.01, B: 2085.43, a: 0.3478, b: 0.3658 }
+    };
+    let fit = FITS.h;
+    const Lf = (N, D) => fit.E + fit.A / N ** fit.a + fit.B / D ** fit.b;
+    const opt = c => { const G = (fit.a * fit.A / (fit.b * fit.B)) ** (1 / (fit.a + fit.b)); const N = G * (c / 6) ** (fit.b / (fit.a + fit.b)); return { N, D: c / (6 * N) }; };
+    const cS = slider(w.controls, { label: "Highlighted budget C", min: 18, max: 25.5, step: 0.1, value: 23, fmt: v => sci(10 ** v, 1) + " FLOPs", onInput: draw });
+    segCtl(w.controls, "Fit", [{ value: "h", label: "Hoffmann 2022 (published)" }, { value: "e", label: "Besiroglu 2024 (refit)" }], "h", v => { fit = FITS[v]; draw(); });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 360, x: [1e7, 1e13], y: [1.6, 4.0], logx: true, xlabel: "parameters N (log scale)   ·   tokens D = C / 6N", ylabel: "predicted loss L(N, D)", xfmt: v => fmtSI(v, 0), yfmt: v => v.toFixed(1) });
+    const set = stats(w.body, [{ key: "n", label: "Optimal N" }, { key: "d", label: "Optimal D" }, { key: "r", label: "Tokens / param at optimum" }, { key: "l", label: "Loss at optimum" }, { key: "n20", label: "20 tokens/param choice" }]);
+    function draw() {
+      const budgets = [1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25];
+      const layers = [];
+      const path = [];
+      for (let e = 17; e <= 26.01; e += 0.25) { const o = opt(10 ** e); path.push([o.N, Lf(o.N, o.D)]); }
+      layers.push({ points: path, color: palette.ink, width: 1, dash: "2 4" });
+      budgets.forEach(c => {
+        layers.push({ fn: N => Lf(N, c / (6 * N)), color: "rgba(118,115,107,.55)", width: 1.2 });
+        const o = opt(c), lo = Lf(o.N, o.D);
+        layers.push({ marker: [o.N, lo], color: palette.ink, r: 3 });
+        const e = Math.round(Math.log10(c));
+        if (o.N > 1.2e7 && o.N < 8e12) layers.push({ text: [o.N, lo - 0.07], label: "10" + String(e).split("").map(ch => SUP[ch]).join(""), color: palette.muted, anchor: "middle", size: 10.5 });
+      });
+      const c = 10 ** cS.value, o = opt(c), lo = Lf(o.N, o.D);
+      const n20 = Math.sqrt(c / 120), l20 = Lf(n20, 20 * n20);
+      layers.push({ fn: N => Lf(N, c / (6 * N)), color: palette.green, width: 2.6, label: "highlighted budget" });
+      layers.push({ marker: [n20, l20], color: palette.brick, r: 6 });
+      layers.push({ marker: [o.N, lo], color: palette.green, r: 6, label: "fit optimum" });
+      layers.push({ text: [n20, l20 + 0.12], label: "D = 20N", color: palette.brick, anchor: "middle" });
+      layers.push({ text: [2e7, 1.7], label: "dotted: path of optima as C grows", color: palette.muted, size: 10.5 });
+      P.draw(layers);
+      set("n", fmtSI(o.N, 1), null, "parameters");
+      set("d", fmtSI(o.D, 1), null, "tokens");
+      const r = o.D / o.N;
+      set("r", fmtNum(r, 0), Math.abs(r - 20) < 6 ? "good" : "warn", "rule of thumb: ≈ 20");
+      set("l", lo.toFixed(3), null, "nats/token (their data)");
+      set("n20", fmtSI(n20, 1) + " params", null, "loss " + l20.toFixed(3) + " (+" + (l20 - lo).toFixed(3) + ")");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: training memory */
+  (function () {
+    const w = widget("w-memory", { title: "Will it fit? Per-GPU training memory", kicker: "Calculator", note: "Model state uses 2 + 2 + 12 bytes/param, sharded per ZeRO stage across all GPUs (pure data/FSDP parallelism, no TP/PP). Activations use 34·s·b·h bytes per layer (FlashAttention, no TP), or with full checkpointing 2·s·b·h per layer plus one layer's working set. Not counted: logits (s·b·vocab, can be several GB), temporary all-gather buffers under ZeRO-3, CUDA context and allocator fragmentation, often 5–15% in practice. 1 GB = 10⁹ bytes." });
+    const MODELS = [
+      { l: "1B (Llama 3.2 1B shape)", N: 1.24e9, L: 16, h: 2048 },
+      { l: "3B (Llama 3.2 3B shape)", N: 3.21e9, L: 28, h: 3072 },
+      { l: "8B (Llama 3.1 8B shape)", N: 8.03e9, L: 32, h: 4096 },
+      { l: "13B (Llama 2 13B shape)", N: 13.0e9, L: 40, h: 5120 },
+      { l: "70B (Llama 3.1 70B shape)", N: 70.6e9, L: 80, h: 8192 },
+      { l: "175B (GPT-3 shape)", N: 175e9, L: 96, h: 12288 },
+      { l: "405B (Llama 3.1 405B shape)", N: 405.9e9, L: 126, h: 16384 }
+    ];
+    let mi = 2, stage = 3, cap = 80e9, seqLen = 4096, ckpt = false;
+    select(w.controls, { label: "Model", options: MODELS.map((m, i) => ({ value: String(i), label: m.l })), value: "2", onChange: v => { mi = +v; draw(); } });
+    segCtl(w.controls, "ZeRO stage", [0, 1, 2, 3].map(v => ({ value: v, label: v === 3 ? "3 / FSDP" : String(v) })), 3, v => { stage = v; draw(); });
+    const gS = slider(w.controls, { label: "GPUs (data parallel)", min: 0, max: 10, step: 1, value: 3, fmt: v => fmtNum(2 ** v, 0), onInput: draw });
+    segCtl(w.controls, "GPU memory", [{ value: 24e9, label: "24 GB" }, { value: 40e9, label: "40 GB" }, { value: 80e9, label: "80 GB" }, { value: 141e9, label: "141 GB" }], 80e9, v => { cap = v; draw(); });
+    segCtl(w.controls, "Sequence length", [{ value: 2048, label: "2K" }, { value: 4096, label: "4K" }, { value: 8192, label: "8K" }], 4096, v => { seqLen = v; draw(); });
+    const bS = slider(w.controls, { label: "Micro-batch (sequences)", min: 1, max: 16, step: 1, value: 1, onInput: draw });
+    segCtl(w.controls, "Activation checkpointing", [{ value: false, label: "off" }, { value: true, label: "full" }], false, v => { ckpt = v; draw(); });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 236" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "tot", label: "Per-GPU total" }, { key: "state", label: "Model state / GPU" }, { key: "act", label: "Activations / GPU" }, { key: "min", label: "Min GPUs at ZeRO-3" }]);
+    const COLS = [["weights", "rgba(47,93,138,.75)"], ["grads", "rgba(154,123,34,.8)"], ["optimizer", "rgba(26,122,82,.68)"], ["activations", "rgba(122,63,110,.65)"]];
+    function parts(st, N, G, act) {
+      const sw = st >= 3 ? G : 1, sg = st >= 2 ? G : 1, so = st >= 1 ? G : 1;
+      return [2 * N / sw, 2 * N / sg, 12 * N / so, act];
+    }
+    function draw() {
+      const m = MODELS[mi], G = 2 ** gS.value, b = bS.value;
+      const act = ckpt ? 2 * seqLen * b * m.h * m.L + 34 * seqLen * b * m.h : 34 * seqLen * b * m.h * m.L;
+      const rows = [0, 1, 2, 3].map(st => parts(st, m.N, G, act));
+      const totals = rows.map(r => r.reduce((a, v) => a + v, 0));
+      const maxTot = Math.max(...totals);
+      const scaleMax = Math.max(cap * 1.25, Math.min(maxTot, cap * 3)) * 1.04;
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const lw = 118, cw = 760 - lw - 16, top = 24, rh = 42;
+      const X = v => lw + Math.min(v, scaleMax) / scaleMax * cw;
+      rows.forEach((r, k) => {
+        const y = top + k * rh;
+        if (k === stage) s.appendChild(svg("rect", { x: 2, y: y - 4, width: 756, height: rh - 2, rx: 6, fill: "rgba(26,122,82,.07)" }));
+        s.appendChild(svg("text", { x: lw - 10, y: y + 20, "text-anchor": "end", "font-size": 12, class: "mono", "font-weight": k === stage ? 700 : 400, fill: palette.ink, text: k === 0 ? "ZeRO-0 (DDP)" : k === 3 ? "ZeRO-3/FSDP" : "ZeRO-" + k }));
+        let acc = 0;
+        r.forEach((v, i) => {
+          const x0 = X(acc), x1 = X(acc + v);
+          if (x1 - x0 > 0.3) s.appendChild(svg("rect", { x: x0, y: y + 4, width: Math.max(0, x1 - x0 - 0.5), height: 24, fill: COLS[i][1] }));
+          acc += v;
+        });
+        const over = totals[k] > scaleMax;
+        const fits = totals[k] <= cap;
+        s.appendChild(svg("text", { x: over ? lw + cw - 6 : X(totals[k]) + 6, y: y + 20, "text-anchor": over ? "end" : "start", "font-size": 11.5, class: "mono", fill: over ? "#fff" : fits ? palette.green : palette.brick, "font-weight": 600, text: fmtGB(totals[k]) + (over ? " ▸" : "") + (fits ? "" : over ? "" : " ✗") }));
+      });
+      const xc = X(cap);
+      s.appendChild(svg("line", { x1: xc, x2: xc, y1: top - 8, y2: top + 4 * rh - 6, stroke: palette.brick, "stroke-width": 1.5, "stroke-dasharray": "5 3" }));
+      s.appendChild(svg("text", { x: xc, y: top - 11, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.brick, text: fmtGB(cap) + " per GPU" }));
+      COLS.forEach(([lab, col], i) => {
+        const x = lw + i * 140, y = top + 4 * rh + 14;
+        s.appendChild(svg("rect", { x, y: y - 10, width: 12, height: 12, rx: 2, fill: col }));
+        s.appendChild(svg("text", { x: x + 18, y, "font-size": 11.5, fill: palette.muted, text: lab }));
+      });
+      const tot = totals[stage], state = tot - act;
+      set("tot", fmtGB(tot), tot <= cap * 0.9 ? "good" : tot <= cap ? "warn" : "bad", tot <= cap ? "fits in " + fmtGB(cap) : "exceeds " + fmtGB(cap));
+      set("state", fmtGB(state), null, "of " + fmtGB(16 * m.N) + " total (16 B/param)");
+      set("act", fmtGB(act), act > cap ? "bad" : null, ckpt ? "checkpointed: ~33% more compute" : "not sharded by ZeRO");
+      let gmin = null;
+      for (let e = 0; e <= 13; e++) if (16 * m.N / 2 ** e + act <= cap) { gmin = 2 ** e; break; }
+      set("min", gmin ? fmtNum(gmin, 0) + " GPUs" : "none", gmin ? null : "bad", gmin ? "power of two, these settings" : "activations alone too big: checkpoint, shrink micro-batch, or add TP/CP");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: pipeline schedule */
+  (function () {
+    const w = widget("w-pp", { title: "Pipeline schedule: fill, steady state, drain", kicker: "Interactive", note: "Simulated with forward = 1 time unit and backward = 2, no communication cost. Brick background is idle time. Both schedules finish at the same time; 1F1B just starts backwards earlier, so fewer micro-batches' activations are alive at once on the early stages." });
+    let mode = "1f1b";
+    const pS = slider(w.controls, { label: "Pipeline stages p", min: 1, max: 16, step: 1, value: 4, onInput: draw });
+    const mS = slider(w.controls, { label: "Micro-batches m", min: 1, max: 32, step: 1, value: 8, onInput: draw });
+    segCtl(w.controls, "Schedule", [{ value: "gpipe", label: "GPipe (all F, then all B)" }, { value: "1f1b", label: "1F1B" }], "1f1b", v => { mode = v; draw(); });
+    const wrap = el("div", { class: "canvas-wrap pp-host" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "sim", label: "Idle fraction (simulated)" }, { key: "f", label: "(p−1)/(m+p−1)" }, { key: "peak", label: "Stage-0 activations held" }, { key: "eff", label: "Pipeline efficiency" }]);
+    function draw() {
+      const p = pS.value, m = mS.value;
+      wrap.innerHTML = "";
+      const r = drawPP(wrap, p, m, mode);
+      const idle = 1 - r.busy / r.T;
+      const f = (p - 1) / (m + p - 1);
+      set("sim", (idle * 100).toFixed(1) + "%", idle < 0.15 ? "good" : idle < 0.35 ? "warn" : "bad", "per stage, per step");
+      set("f", (f * 100).toFixed(1) + "%", null, `${p - 1} / ${m + p - 1}`);
+      set("peak", r.peak[0] + " micro-batch" + (r.peak[0] === 1 ? "" : "es"), r.peak[0] > p ? "warn" : null, mode === "gpipe" ? "GPipe holds all m" : "1F1B holds at most p");
+      set("eff", ((1 - idle) * 100).toFixed(0) + "%", null, "useful work / total time");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: LR schedules */
+  (function () {
+    const w = widget("w-lr", { title: "Learning-rate schedules", kicker: "Interactive", note: "Learning rate as a fraction of peak over a 10,000-step run. WSD = warmup-stable-decay (used e.g. by MiniCPM and DeepSeek-style multi-stage schedules), shown with a linear final decay. Cosine and linear must know the total step count in advance; WSD only needs it when you start the decay." });
+    let kind = "cosine";
+    const total = 10000;
+    segCtl(w.controls, "Schedule", [{ value: "cosine", label: "warmup + cosine" }, { value: "linear", label: "warmup + linear" }, { value: "wsd", label: "WSD" }], "cosine", v => { kind = v; draw(); });
+    const wS = slider(w.controls, { label: "Warmup", min: 0, max: 10, step: 0.5, value: 2, fmt: v => v + "% (" + fmtNum(v * total / 100, 0) + " steps)", onInput: draw });
+    const mS = slider(w.controls, { label: "Final LR / peak", min: 0, max: 0.5, step: 0.01, value: 0.1, fmt: v => v.toFixed(2), onInput: draw });
+    const dS = slider(w.controls, { label: "WSD decay phase", min: 5, max: 40, step: 1, value: 20, fmt: v => "last " + v + "%", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 260, x: [0, total], y: [0, 1.08], xlabel: "optimizer step", ylabel: "LR / peak", xfmt: v => fmtSI(v, 0), yfmt: v => v.toFixed(1) });
+    const set = stats(w.body, [{ key: "a", label: "LR at 50% of run" }, { key: "b", label: "LR at 90% of run" }, { key: "area", label: "Mean LR over run" }]);
+    function lr(t) {
+      const tw = wS.value / 100 * total, mn = mS.value;
+      if (t < tw) return (t + 1) / tw;
+      if (kind === "cosine") return mn + (1 - mn) * 0.5 * (1 + Math.cos(Math.PI * (t - tw) / (total - tw)));
+      if (kind === "linear") return mn + (1 - mn) * (1 - (t - tw) / (total - tw));
+      const ds = total * (1 - dS.value / 100);
+      if (t < ds) return 1;
+      return mn + (1 - mn) * (1 - (t - ds) / (total - ds));
+    }
+    function draw() {
+      const layers = [{ fn: lr, color: palette.green, width: 2.4, area: true, areaOpacity: 0.08, samples: 400 }];
+      layers.push({ vline: wS.value / 100 * total, color: palette.muted, label: "end of warmup" });
+      if (kind === "wsd") layers.push({ band: [total * (1 - dS.value / 100), total], color: palette.gold, opacity: 0.12 });
+      layers.push({ hline: mS.value, color: palette.brick, label: "final LR" });
+      P.draw(layers);
+      dS.wrap.style.opacity = kind === "wsd" ? 1 : 0.4;
+      let sum = 0; for (let t = 0; t < total; t += 10) sum += lr(t);
+      set("a", lr(total * 0.5).toFixed(2) + "×", null, "of peak");
+      set("b", lr(total * 0.9).toFixed(2) + "×", null, "of peak");
+      set("area", (sum / (total / 10)).toFixed(2) + "×", null, "rough proxy for total update size");
+    }
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>

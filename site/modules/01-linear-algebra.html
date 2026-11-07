@@ -1,0 +1,1190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Vectors &amp; matrices — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .hm-row{display:flex;flex-wrap:wrap;gap:10px}
+  .hm-row > div{flex:1 1 200px;min-width:0}
+  .hm-row .cap{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin:0 0 4px 2px}
+  .w-eq{margin:12px 2px 4px;overflow-x:auto;min-height:2.4em;font-size:15px}
+</style>
+</head>
+<body data-module="01">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 01 · Foundations</p>
+<h1 class="title">Vectors &amp; matrices: the <span class="it">shapes</span> inside a model</h1>
+<p class="lede">Strip away the vocabulary and a forward pass through Llama-3-8B is one operation done over and over: multiply a matrix by a batch of vectors. That's about 15 billion floating-point operations per token, and at short context lengths nearly all of them happen inside matrix multiplications. This module builds that operation up from a single dot product, one symbol at a time, and shows where each piece sits in a real model.</p>
+<div class="meta"><span class="tag">~2.5 hours</span><span class="tag n">prereqs: 00, high-school algebra</span><span class="tag g">hands-on: NumPy, PyTorch</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Read a shape like <code>[B, T, d]</code> and predict the output shape of any matmul, linear layer, or broadcast before running it.</li>
+    <li>Compute a dot product, a norm, and a cosine similarity by hand, and say why attention scores and embedding search are built from them.</li>
+    <li>Picture a 2×2 matrix as a transformation of the plane and read its determinant as an area scale.</li>
+    <li>Count the FLOPs of a matrix multiply (\(2MNK\)) and the parameters of a linear layer, all the way up to Llama-3-8B's 8.03B total.</li>
+    <li>Explain SVD and rank-\(k\) approximation well enough to see why LoRA's \(W_0 + BA\) trains under 1% of a matrix's parameters.</li>
+    <li>Say why a GPU runs matrix–matrix products near peak but matrix–vector products far below it.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="objects">Scalars, vectors, matrices, tensors</h2>
+
+<p>A language model never sees words. A tokenizer (Module 05) turns text into integer IDs, and the very first thing the model does with an ID is look up a row in a big table of numbers. From that point on, everything is arrays of floating-point numbers, and the only thing that distinguishes one array from another is its <strong>shape</strong>.</p>
+
+<div class="def"><b>Definition · The four objects</b>
+<p>A <b>scalar</b> is a single number, like a loss of 2.31 or a learning rate of \(3\times10^{-4}\). Its shape is <code>()</code>. A <b>vector</b> is an ordered list of \(d\) numbers, written \(\mathbf{x}\in\mathbb{R}^d\) ("x is in R-d"), with shape <code>[d]</code>. A <b>matrix</b> is a grid with \(m\) rows and \(n\) columns, \(W\in\mathbb{R}^{m\times n}\), shape <code>[m, n]</code>. A <b>tensor</b> is the same idea with any number of axes: shape <code>[B, T, d]</code> is a stack of \(B\) matrices, each \(T\times d\).</p>
+</div>
+
+<p>Notation used throughout the course: bold lowercase (\(\mathbf{x}\)) for vectors, uppercase (\(W\)) for matrices, \(x_i\) for the \(i\)-th entry of \(\mathbf{x}\), and \(W_{ij}\) for the entry in row \(i\), column \(j\). Indices start at 1 in math and at 0 in code. Shapes are written the way PyTorch prints <code>tensor.shape</code>.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 330" id="fig-objects"></svg>
+<figcaption>The four objects as they appear in an LLM. A token ID selects one row of the embedding table, giving a vector of \(d\) numbers (colour shows sign and size: green positive, brick negative). A weight matrix maps \(d_{\text{in}}\) inputs to \(d_{\text{out}}\) outputs. During training and batched inference the model holds a 3-D tensor: \(B\) sequences, each \(T\) tokens long, each token a \(d\)-dimensional vector.</figcaption></figure>
+
+<p>Here are the real shapes for Llama-3-8B (\(d = 4096\), 32 layers, 32 query heads, 8 key/value heads, head size 128, MLP width 14,336, vocabulary 128,256). You will meet every one of them again in Modules 06 and 08.</p>
+
+<table class="t">
+  <thead><tr><th>Tensor</th><th>Shape</th><th class="num">Entries</th><th>What it holds</th></tr></thead>
+  <tbody>
+    <tr><td>token IDs</td><td><code>[B, T]</code></td><td class="num">B·T</td><td>integers, one per token</td></tr>
+    <tr><td><code>embed_tokens.weight</code></td><td><code>[128256, 4096]</code></td><td class="num">525M</td><td>one row per vocabulary entry</td></tr>
+    <tr><td>hidden states</td><td><code>[B, T, 4096]</code></td><td class="num">4096·B·T</td><td>one vector per token, updated by every layer</td></tr>
+    <tr><td><code>q_proj.weight</code></td><td><code>[4096, 4096]</code></td><td class="num">16.8M</td><td>turns a hidden vector into 32 query vectors of size 128</td></tr>
+    <tr><td><code>k_proj.weight</code></td><td><code>[1024, 4096]</code></td><td class="num">4.2M</td><td>8 key heads × 128 (grouped-query attention)</td></tr>
+    <tr><td>attention scores</td><td><code>[B, 32, T, T]</code></td><td class="num">32·B·T²</td><td>how much each token attends to each other token</td></tr>
+    <tr><td><code>up_proj.weight</code></td><td><code>[14336, 4096]</code></td><td class="num">58.7M</td><td>widens each token vector inside the MLP</td></tr>
+    <tr><td>logits</td><td><code>[B, T, 128256]</code></td><td class="num">128256·B·T</td><td>a score for every possible next token</td></tr>
+  </tbody>
+</table>
+
+<div class="pitfall"><b>Pitfall · Two meanings of "rank"</b>
+<p>Some libraries call the number of axes a tensor's "rank" (a <code>[B, T, d]</code> tensor is "rank 3"). PyTorch calls it <code>ndim</code>. That's unrelated to the <em>matrix rank</em> in Section 01.10, which counts independent directions. When someone says "LoRA rank 16", they mean the second kind.</p>
+</div>
+
+<div class="flag"><b>Rows or columns?</b>
+<p>Math books treat vectors as columns and write \(\mathbf{y} = W\mathbf{x}\). Code stores a batch of vectors as the <em>rows</em> of a matrix \(X\) of shape <code>[T, d]</code> and computes \(Y = XW^{\top}\). Same numbers, same result, just transposed bookkeeping. This module uses the math convention for single vectors and the code convention for batches, and says which is which.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="vecops">Vector arithmetic and geometry</h2>
+
+<p>There are two ways to look at a vector, and you'll want both. As <strong>a list of numbers</strong>, \(\mathbf{a} = (3, 1)\) is just data. As <strong>an arrow</strong> from the origin to the point (3, 1), it has a length and a direction. A 4096-dimensional embedding can't be drawn, but the algebra is identical, and most 2-D intuitions carry over.</p>
+
+<p>Adding and scaling are done entry by entry:</p>
+
+$$\mathbf{a} + \mathbf{b} = (a_1 + b_1,\; a_2 + b_2,\; \ldots,\; a_d + b_d), \qquad c\,\mathbf{a} = (c\,a_1,\; c\,a_2,\; \ldots,\; c\,a_d)$$
+
+<p>Geometrically, \(\mathbf{a}+\mathbf{b}\) puts the tail of \(\mathbf{b}\) at the tip of \(\mathbf{a}\) (the diagonal of the parallelogram they span). Multiplying by a scalar \(c\) stretches the arrow by \(|c|\), and flips it if \(c\) is negative. Subtraction, \(\mathbf{b}-\mathbf{a}\), is the arrow that goes from \(\mathbf{a}\)'s tip to \(\mathbf{b}\)'s tip: the <em>difference</em> between two points.</p>
+
+<div class="intuition"><b>Where addition shows up in an LLM</b>
+<p>The transformer's <em>residual stream</em> (Module 06) is vector addition. Each layer reads the current token vector \(\mathbf{h}\), computes an update, and adds it back: \(\mathbf{h} \leftarrow \mathbf{h} + \text{attn}(\mathbf{h})\), then \(\mathbf{h} \leftarrow \mathbf{h} + \text{mlp}(\mathbf{h})\). Thirty-two layers means 64 additions to one running vector. Word2vec's famous \(\text{king} - \text{man} + \text{woman} \approx \text{queen}\) (Mikolov et al., 2013) is the same arithmetic on embeddings. That analogy holds loosely and only for some word pairs, but it's a good picture of "directions carry meaning".</p>
+</div>
+
+<p>Play with two vectors below. The readouts include the dot product, angle, projection and cosine, which the next two sections define properly. For now, watch what happens to the dot product when the arrows point the same way, at right angles, and in opposite directions.</p>
+
+<div id="w-vec"></div>
+
+<!-- ================================================================== -->
+<h2 id="dot">The dot product</h2>
+
+<p>If you learn one operation in this module, learn this one. The dot product takes two vectors of the same length and returns one number. Attention scores, logits, cosine similarity, every entry of every matrix multiply: all of them are dot products.</p>
+
+<div class="formula" data-name="Dot product · algebraic">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{a}}\cdot\htmlClass{t2}{\mathbf{b}} = \sum_{\htmlClass{t3}{i}=1}^{\htmlClass{t4}{d}} \htmlClass{t1}{a_i}\,\htmlClass{t2}{b_i} = a_1b_1 + a_2b_2 + \cdots + a_db_d$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{a}, a_i\)</dt><dd>the first vector and its \(i\)-th entry</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{b}, b_i\)</dt><dd>the second vector, same length as \(\mathbf{a}\)</dd></div>
+    <div data-t="t3"><dt>\(i\)</dt><dd>the position being multiplied; \(\sum\) means "add up over every \(i\)"</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>the dimension: 2 in the widget, 128 for an attention head, 4096 for a Llama-3-8B hidden vector</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Pair up the entries position by position, multiply each pair, and add the products. For \(\mathbf{a}=(1,2,3)\) and \(\mathbf{b}=(4,-5,6)\): \(4 - 10 + 18 = 12\).</p>
+  <p class="why"><b>Why it matters</b>It costs \(d\) multiplies and \(d\) adds, \(2d\) FLOPs, and it's trivially parallel. That's the unit of work everything in Section 01.6 is counted in.</p>
+</div>
+
+<div class="formula" data-name="Dot product · geometric">
+  <div class="tex">$$\mathbf{a}\cdot\mathbf{b} = \htmlClass{t1}{\lVert\mathbf{a}\rVert}\;\htmlClass{t2}{\lVert\mathbf{b}\rVert}\;\htmlClass{t3}{\cos\theta}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\lVert\mathbf{a}\rVert\)</dt><dd>length of \(\mathbf{a}\) (its L2 norm, next section)</dd></div>
+    <div data-t="t2"><dt>\(\lVert\mathbf{b}\rVert\)</dt><dd>length of \(\mathbf{b}\)</dd></div>
+    <div data-t="t3"><dt>\(\cos\theta\)</dt><dd>cosine of the angle between the arrows: +1 same direction, 0 at right angles, −1 opposite</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The dot product is "how long are they" times "how much do they point the same way". Positive means aligned, zero means unrelated (orthogonal), negative means opposed.</p>
+  <p class="why"><b>Why it matters</b>This is why a dot product can serve as a <em>match score</em>. A query vector that points the same way as a key vector gets a big positive score. One at right angles gets zero. Attention is built on exactly that.</p>
+</div>
+
+<details class="think"><summary>Think first: why do the two formulas give the same number?</summary>
+<div>Take the triangle formed by \(\mathbf{a}\), \(\mathbf{b}\), and \(\mathbf{a}-\mathbf{b}\). The law of cosines says \(\lVert\mathbf{a}-\mathbf{b}\rVert^2 = \lVert\mathbf{a}\rVert^2 + \lVert\mathbf{b}\rVert^2 - 2\lVert\mathbf{a}\rVert\lVert\mathbf{b}\rVert\cos\theta\). Now expand the left side entry by entry: \(\sum_i (a_i-b_i)^2 = \sum_i a_i^2 + \sum_i b_i^2 - 2\sum_i a_ib_i\). The squared-length terms match on both sides, so \(\sum_i a_ib_i = \lVert\mathbf{a}\rVert\lVert\mathbf{b}\rVert\cos\theta\). In 4096 dimensions you can't see the angle, so this identity is how "angle" gets <em>defined</em> there.</div>
+</details>
+
+<p>The <strong>projection</strong> of \(\mathbf{b}\) onto \(\mathbf{a}\) asks how far \(\mathbf{b}\) reaches along \(\mathbf{a}\)'s direction. Its signed length is \(\mathbf{a}\cdot\mathbf{b}/\lVert\mathbf{a}\rVert\). That's the gold segment in the widget above. Interpretability work uses this constantly: "how much of this hidden vector lies along the 'French' direction?" is a projection.</p>
+
+<h3>Two places an LLM computes dot products</h3>
+<p><strong>Logits.</strong> The last step of every forward pass multiplies the final hidden vector \(\mathbf{h}\in\mathbb{R}^{4096}\) by the output embedding of each vocabulary entry. That's 128,256 dot products, one per possible next token, and the largest one is the model's top guess.</p>
+<p><strong>Attention scores.</strong> Each token emits a <em>query</em> \(\mathbf{q}\) ("what am I looking for?") and a <em>key</em> \(\mathbf{k}\) ("what do I contain?"). The score between two tokens is \(\mathbf{q}\cdot\mathbf{k}\), and a softmax (Module 03) turns a row of scores into weights that sum to 1. The widget below does this in two dimensions.</p>
+
+<div id="w-attn"></div>
+
+<div class="intuition"><b>What the widget shows</b>
+<p>Rotating the query changes <em>which</em> key wins. Lengthening it changes <em>how decisively</em> it wins: every score scales by \(\lVert\mathbf{q}\rVert\), and softmax of bigger numbers is spikier. Longer keys also get an edge, because a dot product rewards length as well as alignment. Real attention controls this with the \(1/\sqrt{d_k}\) factor in Section 01.7, and some models also normalize queries and keys ("QK-norm").</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="norms">Norms, normalization, and cosine similarity</h2>
+
+<p>A <strong>norm</strong> measures how big a vector is. There's more than one sensible way to do that, and two of them matter in practice.</p>
+
+<div class="formula" data-name="L2 and L1 norms">
+  <div class="tex">$$\htmlClass{t1}{\lVert\mathbf{x}\rVert_2} = \sqrt{\sum_{i=1}^{d} \htmlClass{t3}{x_i}^{2}} = \sqrt{\mathbf{x}\cdot\mathbf{x}}, \qquad \htmlClass{t2}{\lVert\mathbf{x}\rVert_1} = \sum_{i=1}^{d} \lvert \htmlClass{t3}{x_i} \rvert$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\lVert\mathbf{x}\rVert_2\)</dt><dd><b>L2 (Euclidean) norm</b>: the straight-line length of the arrow. Written \(\lVert\mathbf{x}\rVert\) when no subscript is given</dd></div>
+    <div data-t="t2"><dt>\(\lVert\mathbf{x}\rVert_1\)</dt><dd><b>L1 (Manhattan) norm</b>: total distance if you can only move along the axes</dd></div>
+    <div data-t="t3"><dt>\(x_i\)</dt><dd>entries of the vector; \(\lvert\cdot\rvert\) is absolute value</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>For \(\mathbf{x}=(3,-4)\): L2 is \(\sqrt{9+16}=5\), the hypotenuse. L1 is \(3+4=7\), walking the two legs. The L2 norm is also the square root of the vector's dot product with itself.</p>
+  <p class="why"><b>Why it matters</b>L2 is everywhere in training: gradient clipping caps the global L2 norm of all gradients (<code>clip_grad_norm_</code>, often at 1.0), and weight decay pulls weights toward a smaller L2 norm. L1 shows up where you want <em>sparsity</em>, because penalizing it pushes small entries to exactly zero. The sparse autoencoders used in interpretability research put an L1 penalty on their features for that reason.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 780 270" id="fig-norms"></svg>
+<figcaption>The "unit ball" of each norm: every point whose norm equals 1. L1 gives a diamond, L2 a circle, L∞ (the largest absolute entry) a square. The same point \(\mathbf{x}=(0.6,\,0.8)\) has L2 norm exactly 1, L1 norm 1.4, and L∞ norm 0.8. Which vector counts as "big" depends on which norm you measure with.</figcaption></figure>
+
+<h3>Normalization</h3>
+<p>Dividing a vector by its own length gives a <strong>unit vector</strong>, which keeps the direction and throws away the size:</p>
+
+$$\hat{\mathbf{x}} = \frac{\mathbf{x}}{\lVert\mathbf{x}\rVert_2}, \qquad \lVert\hat{\mathbf{x}}\rVert_2 = 1, \qquad \text{RMSNorm}(\mathbf{x}) = \mathbf{g}\odot\frac{\mathbf{x}}{\sqrt{\tfrac{1}{d}\sum_{i} x_i^2 + \epsilon}}$$
+
+<p>The right-hand formula is <strong>RMSNorm</strong> (Zhang &amp; Sennrich, 2019), which runs twice per layer in Llama-family models. The denominator is the root-mean-square of the entries, which equals \(\lVert\mathbf{x}\rVert_2/\sqrt{d}\), so RMSNorm rescales every token vector to length about \(\sqrt{d}\) (64 for \(d=4096\)) before multiplying entry-wise (\(\odot\)) by a learned gain \(\mathbf{g}\). \(\epsilon\) is a tiny constant like \(10^{-5}\) that prevents division by zero. Module 06 covers why the network needs this. For now, notice it's just "divide by the norm".</p>
+
+<h3>Cosine similarity</h3>
+
+<div class="formula" data-name="Cosine similarity">
+  <div class="tex">$$\htmlClass{t1}{\cos(\mathbf{a},\mathbf{b})} = \frac{\htmlClass{t2}{\mathbf{a}\cdot\mathbf{b}}}{\htmlClass{t3}{\lVert\mathbf{a}\rVert_2\,\lVert\mathbf{b}\rVert_2}} = \htmlClass{t4}{\hat{\mathbf{a}}\cdot\hat{\mathbf{b}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\cos(\mathbf{a},\mathbf{b})\)</dt><dd>a number from −1 to +1 that ignores length entirely</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{a}\cdot\mathbf{b}\)</dt><dd>the raw dot product</dd></div>
+    <div data-t="t3"><dt>\(\lVert\mathbf{a}\rVert\lVert\mathbf{b}\rVert\)</dt><dd>the product of lengths, divided out</dd></div>
+    <div data-t="t4"><dt>\(\hat{\mathbf{a}}\cdot\hat{\mathbf{b}}\)</dt><dd>equivalently: normalize both first, then take a plain dot product</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Rearrange the geometric dot product to solve for the cosine. For \((1,2,3)\) and \((4,-5,6)\): \(12 / (\sqrt{14}\cdot\sqrt{77}) = 12/32.83 = 0.365\), an angle of about 68.6°.</p>
+  <p class="why"><b>Why it matters</b>This is how retrieval works (Module 11). Embed the question and every document chunk, then rank chunks by cosine with the question. Chunks that mean similar things get vectors pointing in similar directions, however long or short the text was.</p>
+</div>
+
+<div class="mle"><b>MLE angle · Normalize once, then use the dot product</b>
+<p>Vector indexes are fastest at raw inner products. So the standard trick is to L2-normalize every embedding when you store it (<code>normalize_embeddings=True</code> in sentence-transformers) and use an inner-product index such as FAISS <code>IndexFlatIP</code>. For unit vectors, \(\mathbf{a}\cdot\mathbf{b}\) <em>is</em> the cosine, and \(\lVert\mathbf{a}-\mathbf{b}\rVert^2 = 2 - 2\cos(\mathbf{a},\mathbf{b})\), so Euclidean distance ranks results in exactly the same order. Forget to normalize and long chunks quietly outrank relevant ones.</p>
+</div>
+
+<details class="think"><summary>Think first: two random 4096-dimensional vectors. What's their cosine?</summary>
+<div>Almost exactly 0. If the entries are independent with mean zero, the dot product is a sum of 4096 terms that are as likely to be positive as negative, and most of it cancels. The cosine comes out roughly normal with standard deviation \(1/\sqrt{d} = 1/64 \approx 0.016\). In high dimensions, "unrelated" means "nearly orthogonal", and there's room for a very large number of nearly orthogonal directions. That's part of why a 4096-d hidden vector can hold many features at once. Trained embeddings aren't random, though: they often share a common direction, so unrelated texts can still score 0.2 to 0.5 against each other.</div>
+</details>
+
+<div class="flag"><b>Caveat · Cosine scores aren't universal</b>
+<p>A cosine of 0.8 means different things for different embedding models, and scores from two different models can't be compared at all. Pick retrieval thresholds by measuring on your own labelled queries, not by intuition about what "0.8" should mean.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="transform">Matrices as transformations</h2>
+
+<p>A matrix is a grid of numbers, but its <em>job</em> is to be a function: feed it a vector and it returns another vector. Take a 2×2 matrix \(A\) with first row \((a, b)\) and second row \((c, d)\), and think of it as two columns:</p>
+
+$$A = \big[\;\mathbf{a}_1 \;\;\; \mathbf{a}_2\;\big], \quad \mathbf{a}_1 = \begin{bmatrix} a \\ c \end{bmatrix},\; \mathbf{a}_2 = \begin{bmatrix} b \\ d \end{bmatrix}, \qquad A\mathbf{x} = x_1\begin{bmatrix} a \\ c \end{bmatrix} + x_2\begin{bmatrix} b \\ d \end{bmatrix} = \begin{bmatrix} a x_1 + b x_2 \\ c x_1 + d x_2 \end{bmatrix}$$
+
+<p>Read it two ways. <strong>Row view:</strong> each output entry is a dot product of one row of \(A\) with \(\mathbf{x}\). <strong>Column view:</strong> the output is a weighted mix of \(A\)'s columns, with \(\mathbf{x}\)'s entries as the weights. The column view gives you the key picture: column 1 is where the basis vector \(\mathbf{e}_1 = (1,0)\) lands, column 2 is where \(\mathbf{e}_2 = (0,1)\) lands, and every other vector follows along.</p>
+
+<div class="def"><b>Definition · Linear</b>
+<p>A function \(f\) is <b>linear</b> if \(f(\mathbf{x}+\mathbf{y}) = f(\mathbf{x}) + f(\mathbf{y})\) and \(f(c\,\mathbf{x}) = c\,f(\mathbf{x})\). Every matrix is a linear function and every linear function between finite-dimensional spaces is a matrix. Geometrically: the origin stays put, straight lines stay straight, and evenly spaced grid lines stay evenly spaced (though they may tilt, stretch, or collapse).</p>
+</div>
+
+<div id="w-xform"></div>
+
+<div class="formula" data-name="Determinant of a 2×2 matrix">
+  <div class="tex">$$\det \htmlClass{t5}{A} = \htmlClass{t1}{a}\,\htmlClass{t4}{d} - \htmlClass{t2}{b}\,\htmlClass{t3}{c}$$</div>
+  <dl class="legend">
+    <div data-t="t5"><dt>\(A\)</dt><dd>the matrix with rows \((a, b)\) and \((c, d)\)</dd></div>
+    <div data-t="t1"><dt>\(a\)</dt><dd>top-left: how much \(x_1\) feeds output 1</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>bottom-right: how much \(x_2\) feeds output 2</dd></div>
+    <div data-t="t2"><dt>\(b\)</dt><dd>top-right: how much \(x_2\) leaks into output 1</dd></div>
+    <div data-t="t3"><dt>\(c\)</dt><dd>bottom-left: how much \(x_1\) leaks into output 2</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The determinant is the signed area of the parallelogram the unit square turns into. \(\det = 2\) doubles every area. A negative determinant means the plane got flipped over, like a mirror image. \(\det = 0\) means the square was squashed flat onto a line or a point.</p>
+  <p class="why"><b>Why it matters</b>A zero determinant means information was destroyed: two different inputs land on the same output, so there's no inverse matrix that can undo it. For bigger and non-square matrices the same idea is called <em>rank</em> (Section 01.10).</p>
+</div>
+
+<p>Weight matrices in an LLM are rarely square, and they transform between spaces of <em>different</em> sizes. Llama-3-8B's <code>k_proj</code> is \(1024\times4096\): it maps a 4096-dimensional hidden vector down to 1024 numbers (8 key heads of 128). It can't be undone, because you can't recover 4096 numbers from 1024. The MLP's <code>up_proj</code> goes the other way, 4096 up to 14,336.</p>
+
+<div class="pitfall"><b>Pitfall · Stacked linear layers collapse</b>
+<p>Two matrices in a row are still one matrix: \(W_2(W_1\mathbf{x}) = (W_2W_1)\mathbf{x}\). A hundred linear layers with nothing in between can only do what a single matrix can do. The nonlinear activation between layers (SiLU, GELU, ReLU; Module 04) is what lets depth add expressive power. Where nonlinearity is absent, as in LoRA's \(B\) and \(A\), the product really is just one matrix, and that's exactly the property LoRA relies on to merge adapters back into the weights.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="matmul">Matrix multiplication</h2>
+
+<p>Multiplying two matrices applies one transformation after the other. In practice it's the same thing as "apply \(A\) to many vectors at once": each column of \(B\) is a vector, and each column of the result is \(A\) applied to it. Every entry of the result is a single dot product.</p>
+
+<div class="formula" data-name="Matrix product, one entry">
+  <div class="tex">$$\htmlClass{t1}{C_{ij}} = \sum_{\htmlClass{t4}{k}=1}^{\htmlClass{t5}{K}} \htmlClass{t2}{A_{ik}}\,\htmlClass{t3}{B_{kj}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{ij}\)</dt><dd>the output entry in row \(i\), column \(j\)</dd></div>
+    <div data-t="t2"><dt>\(A_{ik}\)</dt><dd>walk along <b>row \(i\)</b> of \(A\)</dd></div>
+    <div data-t="t3"><dt>\(B_{kj}\)</dt><dd>walk down <b>column \(j\)</b> of \(B\)</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>the shared index, which advances along both at once</dd></div>
+    <div data-t="t5"><dt>\(K\)</dt><dd>the inner dimension: columns of \(A\), which must equal rows of \(B\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Entry \((i, j)\) of the product is the dot product of row \(i\) of \(A\) with column \(j\) of \(B\).</p>
+  <p class="why"><b>Why it matters</b>Every one of the \(M\times N\) outputs is independent of the others, so thousands of GPU cores can compute them at the same time. That's the first half of why GPUs and matmuls get along (Section 01.11).</p>
+</div>
+
+<div class="formula" data-name="Shape rule and cost">
+  <div class="tex">$$\underbrace{[\htmlClass{t1}{M},\, \htmlClass{t3}{K}]}_{A} \times \underbrace{[\htmlClass{t3}{K},\, \htmlClass{t2}{N}]}_{B} = \underbrace{[\htmlClass{t1}{M},\, \htmlClass{t2}{N}]}_{C}, \qquad \htmlClass{t4}{\text{FLOPs}} = 2\,\htmlClass{t1}{M}\,\htmlClass{t2}{N}\,\htmlClass{t3}{K}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M\)</dt><dd>rows of \(A\) and of the output. In a linear layer: the number of tokens</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>columns of \(B\) and of the output. In a linear layer: output features</dd></div>
+    <div data-t="t3"><dt>\(K\)</dt><dd>the inner dimension that gets summed away. It has to match, or the product isn't defined</dd></div>
+    <div data-t="t4"><dt>FLOPs</dt><dd>floating-point operations: \(MN\) outputs × \(K\) multiplies and \(K\) adds each</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The inner dimensions must match and then vanish, and the outer ones survive. The cost is two times the product of all three sizes. (The \(M, N, K\) names are the same ones cuBLAS and CUTLASS use for GEMM, "general matrix multiply".)</p>
+  <p class="why"><b>Why it matters</b>Llama-3-8B's <code>q_proj</code> on a 2048-token prompt: \([2048, 4096]\times[4096, 4096]\) costs \(2\cdot2048\cdot4096\cdot4096 \approx 68.7\) GFLOP. At an H100's 989 TFLOP/s dense bf16 peak, that's about 70 µs, if it ran at peak. Per token, a weight matrix with \(KN\) parameters costs \(2KN\) FLOPs: <b>two FLOPs per parameter per token</b>. That's where the "2" in Module 07's \(6ND\) training-cost rule comes from.</p>
+</div>
+
+<div class="grid3">
+  <div class="card"><div class="k">View 1 · dot products</div><h4>Rows meet columns</h4><p>\(C_{ij}\) is row \(i\) of \(A\) dotted with column \(j\) of \(B\). This is how you compute an entry by hand, and how attention scores are read off.</p></div>
+  <div class="card"><div class="k">View 2 · column mixing</div><h4>Outputs are blends</h4><p>Column \(j\) of \(C\) is a mix of \(A\)'s columns, with weights from column \(j\) of \(B\). This is how a linear layer builds outputs from learned feature directions.</p></div>
+  <div class="card blue"><div class="k">View 3 · outer products</div><h4>A sum of rank-1 layers</h4><p>\(C = \sum_k A_{:,k}\,B_{k,:}\): column \(k\) of \(A\) times row \(k\) of \(B\) gives a full \(M\times N\) matrix, and \(C\) is the sum of \(K\) of them. This view leads straight to SVD and LoRA.</p></div>
+</div>
+
+<div id="w-matmul"></div>
+
+<div class="pitfall"><b>Pitfall · Order matters, twice</b>
+<p>Matrix multiplication is <em>not</em> commutative: \(AB \neq BA\) in general, and often only one of them is even defined. A \([3,4]\) matrix times a \([4,2]\) works; the reverse order is a shape error. It <em>is</em> associative, \((AB)C = A(BC)\), but the costs of the two groupings can be wildly different (next box).</p>
+</div>
+
+<details class="think"><summary>Think first: \(A\) and \(B\) are 4096×4096 and \(\mathbf{x}\) is a vector. Should you compute \((AB)\mathbf{x}\) or \(A(B\mathbf{x})\)?</summary>
+<div>Same answer, very different bill. \((AB)\mathbf{x}\) first does a full matrix–matrix product: \(2\cdot4096^3 \approx 137\) GFLOP, plus a cheap matrix–vector product. \(A(B\mathbf{x})\) does two matrix–vector products: \(2\times2\cdot4096^2 \approx 67\) MFLOP. That's about 2000× less work. LoRA uses this: its update is computed as \(B(A\mathbf{x})\), never by forming the full \(BA\) matrix during training.</div>
+</details>
+
+<div class="intuition"><b>An embedding lookup is a matmul in disguise</b>
+<p>Write token ID \(t\) as a one-hot vector \(\mathbf{o}\) (a 1 in position \(t\) and 0 in the other 128,255 positions). Then \(\mathbf{o}^{\top}E\) picks out row \(t\) of the embedding table \(E\). Libraries never do this multiply: indexing gives the same answer without 128,256 wasted multiply-adds per entry. But it's why the embedding table gets gradients like any other weight matrix, and why the input embedding and output unembedding can share one matrix ("tied embeddings", common in small models).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="transpose">Transpose, and why attention uses QKᵀ</h2>
+
+<p>The <strong>transpose</strong> \(A^{\top}\) flips a matrix across its diagonal: rows become columns. If \(A\) is \([m, n]\), then \(A^{\top}\) is \([n, m]\), and \((A^{\top})_{ij} = A_{ji}\). Two facts you'll use constantly: \((A^{\top})^{\top} = A\), and \((AB)^{\top} = B^{\top}A^{\top}\) (the order reverses, so the shapes still line up). A dot product is itself a tiny matmul: \(\mathbf{a}\cdot\mathbf{b} = \mathbf{a}^{\top}\mathbf{b}\), a \([1,d]\) row times a \([d,1]\) column.</p>
+
+<p>Now attention. Stack the query vectors of all \(T\) tokens as the rows of \(Q\), shape \([T, d_k]\), and the key vectors as the rows of \(K\), also \([T, d_k]\). You want the dot product of <em>every</em> query with <em>every</em> key. \(QK\) doesn't work, since \([T, d_k]\times[T, d_k]\) has mismatched inner dimensions. Transposing \(K\) turns its rows into columns, and the shape rule does the rest: \([T, d_k]\times[d_k, T] = [T, T]\).</p>
+
+<div class="formula" data-name="Attention scores">
+  <div class="tex">$$\htmlClass{t1}{S} = \frac{\htmlClass{t2}{Q}\,\htmlClass{t3}{K}^{\top}}{\sqrt{\htmlClass{t4}{d_k}}}, \qquad \htmlClass{t1}{S_{ij}} = \frac{\htmlClass{t2}{\mathbf{q}_i}\cdot\htmlClass{t3}{\mathbf{k}_j}}{\sqrt{\htmlClass{t4}{d_k}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(S\)</dt><dd>score matrix, \([T, T]\): row \(i\) holds token \(i\)'s score for every token \(j\)</dd></div>
+    <div data-t="t2"><dt>\(Q, \mathbf{q}_i\)</dt><dd>queries, \([T, d_k]\); row \(i\) is token \(i\)'s query</dd></div>
+    <div data-t="t3"><dt>\(K, \mathbf{k}_j\)</dt><dd>keys, \([T, d_k]\); the transpose makes row \(j\) into column \(j\)</dd></div>
+    <div data-t="t4"><dt>\(d_k\)</dt><dd>head dimension (128 in Llama-3-8B). Dividing by \(\sqrt{d_k}\) keeps the scores' spread near 1</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>One matrix multiply computes all \(T^2\) query–key dot products. Then each row goes through softmax and is used to average the value vectors (Module 06).</p>
+  <p class="why"><b>Why it matters</b>The score matrix grows as \(T^2\). At \(T = 8192\), that's 67M scores per head; across 32 heads in bf16, about 4.3 GB per layer for one sequence. That's why FlashAttention (Dao et al., 2022) computes it in tiles and never stores the whole thing.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 880 300" id="fig-qkt"></svg>
+<figcaption>\(QK^{\top}\) for a 6-token sequence. Row 6 of \(Q\) (the query for "mat") meets column 2 of \(K^{\top}\) (the key for "cat"), and their dot product fills cell \((6, 2)\) of \(S\). Grey cells are the causal mask: in a decoder, token \(i\) may not look at tokens after it, so those scores are set to \(-\infty\) before softmax.</figcaption></figure>
+
+<details class="think"><summary>Think first: why divide by \(\sqrt{d_k}\) and not by \(d_k\)?</summary>
+<div>Suppose query and key entries are independent with mean 0 and variance 1. Each product \(q_ik_i\) then has variance 1, and the dot product sums \(d_k\) of them, so its variance is \(d_k\) and its standard deviation is \(\sqrt{d_k}\). For \(d_k=128\), raw scores spread over roughly ±11, and softmax of numbers that far apart is nearly one-hot: one token gets all the attention and gradients for the rest vanish. Dividing by \(\sqrt{d_k} \approx 11.3\) brings the spread back to about 1. Dividing by \(d_k\) would overshoot and make attention nearly uniform. Vaswani et al. (2017) give exactly this argument.</div>
+</details>
+
+<div class="mle"><b>MLE angle · Transposes are usually free</b>
+<p>In PyTorch, <code>k.transpose(-2, -1)</code> doesn't move any data. It returns a <em>view</em> with swapped strides, and matmul kernels accept transposed operands directly. Use <code>.mT</code> or <code>transpose(-2, -1)</code> on batched tensors; <code>.T</code> on a tensor with more than two dimensions is deprecated. A <code>.contiguous()</code> after a transpose <em>does</em> copy, so in hot paths check whether you really need it.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="batched">Batched matmuls and broadcasting</h2>
+
+<p>Real tensors have more than two axes. Hidden states are \([B, T, d]\); attention works on \([B, H, T, d_k]\). The rule for <code>@</code> (<code>torch.matmul</code>) is simple: <strong>the last two axes are multiplied as matrices, and every axis before them is a batch axis</strong>, so the same matmul runs independently for each batch index.</p>
+
+$$[\ldots,\, M,\, K] \times [\ldots,\, K,\, N] \;\to\; [\ldots,\, M,\, N], \qquad [B, T, d] \times [d, d_{\text{ff}}] \;\to\; [B, T, d_{\text{ff}}]$$
+
+<p>In the second example the weight matrix has no batch axes at all. It gets <em>broadcast</em>: the one matrix is reused for all \(B\times T\) token vectors. Under the hood, PyTorch reshapes \([B, T, d]\) to \([B\cdot T, d]\), runs a single big GEMM, and reshapes back. The cost is \(2\cdot BT\cdot d\cdot d_{\text{ff}}\) FLOPs, which is just \(2MNK\) with \(M = BT\).</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 310" id="fig-batched"></svg>
+<figcaption>A linear layer on a batch. \(X\) holds \(B\) sequences of \(T\) token vectors. The single weight matrix \(W\) and bias \(\mathbf{b}\) are shared by all \(B\cdot T\) rows. The bias is a vector of length \(d_{\text{ff}}\) that broadcasts across the two leading axes. In memory, all of this is one \([B\cdot T, d] \times [d, d_{\text{ff}}]\) GEMM.</figcaption></figure>
+
+<h3>The broadcasting rules</h3>
+<p>When two tensors of different shapes meet in an elementwise operation (<code>+</code>, <code>*</code>, <code>masked_fill</code>), NumPy and PyTorch line their shapes up <strong>from the right</strong> and compare axis by axis:</p>
+<ol>
+  <li>If one tensor has fewer axes, pretend it has extra size-1 axes on the left.</li>
+  <li>Two sizes are compatible if they're equal, or if one of them is 1. A size-1 axis is stretched (without copying) to match.</li>
+  <li>Anything else is an error.</li>
+</ol>
+<p>So a bias <code>[d_ff]</code> plus activations <code>[B, T, d_ff]</code> works, and a causal mask <code>[T, T]</code> applies to scores <code>[B, H, T, T]</code> for every batch element and head at once.</p>
+
+<div class="pitfall"><b>Pitfall · The silent [N, N]</b>
+<p>Predictions of shape <code>[N, 1]</code> minus targets of shape <code>[N]</code> doesn't fail. Rule 1 turns the targets into <code>[1, N]</code>, rule 2 stretches both, and you get an <code>[N, N]</code> matrix of every prediction minus every target. Take its mean and you have a loss that trains, slowly and wrongly. When a loss curve looks oddly flat, print the shapes before anything else.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="linear">The linear layer and parameter counting</h2>
+
+<p>Put a matrix multiply and a bias together and you have the most common building block in deep learning. Almost every parameter in an LLM lives in one of these.</p>
+
+<div class="formula" data-name="Linear layer">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{y}} = \htmlClass{t2}{W}\,\htmlClass{t3}{\mathbf{x}} + \htmlClass{t4}{\mathbf{b}}, \qquad \htmlClass{t5}{P} = \htmlClass{t6}{d_{\text{out}}}\cdot\htmlClass{t7}{d_{\text{in}}} + \htmlClass{t6}{d_{\text{out}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{y}\)</dt><dd>output vector, \([d_{\text{out}}]\)</dd></div>
+    <div data-t="t2"><dt>\(W\)</dt><dd>weight matrix, \([d_{\text{out}}, d_{\text{in}}]\). This is exactly how PyTorch stores <code>nn.Linear.weight</code></dd></div>
+    <div data-t="t3"><dt>\(\mathbf{x}\)</dt><dd>input vector, \([d_{\text{in}}]\)</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{b}\)</dt><dd>bias, \([d_{\text{out}}]\). Llama-family models drop it (<code>bias=False</code>)</dd></div>
+    <div data-t="t5"><dt>\(P\)</dt><dd>parameter count of the layer</dd></div>
+    <div data-t="t6"><dt>\(d_{\text{out}}\)</dt><dd>output features</dd></div>
+    <div data-t="t7"><dt>\(d_{\text{in}}\)</dt><dd>input features</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each output is a dot product of one row of \(W\) with the input, plus an offset. One row per output, one column per input.</p>
+  <p class="why"><b>Why it matters</b>For a batch stored as rows, PyTorch computes <code>x @ W.T + b</code>. That's why <code>nn.Linear(4096, 1024).weight.shape</code> is <code>[1024, 4096]</code>, "backwards" from the constructor arguments, and why so many shape bugs are really transpose bugs.</p>
+</div>
+
+<p>Now count a real model. Each Llama-3-8B layer has four attention projections and three MLP projections, all without bias:</p>
+
+<table class="t">
+  <thead><tr><th>Matrix</th><th>Shape \([d_{\text{out}}, d_{\text{in}}]\)</th><th class="num">Parameters</th></tr></thead>
+  <tbody>
+    <tr><td><code>q_proj</code>, <code>o_proj</code></td><td>[4096, 4096] each</td><td class="num">2 × 16,777,216</td></tr>
+    <tr><td><code>k_proj</code>, <code>v_proj</code></td><td>[1024, 4096] each</td><td class="num">2 × 4,194,304</td></tr>
+    <tr><td><code>gate_proj</code>, <code>up_proj</code></td><td>[14336, 4096] each</td><td class="num">2 × 58,720,256</td></tr>
+    <tr><td><code>down_proj</code></td><td>[4096, 14336]</td><td class="num">58,720,256</td></tr>
+    <tr><td><b>one layer</b></td><td></td><td class="num"><b>218,103,808</b></td></tr>
+    <tr><td>× 32 layers</td><td></td><td class="num">6,979,321,856</td></tr>
+    <tr><td>embedding + separate output head</td><td>[128256, 4096] × 2</td><td class="num">1,050,673,152</td></tr>
+    <tr><td>RMSNorm gains (65 vectors of 4096)</td><td></td><td class="num">266,240</td></tr>
+    <tr><td><b>total</b></td><td></td><td class="num"><b>8,030,261,248</b></td></tr>
+  </tbody>
+</table>
+
+<p>That matches the published 8.03B. Two things stand out. The MLP holds about 81% of each layer. And the norms are a rounding error: in an LLM, "parameters" means "entries of linear-layer weight matrices", plus the embedding tables.</p>
+
+<div class="mle"><b>MLE angle · FLOPs per token from a parameter count</b>
+<p>Since a matrix with \(P\) entries costs \(2P\) FLOPs per token, a forward pass costs about 2 FLOPs per matmul parameter per token. The input embedding is a lookup, so it's excluded: Llama-3-8B has about 7.5B matmul parameters, so roughly 15 GFLOP per token, plus attention-score work that grows with context length. Training adds the backward pass at about twice the forward cost, which gives Module 07's \(6ND\).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="svd">Rank, low-rank factorization, and SVD</h2>
+
+<p>The <strong>rank</strong> of a matrix is the number of genuinely independent directions in its output, equivalently the number of linearly independent columns (which always equals the number of independent rows). A \([4096, 4096]\) matrix has rank at most 4096, but it can be much lower. The 2×2 "squash" preset in the transformation widget has rank 1: everything lands on one line.</p>
+
+<p>The simplest low-rank matrix is an <strong>outer product</strong> \(\mathbf{u}\mathbf{v}^{\top}\): a \([m,1]\) column times a \([1,n]\) row, giving an \([m,n]\) matrix whose every row is a multiple of \(\mathbf{v}^{\top}\). It has rank 1, and storing it takes \(m+n\) numbers instead of \(mn\). View 3 of matrix multiplication says any product of an \([m,r]\) and an \([r,n]\) matrix is a sum of \(r\) such outer products, so it has rank at most \(r\). The singular value decomposition says every matrix can be written that way, in the best possible order.</p>
+
+<div class="formula" data-name="Singular value decomposition">
+  <div class="tex">$$\htmlClass{t1}{A} = \htmlClass{t2}{U}\,\htmlClass{t3}{\Sigma}\,\htmlClass{t4}{V}^{\top} = \sum_{i=1}^{\htmlClass{t5}{r}} \htmlClass{t3}{\sigma_i}\,\htmlClass{t2}{\mathbf{u}_i}\,\htmlClass{t4}{\mathbf{v}_i}^{\top}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(A\)</dt><dd>any \([m, n]\) matrix: a weight, a weight update, an image</dd></div>
+    <div data-t="t2"><dt>\(U, \mathbf{u}_i\)</dt><dd>\([m, r]\); orthonormal columns (unit length, mutually perpendicular): the output directions</dd></div>
+    <div data-t="t3"><dt>\(\Sigma, \sigma_i\)</dt><dd>diagonal \([r, r]\) of <b>singular values</b> \(\sigma_1 \ge \sigma_2 \ge \cdots \ge 0\): how much \(A\) stretches along each direction</dd></div>
+    <div data-t="t4"><dt>\(V, \mathbf{v}_i\)</dt><dd>\([n, r]\); orthonormal columns: the input directions</dd></div>
+    <div data-t="t5"><dt>\(r\)</dt><dd>the rank: how many \(\sigma_i\) are non-zero</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every matrix is a rotation, then a stretch along perpendicular axes, then another rotation. Equivalently, it's a sum of rank-1 layers, sorted from most to least important.</p>
+  <p class="why"><b>Why it matters</b>The singular values are an importance ranking. If they drop off fast, the matrix is "approximately low rank", and a few terms reproduce almost all of it.</p>
+</div>
+
+<div class="formula" data-name="Best rank-k approximation (Eckart–Young)">
+  <div class="tex">$$\htmlClass{t1}{A_k} = \sum_{i=1}^{\htmlClass{t2}{k}} \sigma_i\,\mathbf{u}_i\mathbf{v}_i^{\top}, \qquad \htmlClass{t3}{\lVert A - A_k \rVert_F^{2}} = \sum_{i \gt \htmlClass{t2}{k}} \htmlClass{t4}{\sigma_i^{2}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(A_k\)</dt><dd>keep only the first \(k\) terms: a rank-\(k\) matrix, storable as \(k(m+n)\) numbers</dd></div>
+    <div data-t="t2"><dt>\(k\)</dt><dd>how many terms you keep</dd></div>
+    <div data-t="t3"><dt>\(\lVert\cdot\rVert_F^2\)</dt><dd>squared Frobenius norm: the sum of every squared entry, i.e. L2 for matrices</dd></div>
+    <div data-t="t4"><dt>\(\sigma_i^2\)</dt><dd>the "energy" in each dropped term</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Truncating the SVD gives the closest rank-\(k\) matrix there is (Eckart &amp; Young, 1936), and the squared error is exactly the squared singular values you threw away.</p>
+</div>
+
+<div id="w-svd"></div>
+
+<h3>Setting up LoRA</h3>
+<p>Fine-tuning changes a pretrained weight \(W_0\) to \(W_0 + \Delta W\). Hu et al. (2021) bet that \(\Delta W\) is approximately low rank, as with the "low-rank plus noise" pattern above, so they never form it at full size. They train two thin matrices whose product <em>is</em> a rank-\(r\) update.</p>
+
+<div class="formula" data-name="LoRA factorization">
+  <div class="tex">$$\htmlClass{t1}{W} = \htmlClass{t2}{W_0} + \htmlClass{t3}{B}\,\htmlClass{t4}{A}, \qquad \htmlClass{t3}{B}\in\mathbb{R}^{\htmlClass{t5}{d}\times\htmlClass{t6}{r}},\;\; \htmlClass{t4}{A}\in\mathbb{R}^{\htmlClass{t6}{r}\times\htmlClass{t7}{k}}, \qquad \text{params} = \htmlClass{t6}{r}\,(\htmlClass{t5}{d}+\htmlClass{t7}{k}) \;\text{ vs }\; \htmlClass{t5}{d}\,\htmlClass{t7}{k}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(W\)</dt><dd>the adapted weight, still \([d, k]\)</dd></div>
+    <div data-t="t2"><dt>\(W_0\)</dt><dd>pretrained weight, frozen</dd></div>
+    <div data-t="t3"><dt>\(B\)</dt><dd>\([d, r]\), trained; initialized to zero so training starts exactly at \(W_0\)</dd></div>
+    <div data-t="t4"><dt>\(A\)</dt><dd>\([r, k]\), trained; random init (a different \(A\) from the SVD's matrix above)</dd></div>
+    <div data-t="t5"><dt>\(d\)</dt><dd>output dimension of the weight</dd></div>
+    <div data-t="t6"><dt>\(r\)</dt><dd>LoRA rank, typically 8 to 64</dd></div>
+    <div data-t="t7"><dt>\(k\)</dt><dd>input dimension of the weight</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Replace one big \(d\times k\) update with a tall-thin times a short-wide pair. The product can only express \(r\) directions, and in exchange it costs the <em>sum</em> of the dimensions instead of their product.</p>
+  <p class="why"><b>Why it matters</b>A 4096×4096 <code>q_proj</code> at \(r = 16\): \(16\times(4096+4096) = 131{,}072\) trainable parameters instead of 16,777,216, which is 0.78%. Module 10 builds the full training setup on this.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 880 340" id="fig-svd"></svg>
+<figcaption>Top: the SVD as shapes. A tall \(U\), a diagonal \(\Sigma\) whose entries shrink, and a wide \(V^{\top}\). Keeping the first \(k\) columns and rows gives the best rank-\(k\) approximation. Bottom: LoRA reuses the same shape trick without computing any SVD. It learns a thin \(B\) and a flat \(A\) directly by gradient descent, and their product is a full-size, rank-\(r\) update.</figcaption></figure>
+
+<div class="flag"><b>Caveat · Pretrained weights aren't low rank</b>
+<p>The bet is about the <em>update</em> \(\Delta W\), not \(W_0\). Pretrained weight matrices usually have slowly decaying spectra, closer to the "random noise" pattern, so truncating their SVD to save memory costs real quality. Some LoRA variants do borrow the SVD: PiSSA (Meng et al., 2024) initializes \(B\) and \(A\) from the top singular directions of \(W_0\). Standard LoRA starts from \(BA = 0\).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="gpu">Why GPUs love matmuls</h2>
+
+<p>A GPU has two speed limits: how many FLOPs per second its arithmetic units can do, and how many bytes per second it can stream from memory. An H100 SXM does about 989 TFLOP/s of dense bf16 matmul against 3.35 TB/s of memory bandwidth. To keep the arithmetic busy, a kernel must do roughly 295 FLOPs for every byte it reads. Module 08 builds the full roofline model; here's the matmul half of the story.</p>
+
+<div class="formula" data-name="Arithmetic intensity of a matmul">
+  <div class="tex">$$\htmlClass{t1}{\text{AI}} = \frac{2\,M\,N\,K}{\htmlClass{t2}{b}\,(\htmlClass{t3}{MK} + \htmlClass{t4}{KN} + \htmlClass{t5}{MN})} \;\;\xrightarrow{\;M=N=K=n,\; b=2\;}\;\; \frac{n}{3}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>AI</dt><dd>arithmetic intensity: FLOPs done per byte moved to or from memory</dd></div>
+    <div data-t="t2"><dt>\(b\)</dt><dd>bytes per number: 2 for bf16, 4 for fp32</dd></div>
+    <div data-t="t3"><dt>\(MK\)</dt><dd>entries of \(A\), read once</dd></div>
+    <div data-t="t4"><dt>\(KN\)</dt><dd>entries of \(B\), read once</dd></div>
+    <div data-t="t5"><dt>\(MN\)</dt><dd>entries of \(C\), written once</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Work grows with the <em>product</em> of three sizes, while data grows with products of only two. Make the matrices bigger and each loaded number gets reused more times. A 4096³ bf16 matmul does about 1365 FLOPs per byte, far past the ridge. A matrix–vector product (\(M=1\)) reuses nothing and sits near 1 FLOP per byte.</p>
+  <p class="why"><b>Why it matters</b>This is the whole prefill-versus-decode story of Module 08. Prefill pushes thousands of tokens through each weight matrix (\(M\) large, compute-bound). Decode pushes one token per sequence (\(M\) = batch size, memory-bound). Same weights, same math, a factor of a thousand in efficiency.</p>
+</div>
+
+<figure class="fig"><div id="fig-ai"></div>
+<figcaption>Arithmetic intensity of one Llama-3-8B-sized projection, \([T, 4096]\times[4096, 4096]\) in bf16, as the number of tokens \(T\) processed together grows. For \(T \ll 4096\) the intensity is about \(T\). It crosses the H100's ridge near \(T \approx 330\) and levels off at 2048. Ridge points are from the peak-throughput and bandwidth figures quoted in Module 08; the Apple figure is rough.</figcaption></figure>
+
+<p>GPUs also have dedicated matmul hardware. NVIDIA's <strong>tensor cores</strong> multiply small tiles (for example 16×16 blocks) in one instruction. On an H100 they deliver roughly fifteen times the throughput of the ordinary fp32 units. A well-written GEMM loads a tile of \(A\) and a tile of \(B\) into fast on-chip memory, multiplies them there, and accumulates, so each number fetched from slow memory gets reused across a whole tile. That tiling is exactly the reuse the arithmetic intensity formula counts.</p>
+
+<div class="mle"><b>MLE angle · Shapes that are friendly to hardware</b>
+<p>Tensor-core kernels work in tiles, so dimensions that are multiples of 64 or 128 avoid wasted partial tiles. That's why model widths are numbers like 4096 and 14,336 (= 112 × 128), and why Karpathy's nanoGPT pads GPT-2's 50,257-token vocabulary to 50,304 (a multiple of 64) and reports a noticeable speedup from that one change. If a custom layer runs oddly slow, check whether one of its dimensions is something like 1000 or 50,257.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Vectors, norms, and cosine in NumPy</h3>
+<div class="code" data-lang="python" data-title="vectors.py"><pre><code>
+import numpy as np
+
+a = np.array([1.0, 2.0, 3.0])
+b = np.array([4.0, -5.0, 6.0])
+
+print(a + b, 2 * a)            # [ 5. -3.  9.] [2. 4. 6.]
+print(a @ b, np.dot(a, b))     # 12.0 12.0   (sum of a_i * b_i)
+print(np.linalg.norm(a))       # 3.7416...   sqrt(14), the L2 norm
+print(np.abs(a).sum())         # 6.0         the L1 norm
+
+cos = a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+print(round(float(cos), 4), np.degrees(np.arccos(cos)))   # 0.3655 68.56...
+
+# random high-dimensional vectors are nearly orthogonal
+rng = np.random.default_rng(0)
+x, y = rng.normal(size=(2, 4096))
+print(x @ y / (np.linalg.norm(x) * np.linalg.norm(y)))    # close to 0: std is 1/64
+</code></pre></div>
+
+<h3>2. Shapes, linear layers, and broadcasting in PyTorch</h3>
+<div class="code" data-lang="python" data-title="shapes.py"><pre><code>
+import torch
+
+B, T, d, d_ff = 2, 128, 4096, 14336
+x = torch.randn(B, T, d)
+
+up = torch.nn.Linear(d, d_ff, bias=False)
+print(up.weight.shape)          # torch.Size([14336, 4096]): stored as [out, in]
+
+y = up(x)                       # computes x @ up.weight.T
+print(y.shape)                  # torch.Size([2, 128, 14336])
+print(torch.allclose(y, x @ up.weight.T, atol=1e-4))   # True: leading dims are batch dims
+
+flops = 2 * (B * T) * d * d_ff  # 2MNK with M = B*T
+print(f"{flops / 1e9:.1f} GFLOP")                      # 30.1 GFLOP
+
+bias = torch.zeros(d_ff)
+print((y + bias).shape)         # [2, 128, 14336]: bias broadcasts over B and T
+
+# the classic bug: [N, 1] minus [N] broadcasts to [N, N]
+pred, target = torch.randn(8, 1), torch.randn(8)
+print((pred - target).shape)    # torch.Size([8, 8]), not [8]
+loss = ((pred.squeeze(-1) - target) ** 2).mean()       # what you meant
+</code></pre></div>
+
+<h3>3. Attention scores three ways: matmul, einsum, fused kernel</h3>
+<p><code>einsum</code> names every axis with a letter. Letters that appear in the inputs but not in the output are summed over. Here <code>d</code> disappears, so it's a dot product over the head dimension for every \((b, h, i, j)\).</p>
+<div class="code" data-lang="python" data-title="scores.py"><pre><code>
+import math
+import torch
+import torch.nn.functional as F
+
+B, H, T, d_k = 2, 32, 16, 128
+q, k, v = (torch.randn(B, H, T, d_k) for _ in range(3))
+
+s1 = q @ k.transpose(-2, -1) / math.sqrt(d_k)                 # [B, H, T, T]
+s2 = torch.einsum("bhid,bhjd-&gt;bhij", q, k) / math.sqrt(d_k)   # same thing, axes named
+print(s1.shape, torch.allclose(s1, s2, atol=1e-4))             # torch.Size([2, 32, 16, 16]) True
+
+print((q @ k.transpose(-2, -1)).std().item(), s1.std().item())  # about 11.3 vs about 1.0
+
+mask = torch.ones(T, T, dtype=torch.bool).tril()               # [T, T] broadcasts over B and H
+attn = torch.softmax(s1.masked_fill(~mask, float("-inf")), dim=-1)
+out = attn @ v                                                 # [B, H, T, d_k]
+
+ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print(torch.allclose(out, ref, atol=1e-4))                     # True
+</code></pre></div>
+
+<h3>4. SVD, rank-k error, and LoRA-shaped factors</h3>
+<div class="code" data-lang="python" data-title="lowrank.py"><pre><code>
+import torch
+
+torch.manual_seed(0)
+d, k, r_true = 1024, 1024, 8
+# "rank 8 plus a little noise": the shape of matrix LoRA bets a fine-tuning update has
+delta = torch.randn(d, r_true) @ torch.randn(r_true, k) + 0.05 * torch.randn(d, k)
+
+U, S, Vh = torch.linalg.svd(delta, full_matrices=False)   # delta = U @ diag(S) @ Vh
+print(S[:10])                   # eight large values, then a cliff
+
+def rank_k(r):
+    return U[:, :r] @ torch.diag(S[:r]) @ Vh[:r, :]
+
+total = torch.linalg.norm(delta)
+for r in (1, 4, 8, 16, 64):
+    err = (torch.linalg.norm(delta - rank_k(r)) / total).item()
+    tail = ((S[r:] ** 2).sum().sqrt() / total).item()     # Eckart-Young prediction
+    print(f"rank {r:3d}: rel. error {err:.4f}  (from dropped sigmas {tail:.4f})  "
+          f"params {r * (d + k):,} vs {d * k:,}")
+
+# LoRA-shaped factors from the SVD: B is [d, r], A is [r, k], and B @ A is the rank-r approximation
+r = 8
+B_ = U[:, :r] * S[:r].sqrt()
+A_ = S[:r].sqrt()[:, None] * Vh[:r]
+print(B_.shape, A_.shape, torch.allclose(B_ @ A_, rank_k(r), atol=1e-3))
+</code></pre></div>
+
+<h3>5. Measure arithmetic intensity on your own hardware</h3>
+<div class="code" data-lang="python" data-title="matmul_bench.py"><pre><code>
+import time
+import torch
+
+dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+dt = torch.float32 if dev == "cpu" else torch.float16
+
+def sync():
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    elif dev == "mps":
+        torch.mps.synchronize()
+
+def bench(M, K, N, iters=20):
+    A = torch.randn(M, K, device=dev, dtype=dt)
+    B = torch.randn(K, N, device=dev, dtype=dt)
+    for _ in range(3):
+        A @ B                                   # warm-up
+    sync()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        A @ B
+    sync()
+    sec = (time.perf_counter() - t0) / iters
+    flops = 2 * M * N * K
+    nbytes = A.element_size() * (M * K + K * N + M * N)
+    print(f"T={M:5d}  {flops / sec / 1e12:7.2f} TFLOP/s  {nbytes / sec / 1e9:7.1f} GB/s  AI={flops / nbytes:7.1f}")
+
+for T in (1, 8, 64, 512, 4096):
+    bench(T, 4096, 4096)                        # one Llama-sized projection, T tokens at a time
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you can (1) predict, before running, every shape printed by scripts 2 and 3; (2) explain why script 4's error at rank 8 equals the dropped-sigma formula and why it falls off a cliff exactly there; and (3) produce the table from script 5 for your machine and point to the \(T\) where TFLOP/s stops climbing. Compare that \(T\) to your chip's ridge point (peak FLOP/s ÷ bandwidth) and explain any gap.</p>
+</div>
+
+<p class="small muted">Further reading: Grant Sanderson's <a href="https://www.3blue1brown.com/topics/linear-algebra">Essence of Linear Algebra</a> videos animate the "matrix as transformation" picture from Section 01.5. Gilbert Strang's <a href="https://ocw.mit.edu/courses/18-06-linear-algebra-spring-2010/">MIT 18.06</a> is the classic full course. Horace He's <a href="https://horace.io/brrr_intro.html">Making Deep Learning Go Brrrr</a> covers the compute-versus-memory view. The PyTorch <a href="https://pytorch.org/docs/stable/notes/broadcasting.html">broadcasting notes</a> are short and worth reading once. LoRA: <a href="https://arxiv.org/abs/2106.09685">Hu et al., 2021</a>.</p>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="01-main" data-title="Check yourself · Vectors &amp; matrices">
+  <div class="q" data-answer="2"><p>What is \((3, -2, 1)\cdot(2, 4, 5)\)?</p>
+    <ol><li>19</li><li>−3</li><li>3</li><li>11</li></ol>
+    <div class="explain">Multiply position by position and add: \(3\cdot2 + (-2)\cdot4 + 1\cdot5 = 6 - 8 + 5 = 3\). 19 is what you get if you drop the minus sign.</div></div>
+  <div class="q" data-answer="1"><p>Hidden states <code>x</code> have shape <code>[8, 1024, 4096]</code> (batch, tokens, features). You apply <code>nn.Linear(4096, 1024, bias=False)</code>, the shape of Llama-3-8B's <code>k_proj</code>. What are the weight shape and the output shape?</p>
+    <ol><li>weight <code>[4096, 1024]</code>, output <code>[8, 1024, 4096]</code></li><li>weight <code>[1024, 4096]</code>, output <code>[8, 1024, 1024]</code></li><li>weight <code>[1024, 4096]</code>, output <code>[8, 4096, 1024]</code></li><li>Shape error: 4096 ≠ 1024</li></ol>
+    <div class="explain">PyTorch stores the weight as <code>[out, in]</code> = <code>[1024, 4096]</code> and computes <code>x @ W.T</code>: \([\ldots, 4096]\times[4096, 1024]\). The last axis changes from 4096 to 1024. The batch and token axes pass through, so the output is <code>[8, 1024, 1024]</code>. The token count happens to also be 1024 here, which is exactly the kind of coincidence that hides shape bugs.</div></div>
+  <div class="q" data-answer="3"><p>How many FLOPs does \([2048, 4096]\times[4096, 14336]\) take (an <code>up_proj</code> over a 2048-token prompt)?</p>
+    <ol><li>≈ 120 GFLOP</li><li>≈ 60 GFLOP</li><li>≈ 2.4 TFLOP</li><li>≈ 240 GFLOP</li></ol>
+    <div class="explain">\(2MNK = 2\times2048\times14336\times4096 \approx 2.4\times10^{11}\), about 240 GFLOP. 120 GFLOP is the number of multiply-adds, which forgets that each one is two FLOPs.</div></div>
+  <div class="q" data-answer="0"><p>You add LoRA with rank \(r = 8\) to a \([1024, 4096]\) weight (\(d = 1024\), \(k = 4096\)). How many trainable parameters does it add?</p>
+    <ol><li>40,960</li><li>32,768</li><li>4,194,304</li><li>65,536</li></ol>
+    <div class="explain">\(B\) is \([1024, 8]\) = 8,192 and \(A\) is \([8, 4096]\) = 32,768, so \(r(d+k) = 8\times5120 = 40{,}960\). That's about 1% of the 4,194,304 entries in the full matrix. 32,768 counts only \(A\).</div></div>
+  <div class="q" data-answer="1"><p>Two non-zero embedding vectors have lengths 3 and 5 and a dot product of 0. What's their cosine similarity, and what happens to it if you double the first vector?</p>
+    <ol><li>15, and it doubles to 30</li><li>0, and it stays 0</li><li>1, since cosine only measures direction</li><li>Undefined, because the dot product is zero</li></ol>
+    <div class="explain">\(\cos = 0/(3\times5) = 0\): the vectors are orthogonal. Scaling either vector multiplies both the numerator and the denominator by the same factor, so cosine never changes under scaling. That's the point of using it for retrieval.</div></div>
+  <div class="q" data-answer="2"><p>What does the matrix with rows \((2, 1)\) and \((4, 2)\) do to the plane?</p>
+    <ol><li>Doubles every area</li><li>Scales areas by 4 and flips orientation</li><li>Squashes the whole plane onto a line: det 0, rank 1, no inverse</li><li>Rotates by 45°</li></ol>
+    <div class="explain">\(\det = 2\cdot2 - 1\cdot4 = 0\). The second column \((1, 2)\) is half the first column \((2, 4)\), so both basis vectors land on the same line, and so does every other vector. Distinct inputs collide, so it can't be undone.</div></div>
+  <div class="q" data-answer="0"><p>In bf16, what's the approximate arithmetic intensity of \([1, 4096]\times[4096, 4096]\) (one decode token) versus \([4096, 4096]\times[4096, 4096]\) (a long prefill)?</p>
+    <ol><li>≈ 1 vs ≈ 1365 FLOPs/byte</li><li>≈ 1365 vs ≈ 1 FLOPs/byte</li><li>Both ≈ 4096 FLOPs/byte</li><li>Both ≈ 2 FLOPs/byte: same weights, same intensity</li></ol>
+    <div class="explain">One token: \(2\cdot4096^2\) FLOPs over about \(2\cdot4096^2\) bytes of weights, so ≈ 1. Square: \(2n^3/(2\cdot3n^2) = n/3 \approx 1365\). Same weight matrix, but in the prefill case every weight byte is reused across 4096 tokens. On an H100 (ridge ≈ 295) the first is memory-bound and the second compute-bound.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, seg, select, stats, plot, bars, heatmap, widget, fmtNum, rng, palette, clamp, softmax, diverge } = C;
+  const ktx = C.katex;
+
+  /* ---------------------------------------------------------- shared drawing helpers */
+  function clear(s) { while (s.firstChild) s.removeChild(s.firstChild); }
+  function arrow(g, x1, y1, x2, y2, color, o) {
+    o = o || {};
+    const dx = x2 - x1, dy = y2 - y1, L = Math.hypot(dx, dy);
+    if (L < 1) { g.appendChild(svg("circle", { cx: x1, cy: y1, r: 3.5, fill: color })); return; }
+    const ux = dx / L, uy = dy / L, h = Math.min(o.head || 11, L * 0.5), hw = h * 0.48;
+    const bx = x2 - ux * h, by = y2 - uy * h;
+    g.appendChild(svg("line", { x1, y1, x2: bx, y2: by, stroke: color, "stroke-width": o.width || 2.4, "stroke-dasharray": o.dash || null, "stroke-linecap": "round", opacity: o.opacity == null ? null : o.opacity }));
+    g.appendChild(svg("path", { d: `M${x2.toFixed(1)},${y2.toFixed(1)}L${(bx - uy * hw).toFixed(1)},${(by + ux * hw).toFixed(1)}L${(bx + uy * hw).toFixed(1)},${(by - ux * hw).toFixed(1)}Z`, fill: color, opacity: o.opacity == null ? null : o.opacity }));
+  }
+  function txt(g, x, y, t, o) {
+    o = o || {};
+    g.appendChild(svg("text", { x, y, "font-size": o.size || 12, fill: o.color || palette.ink, "text-anchor": o.anchor || "start", "font-weight": o.weight || null, class: o.mono === false ? null : "mono", transform: o.rotate != null ? `rotate(${o.rotate} ${x} ${y})` : null, text: t }));
+  }
+  function grid(g, x, y, rows, cols, cw, ch, fillFn, o) {
+    o = o || {};
+    for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++) {
+      g.appendChild(svg("rect", { x: x + j * cw + 1, y: y + i * ch + 1, width: cw - 2, height: ch - 2, rx: o.rx == null ? 2.5 : o.rx, fill: fillFn(i, j), stroke: o.stroke || "rgba(28,27,25,.12)", "stroke-width": 0.8 }));
+    }
+  }
+  const m1 = v => (v < 0 ? "-" : "") + Math.abs(v).toFixed(1);
+  const m2 = v => (v < 0 ? "-" : "") + Math.abs(v).toFixed(2);
+  const neg = v => (v < 0 ? "−" : "") + Math.abs(v);
+
+  /* ---------------------------------------------------------- Fig: the four objects */
+  (function () {
+    const s = document.getElementById("fig-objects");
+    const R = rng(3);
+    const val = () => clamp(R.normal() * 0.55, -1, 1);
+    const cap = (cx, title, shape, subs) => {
+      txt(s, cx, 272, title, { anchor: "middle", weight: 600, mono: false, size: 13.5 });
+      txt(s, cx, 290, shape, { anchor: "middle", color: palette.blue, size: 12 });
+      subs.forEach((t, i) => txt(s, cx, 307 + i * 14, t, { anchor: "middle", color: palette.muted, size: 10.5, mono: false }));
+    };
+    // scalar
+    s.appendChild(svg("rect", { x: 42, y: 140, width: 56, height: 34, rx: 5, fill: diverge(0.45), stroke: "rgba(28,27,25,.25)" }));
+    txt(s, 70, 162, "0.73", { anchor: "middle", size: 13 });
+    cap(70, "scalar", "shape ()", ["a loss, a learning rate"]);
+    // vector: token -> embedding
+    s.appendChild(svg("rect", { x: 186, y: 18, width: 68, height: 26, rx: 13, fill: "#fff", stroke: palette.ink, "stroke-width": 1.2 }));
+    txt(s, 220, 36, "“ cat”", { anchor: "middle", size: 12.5 });
+    arrow(s, 220, 46, 220, 66, palette.muted, { width: 1.5, head: 8 });
+    txt(s, 228, 60, "lookup", { size: 10, color: palette.muted, mono: false });
+    const vv = Array.from({ length: 12 }, val);
+    grid(s, 206, 70, 12, 1, 28, 14.5, i => diverge(vv[i]));
+    txt(s, 244, 74 + 6 * 14.5, "d", { size: 12, color: palette.blue });
+    cap(220, "vector", "shape [d]", ["one token's embedding", "d = 4096 in Llama-3-8B"]);
+    // matrix
+    const mx = 340, my = 86, mr = 8, mc = 10, cw = 19;
+    const mv = Array.from({ length: mr }, () => Array.from({ length: mc }, val));
+    grid(s, mx, my, mr, mc, cw, cw, (i, j) => diverge(mv[i][j]));
+    arrow(s, mx, my - 12, mx + mc * cw, my - 12, palette.blue, { width: 1.2, head: 7 });
+    txt(s, mx + mc * cw / 2, my - 18, "d_in (columns)", { anchor: "middle", color: palette.blue, size: 11 });
+    arrow(s, mx - 12, my, mx - 12, my + mr * cw, palette.blue, { width: 1.2, head: 7 });
+    txt(s, mx - 18, my + mr * cw / 2, "d_out (rows)", { anchor: "middle", color: palette.blue, size: 11, rotate: -90 });
+    cap(mx + mc * cw / 2, "matrix", "shape [d_out, d_in]", ["a weight such as q_proj", "[4096, 4096] in Llama-3-8B"]);
+    // tensor: stacked sheets
+    const tr = 6, tc = 8, tcw = 15, off = 16, fx = 640, fy = 132;
+    for (let b = 2; b >= 0; b--) {
+      const ox = fx + b * off, oy = fy - b * off;
+      s.appendChild(svg("rect", { x: ox - 2, y: oy - 2, width: tc * tcw + 4, height: tr * tcw + 4, rx: 4, fill: "#fbfaf7", stroke: "rgba(28,27,25,.3)" }));
+      const tv = Array.from({ length: tr }, () => Array.from({ length: tc }, val));
+      grid(s, ox, oy, tr, tc, tcw, tcw, (i, j) => diverge(tv[i][j] * (b === 0 ? 1 : 0.5)));
+    }
+    arrow(s, fx, fy + tr * tcw + 12, fx + tc * tcw, fy + tr * tcw + 12, palette.blue, { width: 1.2, head: 7 });
+    txt(s, fx + tc * tcw / 2, fy + tr * tcw + 28, "d (features)", { anchor: "middle", color: palette.blue, size: 11 });
+    arrow(s, fx - 12, fy, fx - 12, fy + tr * tcw, palette.blue, { width: 1.2, head: 7 });
+    txt(s, fx - 18, fy + tr * tcw / 2, "T (tokens)", { anchor: "middle", color: palette.blue, size: 11, rotate: -90 });
+    arrow(s, fx + tc * tcw + 10, fy - 6, fx + tc * tcw + 10 + 2 * off + 6, fy - 2 * off - 12, palette.blue, { width: 1.2, head: 7 });
+    txt(s, fx + tc * tcw + 50, fy - 30, "B (sequences)", { color: palette.blue, size: 11 });
+    cap(fx + 76, "3-D tensor", "shape [B, T, d]", ["hidden states for a batch", "B sequences × T tokens × d"]);
+  })();
+
+  /* ---------------------------------------------------------- Widget: two vectors */
+  (function () {
+    const w = widget("w-vec", { title: "Two vectors, live", kicker: "Interactive", note: "Green is <b>a</b>, brick is <b>b</b>, blue dashed is <b>a + b</b> (the parallelogram diagonal). The gold segment is the projection of <b>b</b> onto <b>a</b>'s direction, and its signed length is a·b / ‖a‖. Try the presets: the dot product hits zero exactly when the arrows are perpendicular, and goes negative past 90°." });
+    const mk = (label, v) => slider(w.controls, { label, min: -5, max: 5, step: 0.1, value: v, fmt: x => x.toFixed(1), onInput: draw });
+    const ax = mk("a₁", 3), ay = mk("a₂", 1), bx = mk("b₁", 1), by = mk("b₂", 2.5);
+    const presets = el("div", { class: "btnrow" });
+    const setv = (a1, a2, b1, b2) => { ax.value = a1; ay.value = a2; bx.value = b1; by.value = b2; draw(); };
+    [["aligned", [3, 1, 4.5, 1.5]], ["perpendicular", [3, 1, -1, 3]], ["opposite", [3, 1, -2.4, -0.8]], ["obtuse", [3, 1, -2, 2]], ["double a", null]].forEach(([t, v]) => presets.appendChild(el("button", { class: "btn", text: t, onclick: () => v ? setv(...v) : setv(clamp(ax.value * 2, -5, 5), clamp(ay.value * 2, -5, 5), bx.value, by.value) })));
+    w.controls.appendChild(presets);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const W = 760, H = 380, cx = 380, cy = 190, S = 24;
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}` }); wrap.appendChild(s);
+    const eq = el("div", { class: "w-eq" }); w.body.appendChild(eq);
+    const set = stats(w.body, [{ key: "dot", label: "a · b" }, { key: "cos", label: "cos θ" }, { key: "ang", label: "angle θ" }, { key: "proj", label: "projection of b on a" }, { key: "sum", label: "‖a + b‖" }]);
+    const X = v => cx + v * S, Y = v => cy - v * S;
+    function draw() {
+      clear(s);
+      for (let i = -15; i <= 15; i++) s.appendChild(svg("line", { x1: X(i), x2: X(i), y1: 0, y2: H, stroke: i === 0 ? palette.ink : palette.line, "stroke-width": i === 0 ? 1 : 0.6 }));
+      for (let j = -8; j <= 8; j++) s.appendChild(svg("line", { x1: 0, x2: W, y1: Y(j), y2: Y(j), stroke: j === 0 ? palette.ink : palette.line, "stroke-width": j === 0 ? 1 : 0.6 }));
+      const a = [ax.value, ay.value], b = [bx.value, by.value];
+      const dot = a[0] * b[0] + a[1] * b[1], na = Math.hypot(...a), nb = Math.hypot(...b);
+      const cos = na > 0 && nb > 0 ? clamp(dot / (na * nb), -1, 1) : NaN;
+      const sm = [a[0] + b[0], a[1] + b[1]];
+      // parallelogram
+      s.appendChild(svg("path", { d: `M${X(a[0])},${Y(a[1])}L${X(sm[0])},${Y(sm[1])}L${X(b[0])},${Y(b[1])}`, fill: "none", stroke: palette.blue, "stroke-width": 1, "stroke-dasharray": "3 4", opacity: 0.7 }));
+      arrow(s, X(0), Y(0), X(sm[0]), Y(sm[1]), palette.blue, { dash: "6 4", width: 2 });
+      txt(s, X(sm[0]) + 8, Y(sm[1]) - 6, "a + b", { color: palette.blue, size: 12 });
+      // projection of b onto a
+      if (na > 0) {
+        const t = dot / (na * na), p = [a[0] * t, a[1] * t];
+        const far = 20 / na;
+        s.appendChild(svg("line", { x1: X(-a[0] * far), y1: Y(-a[1] * far), x2: X(a[0] * far), y2: Y(a[1] * far), stroke: palette.green, "stroke-width": 0.8, "stroke-dasharray": "2 4", opacity: 0.6 }));
+        s.appendChild(svg("line", { x1: X(b[0]), y1: Y(b[1]), x2: X(p[0]), y2: Y(p[1]), stroke: palette.gold, "stroke-width": 1.2, "stroke-dasharray": "3 3" }));
+        s.appendChild(svg("line", { x1: X(0), y1: Y(0), x2: X(p[0]), y2: Y(p[1]), stroke: palette.gold, "stroke-width": 6, opacity: 0.55, "stroke-linecap": "round" }));
+      }
+      // angle arc
+      if (isFinite(cos)) {
+        const A0 = Math.atan2(a[1], a[0]);
+        let d = Math.atan2(b[1], b[0]) - A0;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d <= -Math.PI) d += 2 * Math.PI;
+        const pts = [];
+        for (let i = 0; i <= 24; i++) { const t = A0 + d * i / 24; pts.push(`${(cx + 30 * Math.cos(t)).toFixed(1)},${(cy - 30 * Math.sin(t)).toFixed(1)}`); }
+        s.appendChild(svg("polyline", { points: pts.join(" "), fill: "none", stroke: palette.ink, "stroke-width": 1.2 }));
+        const mid = A0 + d / 2;
+        txt(s, cx + 44 * Math.cos(mid), cy - 44 * Math.sin(mid) + 4, "θ", { anchor: "middle", size: 13, mono: false });
+      }
+      arrow(s, X(0), Y(0), X(a[0]), Y(a[1]), palette.green, { width: 3 });
+      arrow(s, X(0), Y(0), X(b[0]), Y(b[1]), palette.brick, { width: 3 });
+      txt(s, X(a[0]) + 8, Y(a[1]) + 14, `a = (${m1(a[0]).replace("-", "−")}, ${m1(a[1]).replace("-", "−")})`, { color: palette.green, size: 12 });
+      txt(s, X(b[0]) + 8, Y(b[1]) - 8, `b = (${m1(b[0]).replace("-", "−")}, ${m1(b[1]).replace("-", "−")})`, { color: palette.brick, size: 12 });
+      eq.innerHTML = ktx(`\\mathbf{a}\\cdot\\mathbf{b} = (${m1(a[0])})(${m1(b[0])}) + (${m1(a[1])})(${m1(b[1])}) = ${m2(dot)} \\qquad \\lVert\\mathbf{a}\\rVert\\,\\lVert\\mathbf{b}\\rVert\\cos\\theta = ${na.toFixed(2)}\\times${nb.toFixed(2)}\\times${isFinite(cos) ? m2(cos) : "?"} = ${isFinite(cos) ? m2(na * nb * cos) : "?"}`, false);
+      const lab = !isFinite(cos) ? "zero vector" : cos > 0.98 ? "same direction" : cos > 0.05 ? "partly aligned" : cos > -0.05 ? "perpendicular" : cos > -0.98 ? "opposed" : "opposite";
+      set("dot", m2(dot).replace("-", "−"), dot > 0.05 ? "good" : dot < -0.05 ? "bad" : "warn", lab);
+      set("cos", isFinite(cos) ? m2(cos).replace("-", "−") : "—", null, "ignores length");
+      set("ang", isFinite(cos) ? (Math.acos(cos) * 180 / Math.PI).toFixed(1) + "°" : "—", null, "0° aligned, 90° orthogonal");
+      set("proj", na > 0 ? m2(dot / na).replace("-", "−") : "—", null, "a · b / ‖a‖");
+      set("sum", Math.hypot(...sm).toFixed(2), null, `vs ‖a‖ + ‖b‖ = ${(na + nb).toFixed(2)}`);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: query scoring keys */
+  (function () {
+    const w = widget("w-attn", { title: "A query scoring keys", kicker: "Interactive", note: "Six tokens, each with a 2-D key vector. Score = q · k, then softmax over the six scores. Real heads use 128 dimensions and divide scores by √128 ≈ 11.3, but the mechanics are the same: direction picks the winner, length sets how sharp the choice is. \"Effective keys\" is 1 / Σ w², which equals 6 when attention is uniform and 1 when one key takes everything." });
+    const keys = [["The", [-1.1, -0.5]], ["cat", [2.3, 1.0]], ["sat", [-1.0, 2.1]], ["on", [0.5, -1.7]], ["the", [-0.8, -0.8]], ["mat", [1.0, 2.0]]];
+    const ang = slider(w.controls, { label: "Query direction", min: 0, max: 359, step: 1, value: 30, fmt: v => v + "°", onInput: draw });
+    const len = slider(w.controls, { label: "Query length ‖q‖", min: 0.1, max: 4, step: 0.05, value: 1.2, fmt: v => v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 300" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "top", label: "Most attended" }, { key: "w", label: "Its weight" }, { key: "eff", label: "Effective keys" }]);
+    function draw() {
+      clear(s);
+      const cx = 160, cy = 150, S = 34;
+      s.appendChild(svg("rect", { x: 10, y: 10, width: 300, height: 280, rx: 8, fill: "#fff", stroke: palette.line }));
+      for (let i = -4; i <= 4; i++) {
+        s.appendChild(svg("line", { x1: cx + i * S, x2: cx + i * S, y1: 12, y2: 288, stroke: i === 0 ? "rgba(28,27,25,.35)" : palette.line, "stroke-width": 0.6 }));
+        s.appendChild(svg("line", { x1: 12, x2: 308, y1: cy - i * S, y2: cy - i * S, stroke: i === 0 ? "rgba(28,27,25,.35)" : palette.line, "stroke-width": 0.6 }));
+      }
+      const th = ang.value * Math.PI / 180, q = [len.value * Math.cos(th), len.value * Math.sin(th)];
+      const sc = keys.map(([, k]) => q[0] * k[0] + q[1] * k[1]);
+      const wt = softmax(sc);
+      const top = wt.indexOf(Math.max(...wt));
+      keys.forEach(([t, k], i) => {
+        const col = i === top ? palette.green : palette.muted;
+        arrow(s, cx, cy, cx + k[0] * S, cy - k[1] * S, col, { width: 2, opacity: 0.35 + 0.65 * Math.min(1, wt[i] * 2) });
+        txt(s, cx + k[0] * S + (k[0] >= 0 ? 6 : -6), cy - k[1] * S + (k[1] >= 0 ? -4 : 13), t, { anchor: k[0] >= 0 ? "start" : "end", color: col, size: 12, weight: i === top ? 700 : null });
+      });
+      const qx = clamp(cx + q[0] * S, 14, 306), qy = clamp(cy - q[1] * S, 14, 286);
+      arrow(s, cx, cy, qx, qy, palette.ink, { width: 3.2 });
+      txt(s, qx + 6, qy - 6, "q", { size: 14, weight: 700 });
+      // right panel
+      const x0 = 340, sc0 = 520, sw = 78, w0 = 620, ww = 120, y0 = 56, rh = 38, smax = 11;
+      txt(s, x0, 32, "key", { color: palette.muted, size: 11.5 });
+      txt(s, sc0, 32, "score q · k", { anchor: "middle", color: palette.muted, size: 11.5 });
+      txt(s, w0, 32, "softmax weight", { color: palette.muted, size: 11.5 });
+      s.appendChild(svg("line", { x1: sc0, x2: sc0, y1: 40, y2: y0 + keys.length * rh - 6, stroke: palette.ink, "stroke-width": 1 }));
+      keys.forEach(([t], i) => {
+        const y = y0 + i * rh, v = sc[i], bw = Math.min(sw, Math.abs(v) / smax * sw);
+        txt(s, x0, y + 16, t, { size: 13, weight: i === top ? 700 : null, color: i === top ? palette.green : palette.ink });
+        s.appendChild(svg("rect", { x: v >= 0 ? sc0 : sc0 - bw, y: y + 3, width: bw, height: 18, rx: 3, fill: v >= 0 ? palette.green : palette.brick, opacity: 0.8 }));
+        txt(s, v >= 0 ? sc0 - 6 : sc0 + 6, y + 16, (v < 0 ? "−" : "") + Math.abs(v).toFixed(2), { anchor: v >= 0 ? "end" : "start", size: 10.5, color: palette.muted });
+        s.appendChild(svg("rect", { x: w0, y: y + 3, width: ww, height: 18, rx: 3, fill: palette.paper2 }));
+        s.appendChild(svg("rect", { x: w0, y: y + 3, width: ww * wt[i], height: 18, rx: 3, fill: palette.blue, opacity: 0.85 }));
+        txt(s, w0 + ww + 6, y + 16, (wt[i] * 100).toFixed(0) + "%", { size: 11, color: palette.ink });
+      });
+      const eff = 1 / wt.reduce((a, v) => a + v * v, 0);
+      set("top", "“" + keys[top][0] + "”", null, `score ${sc[top].toFixed(2)}`);
+      set("w", (wt[top] * 100).toFixed(0) + "%", wt[top] > 0.7 ? "good" : wt[top] > 0.35 ? "warn" : null, "of the attention");
+      set("eff", eff.toFixed(2), null, "of 6: 6 = uniform, 1 = one-hot");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Fig: unit balls */
+  (function () {
+    const s = document.getElementById("fig-norms");
+    const R = 70, pts = [0.6, 0.8];
+    const panels = [
+      { cx: 130, name: "L1:  |x₁| + |x₂|", val: "‖x‖₁ = 1.4  (outside)", shape: c => svg("path", { d: `M${c + R},120 L${c},${120 - R} L${c - R},120 L${c},${120 + R} Z`, fill: "rgba(176,67,46,.10)", stroke: palette.brick, "stroke-width": 2 }) },
+      { cx: 390, name: "L2:  √(x₁² + x₂²)", val: "‖x‖₂ = 1.0  (on it)", shape: c => svg("circle", { cx: c, cy: 120, r: R, fill: "rgba(26,122,82,.10)", stroke: palette.green, "stroke-width": 2 }) },
+      { cx: 650, name: "L∞:  max(|x₁|, |x₂|)", val: "‖x‖∞ = 0.8  (inside)", shape: c => svg("rect", { x: c - R, y: 120 - R, width: 2 * R, height: 2 * R, fill: "rgba(47,93,138,.10)", stroke: palette.blue, "stroke-width": 2 }) }
+    ];
+    panels.forEach(p => {
+      s.appendChild(svg("line", { x1: p.cx - 100, x2: p.cx + 100, y1: 120, y2: 120, stroke: "rgba(28,27,25,.35)" }));
+      s.appendChild(svg("line", { x1: p.cx, x2: p.cx, y1: 20, y2: 220, stroke: "rgba(28,27,25,.35)" }));
+      s.appendChild(p.shape(p.cx));
+      arrow(s, p.cx, 120, p.cx + pts[0] * R, 120 - pts[1] * R, palette.ink, { width: 2, head: 9 });
+      s.appendChild(svg("circle", { cx: p.cx + pts[0] * R, cy: 120 - pts[1] * R, r: 3.5, fill: palette.ink }));
+      txt(s, p.cx + pts[0] * R + 6, 120 - pts[1] * R - 6, "x", { size: 12, weight: 700 });
+      txt(s, p.cx + R + 4, 134, "1", { size: 10.5, color: palette.muted });
+      txt(s, p.cx, 244, p.name, { anchor: "middle", size: 12.5, weight: 600 });
+      txt(s, p.cx, 262, p.val, { anchor: "middle", size: 11.5, color: palette.muted });
+    });
+  })();
+
+  /* ---------------------------------------------------------- Widget: 2x2 transformation */
+  (function () {
+    const w = widget("w-xform", { title: "A 2×2 matrix bending the plane", kicker: "Interactive", note: "Faint grey: the original grid and unit square (dashed). Blue: where the grid lines go. Green arrow: A e₁, which is column 1 of A. Brick arrow: A e₂, column 2. The shaded parallelogram is the image of the unit square, and its signed area is det A. It turns brick when the orientation flips." });
+    const mk = (label, v) => slider(w.controls, { label, min: -2, max: 2, step: 0.01, value: v, fmt: x => x.toFixed(2), onInput: draw });
+    const sa = mk("a (row 1, col 1)", 1), sb = mk("b (row 1, col 2)", 0.5), sc = mk("c (row 2, col 1)", 0), sd = mk("d (row 2, col 2)", 1);
+    const presets = el("div", { class: "btnrow" });
+    [["identity", [1, 0, 0, 1]], ["scale ×1.5", [1.5, 0, 0, 1.5]], ["rotate ≈37°", [0.8, -0.6, 0.6, 0.8]], ["rotate 90°", [0, -1, 1, 0]], ["shear", [1, 1, 0, 1]], ["reflect", [-1, 0, 0, 1]], ["squash (det 0)", [1, 2, 0.5, 1]]].forEach(([t, v]) => presets.appendChild(el("button", { class: "btn", text: t, onclick: () => { sa.value = v[0]; sb.value = v[1]; sc.value = v[2]; sd.value = v[3]; draw(); } })));
+    w.controls.appendChild(presets);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const W = 760, H = 400, cx = 380, cy = 200, S = 44;
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}` }); wrap.appendChild(s);
+    const eq = el("div", { class: "w-eq" }); w.body.appendChild(eq);
+    const set = stats(w.body, [{ key: "det", label: "det A = ad − bc" }, { key: "area", label: "Area scale" }, { key: "ori", label: "Orientation" }, { key: "rank", label: "Rank" }]);
+    function draw() {
+      clear(s);
+      const a = sa.value, b = sb.value, c = sc.value, d = sd.value;
+      const T = (x, y) => [cx + (a * x + b * y) * S, cy - (c * x + d * y) * S];
+      const defs = svg("defs"); defs.appendChild(svg("clipPath", { id: "xf-clip" }, svg("rect", { x: 0, y: 0, width: W, height: H }))); s.appendChild(defs);
+      const g = svg("g", { "clip-path": "url(#xf-clip)" }); s.appendChild(g);
+      for (let i = -10; i <= 10; i++) {
+        g.appendChild(svg("line", { x1: cx + i * S, x2: cx + i * S, y1: 0, y2: H, stroke: i === 0 ? "rgba(28,27,25,.3)" : palette.line, "stroke-width": 0.6 }));
+        g.appendChild(svg("line", { x1: 0, x2: W, y1: cy - i * S, y2: cy - i * S, stroke: i === 0 ? "rgba(28,27,25,.3)" : palette.line, "stroke-width": 0.6 }));
+      }
+      g.appendChild(svg("rect", { x: cx, y: cy - S, width: S, height: S, fill: "none", stroke: palette.muted, "stroke-width": 1, "stroke-dasharray": "3 3" }));
+      for (let i = -12; i <= 12; i++) {
+        const p1 = T(i, -12), p2 = T(i, 12), p3 = T(-12, i), p4 = T(12, i);
+        const st = { stroke: palette.blue, "stroke-width": i === 0 ? 1.6 : 0.9, opacity: i === 0 ? 0.8 : 0.35 };
+        g.appendChild(svg("line", Object.assign({ x1: p1[0], y1: p1[1], x2: p2[0], y2: p2[1] }, st)));
+        g.appendChild(svg("line", Object.assign({ x1: p3[0], y1: p3[1], x2: p4[0], y2: p4[1] }, st)));
+      }
+      const det = a * d - b * c;
+      const sq = [T(0, 0), T(1, 0), T(1, 1), T(0, 1)];
+      g.appendChild(svg("path", { d: "M" + sq.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join("L") + "Z", fill: det >= 0 ? "rgba(26,122,82,.20)" : "rgba(176,67,46,.20)", stroke: det >= 0 ? palette.green : palette.brick, "stroke-width": 1.4 }));
+      const e1 = T(1, 0), e2 = T(0, 1);
+      arrow(g, cx, cy, e1[0], e1[1], palette.green, { width: 3 });
+      arrow(g, cx, cy, e2[0], e2[1], palette.brick, { width: 3 });
+      txt(g, e1[0] + 8, e1[1] + 14, `Ae₁ = (${neg(+a.toFixed(2))}, ${neg(+c.toFixed(2))})`, { color: palette.green, size: 12 });
+      txt(g, e2[0] + 8, e2[1] - 8, `Ae₂ = (${neg(+b.toFixed(2))}, ${neg(+d.toFixed(2))})`, { color: palette.brick, size: 12 });
+      const f = v => (+v.toFixed(2)).toString();
+      eq.innerHTML = ktx(`A = \\begin{bmatrix} ${f(a)} & ${f(b)} \\\\ ${f(c)} & ${f(d)} \\end{bmatrix}, \\qquad \\det A = (${f(a)})(${f(d)}) - (${f(b)})(${f(c)}) = ${f(det)}`, false);
+      const z = Math.abs(det) < 1e-9;
+      const rank = !z ? 2 : (a || b || c || d) ? 1 : 0;
+      set("det", (det < 0 ? "−" : "") + Math.abs(det).toFixed(2), z ? "bad" : det < 0 ? "warn" : "good", z ? "square squashed flat" : "signed area of the image");
+      set("area", "×" + Math.abs(det).toFixed(2), null, "every region scales by this");
+      set("ori", z ? "collapsed" : det > 0 ? "preserved" : "flipped", z ? "bad" : det > 0 ? "good" : "warn", det < 0 ? "a mirror image" : "");
+      set("rank", String(rank), rank === 2 ? "good" : "bad", rank === 2 ? "invertible" : "information lost, no inverse");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: matmul visualizer */
+  (function () {
+    const w = widget("w-matmul", { title: "Matrix multiplication, one cell at a time", kicker: "Interactive", note: "In <b>row · column</b> view, hover or click any cell of C: its row of A and column of B light up, and the sum is written out below. In <b>outer products</b> view, click a column of A (or row of B) to see its rank-1 contribution. C is the sum of all K of them. Change M, K, N and watch the FLOP count: it's always 2MNK." });
+    let seed = 5, A, B, Cm, mode = "entry", si = 0, sj = 0, sk = 0;
+    const mS = slider(w.controls, { label: "M (rows of A)", min: 1, max: 5, step: 1, value: 3, onInput: rebuild });
+    const kS = slider(w.controls, { label: "K (shared)", min: 1, max: 5, step: 1, value: 4, onInput: rebuild });
+    const nS = slider(w.controls, { label: "N (cols of B)", min: 1, max: 5, step: 1, value: 2, onInput: rebuild });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "View" })));
+    seg(c1, { options: [{ value: "entry", label: "row · column" }, { value: "outer", label: "outer products" }], value: "entry", onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    w.controls.appendChild(el("div", { class: "btnrow" }, el("button", { class: "btn", text: "new numbers", onclick: () => { seed++; rebuild(); } })));
+    const wrap = el("div", { class: "canvas-wrap", style: { padding: "10px" } }); w.body.appendChild(wrap);
+    const s = svg("svg"); wrap.appendChild(s);
+    const eq = el("div", { class: "w-eq" }); w.body.appendChild(eq);
+    const set = stats(w.body, [{ key: "shape", label: "Shape rule" }, { key: "macs", label: "Multiply-adds" }, { key: "flops", label: "FLOPs (2MNK)" }, { key: "per", label: "Per output entry" }]);
+    function rebuild() {
+      const M = mS.value, K = kS.value, N = nS.value, R = rng(seed * 31 + 7);
+      const ri = () => Math.floor(R() * 7) - 3;
+      A = Array.from({ length: M }, () => Array.from({ length: K }, ri));
+      B = Array.from({ length: K }, () => Array.from({ length: N }, ri));
+      Cm = A.map(r => Array.from({ length: N }, (_, j) => r.reduce((acc, v, k) => acc + v * B[k][j], 0)));
+      si = Math.min(si, M - 1); sj = Math.min(sj, N - 1); sk = Math.min(sk, K - 1);
+      draw();
+    }
+    function draw() {
+      clear(s);
+      const M = A.length, K = B.length, N = B[0].length, cs = 44, gap = 34;
+      const xA = 30, xB = xA + K * cs + gap, yB = 30, yC = yB + K * cs + gap;
+      const W = xB + N * cs + 20, H = yC + M * cs + 30;
+      s.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      s.style.maxWidth = Math.round(W * 1.3) + "px"; s.style.margin = "0 auto";
+      txt(s, xA + K * cs / 2, yC - 10, `A  [${M}, ${K}]`, { anchor: "middle", color: palette.green, weight: 600 });
+      txt(s, xB + N * cs / 2, yB - 10, `B  [${K}, ${N}]`, { anchor: "middle", color: palette.brick, weight: 600 });
+      txt(s, xB + N * cs / 2, yC + M * cs + 20, `C = AB  [${M}, ${N}]`, { anchor: "middle", color: palette.ink, weight: 600 });
+      const cell = (x, y, v, fill, stroke, pick) => {
+        const g = svg("g", { style: pick ? "cursor:pointer" : null });
+        g.appendChild(svg("rect", { x: x + 2, y: y + 2, width: cs - 4, height: cs - 4, rx: 6, fill, stroke: stroke || "rgba(28,27,25,.18)", "stroke-width": stroke ? 1.8 : 1 }));
+        g.appendChild(svg("text", { x: x + cs / 2, y: y + cs / 2 + 5, "text-anchor": "middle", "font-size": String(v).length > 3 ? 12 : 14, class: "mono", fill: palette.ink, text: v }));
+        if (pick) { g.addEventListener("click", pick); g.addEventListener("mouseenter", pick); }
+        s.appendChild(g);
+      };
+      if (mode === "entry") {
+        // guide lines from the highlighted row and column into the chosen output cell
+        s.appendChild(svg("line", { x1: xA + K * cs, y1: yC + si * cs + cs / 2, x2: xB + sj * cs, y2: yC + si * cs + cs / 2, stroke: palette.green, "stroke-width": 1.2, "stroke-dasharray": "3 3" }));
+        s.appendChild(svg("line", { x1: xB + sj * cs + cs / 2, y1: yB + K * cs, x2: xB + sj * cs + cs / 2, y2: yC + si * cs, stroke: palette.brick, "stroke-width": 1.2, "stroke-dasharray": "3 3" }));
+        for (let i = 0; i < M; i++) for (let k = 0; k < K; k++) cell(xA + k * cs, yC + i * cs, neg(A[i][k]), i === si ? "rgba(26,122,82,.18)" : "#fff", i === si ? palette.green : null);
+        for (let k = 0; k < K; k++) for (let j = 0; j < N; j++) cell(xB + j * cs, yB + k * cs, neg(B[k][j]), j === sj ? "rgba(176,67,46,.14)" : "#fff", j === sj ? palette.brick : null);
+        for (let i = 0; i < M; i++) for (let j = 0; j < N; j++) {
+          const on = i === si && j === sj;
+          cell(xB + j * cs, yC + i * cs, neg(Cm[i][j]), on ? "rgba(154,123,34,.32)" : "#fbfaf7", on ? palette.gold : null, () => { if (si === i && sj === j) return; si = i; sj = j; draw(); });
+        }
+        const terms = A[si].map((v, k) => `\\textcolor{${palette.green}}{(${v})}\\textcolor{${palette.brick}}{(${B[k][sj]})}`);
+        eq.innerHTML = ktx(`C_{${si + 1},${sj + 1}} = \\sum_{k=1}^{${K}} A_{${si + 1},k}\\,B_{k,${sj + 1}} = ${terms.join(" + ")} = \\mathbf{${Cm[si][sj]}}`, false);
+      } else {
+        const pickK = k => () => { if (sk === k) return; sk = k; draw(); };
+        for (let i = 0; i < M; i++) for (let k = 0; k < K; k++) cell(xA + k * cs, yC + i * cs, neg(A[i][k]), k === sk ? "rgba(26,122,82,.18)" : "#fff", k === sk ? palette.green : null, pickK(k));
+        for (let k = 0; k < K; k++) for (let j = 0; j < N; j++) cell(xB + j * cs, yB + k * cs, neg(B[k][j]), k === sk ? "rgba(176,67,46,.14)" : "#fff", k === sk ? palette.brick : null, pickK(k));
+        for (let i = 0; i < M; i++) for (let j = 0; j < N; j++) {
+          const v = A[i][sk] * B[sk][j];
+          cell(xB + j * cs, yC + i * cs, neg(v), diverge(v / 9), null);
+        }
+        eq.innerHTML = ktx(`C = \\sum_{k=1}^{${K}} A_{:,k}\\,B_{k,:} \\qquad \\text{showing term } k=${sk + 1}\\text{: column } ${sk + 1} \\text{ of } A \\text{ times row } ${sk + 1} \\text{ of } B \\text{, a rank-1 matrix}`, false);
+      }
+      set("shape", `[${M},${K}]×[${K},${N}]`, null, `→ [${M},${N}]`);
+      set("macs", String(M * N * K), null, "M·N·K");
+      set("flops", String(2 * M * N * K), null, "each MAC = 2 FLOPs");
+      set("per", `${K} MACs`, null, "one dot product of length K");
+    }
+    rebuild();
+  })();
+
+  /* ---------------------------------------------------------- Fig: QK^T */
+  (function () {
+    const s = document.getElementById("fig-qkt");
+    const toks = ["The", "cat", "sat", "on", "the", "mat"], T = 6, dk = 4, c = 24, qi = 5, kj = 1;
+    const R = rng(8);
+    const qv = Array.from({ length: T }, () => Array.from({ length: dk }, () => clamp(R.normal() * 0.5, -1, 1)));
+    const kv = Array.from({ length: T }, () => Array.from({ length: dk }, () => clamp(R.normal() * 0.5, -1, 1)));
+    // Q
+    const xQ = 70, yQ = 70;
+    grid(s, xQ, yQ, T, dk, c, c, (i, j) => i === qi ? "rgba(26,122,82,.55)" : diverge(qv[i][j] * 0.35));
+    toks.forEach((t, i) => txt(s, xQ - 8, yQ + i * c + 16, t, { anchor: "end", size: 11, color: i === qi ? palette.green : palette.muted }));
+    txt(s, xQ + dk * c / 2, yQ - 14, "Q", { anchor: "middle", size: 15, weight: 700, color: palette.green });
+    txt(s, xQ + dk * c / 2, yQ + T * c + 20, "[T, d_k]", { anchor: "middle", size: 11.5, color: palette.muted });
+    txt(s, 190, 142, "×", { anchor: "middle", size: 22, mono: false });
+    // K^T
+    const xK = 214, yK = 70 + (T - dk) * c / 2;
+    grid(s, xK, yK, dk, T, c, c, (i, j) => j === kj ? "rgba(176,67,46,.5)" : diverge(kv[j][i] * 0.35));
+    toks.forEach((t, j) => txt(s, xK + j * c + 12, yK - 8, t, { anchor: "start", size: 10.5, rotate: -55, color: j === kj ? palette.brick : palette.muted }));
+    txt(s, xK + T * c / 2, yK + dk * c + 34, "Kᵀ  [d_k, T]", { anchor: "middle", size: 11.5, color: palette.muted });
+    txt(s, xK + T * c / 2, yK - 46, "Kᵀ", { anchor: "middle", size: 15, weight: 700, color: palette.brick });
+    txt(s, 390, 142, "=", { anchor: "middle", size: 22, mono: false });
+    // S
+    const xS = 450, yS = 70;
+    grid(s, xS, yS, T, T, c, c, (i, j) => {
+      if (j > i) return "#e7e5de";
+      if (i === qi && j === kj) return "rgba(154,123,34,.75)";
+      let d = 0; for (let k = 0; k < dk; k++) d += qv[i][k] * kv[j][k];
+      return diverge(d * 0.6);
+    });
+    toks.forEach((t, i) => txt(s, xS - 8, yS + i * c + 16, t, { anchor: "end", size: 11, color: i === qi ? palette.green : palette.muted }));
+    toks.forEach((t, j) => txt(s, xS + j * c + 12, yS - 8, t, { anchor: "start", size: 10.5, rotate: -55, color: j === kj ? palette.brick : palette.muted }));
+    txt(s, xS + T * c / 2, yS + T * c + 20, "S = QKᵀ/√d_k   [T, T]", { anchor: "middle", size: 11.5, color: palette.muted });
+    // notes
+    const nx = 640;
+    [["S[6, 2] = q_mat · k_cat / √d_k", palette.ink], ["row i: token i's scores for all tokens", palette.muted], ["grey: causal mask (future tokens)", palette.muted], ["softmax each row → attention weights", palette.muted], ["T = 8192 → 67M scores per head", palette.brick]].forEach(([t, col], i) => txt(s, nx, 92 + i * 26, t, { size: 11.5, color: col }));
+  })();
+
+  /* ---------------------------------------------------------- Fig: batched linear layer */
+  (function () {
+    const s = document.getElementById("fig-batched");
+    const R = rng(12), v = () => clamp(R.normal() * 0.45, -1, 1), c = 17, off = 14;
+    const sheets = (x, y, rows, cols, label, shape) => {
+      for (let b = 2; b >= 0; b--) {
+        const ox = x + b * off, oy = y - b * off;
+        s.appendChild(svg("rect", { x: ox - 2, y: oy - 2, width: cols * c + 4, height: rows * c + 4, rx: 4, fill: "#fbfaf7", stroke: "rgba(28,27,25,.3)" }));
+        const vals = Array.from({ length: rows }, () => Array.from({ length: cols }, v));
+        grid(s, ox, oy, rows, cols, c, c, (i, j) => diverge(vals[i][j] * (b === 0 ? 1 : 0.45)));
+      }
+      txt(s, x + cols * c / 2 + off, y + rows * c + 24, label, { anchor: "middle", size: 14, weight: 700 });
+      txt(s, x + cols * c / 2 + off, y + rows * c + 42, shape, { anchor: "middle", size: 11.5, color: palette.blue });
+    };
+    sheets(40, 110, 5, 4, "X", "[B, T, d]");
+    txt(s, 170, 160, "×", { anchor: "middle", size: 22, mono: false });
+    const wv = Array.from({ length: 4 }, () => Array.from({ length: 8 }, v));
+    grid(s, 196, 119, 4, 8, c, c, (i, j) => diverge(wv[i][j]));
+    txt(s, 196 + 4 * c, 222 - 40, "", {});
+    txt(s, 196 + 4 * c, 207, "W", { anchor: "middle", size: 14, weight: 700 });
+    txt(s, 196 + 4 * c, 225, "[d, d_ff]  shared", { anchor: "middle", size: 11.5, color: palette.blue });
+    txt(s, 352, 160, "+", { anchor: "middle", size: 22, mono: false });
+    const bv = Array.from({ length: 8 }, v);
+    grid(s, 372, 145, 1, 8, c, c, (i, j) => diverge(bv[j]));
+    txt(s, 372 + 4 * c, 190, "b", { anchor: "middle", size: 14, weight: 700 });
+    txt(s, 372 + 4 * c, 208, "[d_ff]  broadcast", { anchor: "middle", size: 11.5, color: palette.blue });
+    txt(s, 530, 160, "=", { anchor: "middle", size: 22, mono: false });
+    sheets(560, 110, 5, 8, "Y", "[B, T, d_ff]");
+    s.appendChild(svg("line", { x1: 40, x2: 840, y1: 262, y2: 262, stroke: palette.line }));
+    txt(s, 440, 288, "In memory: reshape X to [B·T, d], run one [B·T, d] × [d, d_ff] GEMM, reshape back.  FLOPs = 2 · BT · d · d_ff", { anchor: "middle", size: 12, color: palette.ink });
+  })();
+
+  /* ---------------------------------------------------------- Widget: rank-k SVD */
+  (function () {
+    const w = widget("w-svd", { title: "Rank-k approximation of a 24×24 matrix", kicker: "Interactive", note: "The SVD is computed in your browser by power iteration with deflation: repeatedly multiply by AᵀA to find the strongest remaining direction, record it, subtract it, repeat. Real libraries use more stable algorithms (LAPACK's bidiagonalization), but the result is the same decomposition. Storage counts the k(m + n) numbers needed for the factors, ignoring the k singular values." });
+    const n = 24;
+    function make(kind) {
+      const R = rng(kind === "noise" ? 21 : 13);
+      const A = Array.from({ length: n }, () => new Array(n).fill(0));
+      if (kind === "lownoise") {
+        [1, 0.6, 0.35].forEach(sc => {
+          const u = Array.from({ length: n }, () => R.normal()), v = Array.from({ length: n }, () => R.normal());
+          for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) A[i][j] += sc * u[i] * v[j] / 2;
+        });
+        for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) A[i][j] += 0.12 * R.normal();
+        return A;
+      }
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const x = i / (n - 1), y = j / (n - 1);
+        if (kind === "plaid") A[i][j] = Math.sin(3 * Math.PI * x) * Math.cos(2 * Math.PI * y) + 0.8 * (x - 0.5) * (y > 0.5 ? 1 : -0.4);
+        else if (kind === "blob") { const u = (x - 0.45) * Math.cos(0.6) + (y - 0.55) * Math.sin(0.6), v = -(x - 0.45) * Math.sin(0.6) + (y - 0.55) * Math.cos(0.6); A[i][j] = Math.exp(-(u * u) / 0.06 - (v * v) / 0.012); }
+        else if (kind === "band") A[i][j] = Math.abs(i - j) <= 1 ? 1 : 0;
+        else A[i][j] = R.normal();
+      }
+      return A;
+    }
+    function svdPI(A0) {
+      const m = A0.length, nn = A0[0].length, Rm = A0.map(r => r.slice()), comps = [], Vs = [], R = rng(99);
+      const dotv = (x, y) => x.reduce((acc, v, i) => acc + v * y[i], 0);
+      const orth = v => { Vs.forEach(p => { const d = dotv(v, p); for (let j = 0; j < v.length; j++) v[j] -= d * p[j]; }); return v; };
+      const nrm = v => Math.sqrt(dotv(v, v));
+      for (let t = 0; t < Math.min(m, nn); t++) {
+        let v = orth(Array.from({ length: nn }, () => R.normal()));
+        let nv = nrm(v); v = v.map(x => x / nv);
+        for (let it = 0; it < 300; it++) {
+          const Av = Rm.map(r => dotv(r, v));
+          const wv = orth(Array.from({ length: nn }, (_, j) => { let acc = 0; for (let i = 0; i < m; i++) acc += Rm[i][j] * Av[i]; return acc; }));
+          const nw = nrm(wv);
+          if (nw < 1e-13) break;
+          v = wv.map(x => x / nw);
+        }
+        const u0 = Rm.map(r => dotv(r, v)), sg = nrm(u0);
+        const u = sg > 1e-12 ? u0.map(x => x / sg) : u0.map(() => 0);
+        for (let i = 0; i < m; i++) for (let j = 0; j < nn; j++) Rm[i][j] -= sg * u[i] * v[j];
+        Vs.push(v); comps.push({ s: sg, u, v });
+      }
+      return comps.sort((p, q) => q.s - p.s);
+    }
+    let kind = "lownoise", A, comps, errs, fro;
+    select(w.controls, { label: "Pattern", options: [{ value: "lownoise", label: "low rank + noise (like a weight update)" }, { value: "plaid", label: "plaid (exactly rank 2)" }, { value: "blob", label: "smooth tilted blob" }, { value: "band", label: "diagonal band" }, { value: "noise", label: "pure random noise" }], value: kind, onChange: v => { kind = v; compute(); } });
+    const kS = slider(w.controls, { label: "Rank k", min: 0, max: 24, step: 1, value: 3, onInput: draw });
+    const row = el("div", { class: "hm-row" }); w.body.appendChild(row);
+    const panel = cap => { const box = el("div"); box.appendChild(el("div", { class: "cap", text: cap })); const cw = el("div", { class: "canvas-wrap", style: { padding: "6px" } }); box.appendChild(cw); row.appendChild(box); return { box, cw }; };
+    const p1 = panel("A (original)"), p2 = panel("A_k (rank k)"), p3 = panel("A − A_k (residual)");
+    const H1 = heatmap(p1.cw, { cell: 9, showValues: false, maxWidth: 260 }), H2 = heatmap(p2.cw, { cell: 9, showValues: false, maxWidth: 260 }), H3 = heatmap(p3.cw, { cell: 9, showValues: false, maxWidth: 260 });
+    const row2 = el("div", { class: "hm-row", style: { marginTop: "10px" } }); w.body.appendChild(row2);
+    const pe = el("div"); pe.appendChild(el("div", { class: "cap", text: "relative error ‖A − A_k‖_F / ‖A‖_F vs k" })); const pew = el("div", { class: "canvas-wrap" }); pe.appendChild(pew); row2.appendChild(pe);
+    const ps = el("div"); ps.appendChild(el("div", { class: "cap", text: "singular values σ₁ … σ₂₄ (green = kept)" })); const psw = el("div", { class: "canvas-wrap" }); ps.appendChild(psw); row2.appendChild(ps);
+    const P = plot(pew, { width: 380, height: 220, x: [0, 24], y: [0, 1], xticks: [0, 4, 8, 12, 16, 20, 24], yticks: [0, 0.25, 0.5, 0.75, 1], xfmt: v => String(v), yfmt: v => v.toFixed(2), xlabel: "k", margin: { l: 44, b: 38 } });
+    const Bs = bars(psw, { width: 380, height: 220 });
+    const set = stats(w.body, [{ key: "store", label: "Storage at rank k" }, { key: "energy", label: "Energy kept" }, { key: "err", label: "Relative error" }, { key: "next", label: "σ_(k+1) / σ₁" }]);
+    function recon(k) {
+      const Ak = Array.from({ length: n }, () => new Array(n).fill(0));
+      for (let t = 0; t < k; t++) { const { s: sg, u, v } = comps[t]; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) Ak[i][j] += sg * u[i] * v[j]; }
+      return Ak;
+    }
+    function compute() {
+      A = make(kind); comps = svdPI(A);
+      fro = Math.sqrt(A.flat().reduce((acc, v) => acc + v * v, 0));
+      errs = [];
+      for (let k = 0; k <= n; k++) { const Ak = recon(k); let e = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) e += (A[i][j] - Ak[i][j]) ** 2; errs.push(Math.sqrt(e) / fro); }
+      draw();
+    }
+    function draw() {
+      const k = kS.value, Ak = recon(k), Rr = A.map((r, i) => r.map((v, j) => v - Ak[i][j]));
+      const mx = Math.max(...A.flat().map(Math.abs));
+      H1.draw(A, { diverging: true, max: mx }); H2.draw(Ak, { diverging: true, max: mx }); H3.draw(Rr, { diverging: true, max: mx });
+      P.draw([{ points: errs.map((e, i) => [i, e]), color: palette.blue, dots: true, r: 2.5 }, { vline: k, color: palette.brick, label: "k = " + k }, { marker: [k, errs[k]], color: palette.brick }]);
+      const sig = comps.map(c => c.s);
+      Bs.draw(sig.map((_, i) => (i % 4 === 0 ? String(i + 1) : "")), sig, { colors: sig.map((_, i) => i < k ? palette.green : "#c9c6bd"), showValues: false, max: sig[0] });
+      const tot = sig.reduce((a, v) => a + v * v, 0), kept = sig.slice(0, k).reduce((a, v) => a + v * v, 0);
+      set("store", `${k * 2 * n} / ${n * n}`, k * 2 * n < n * n ? "good" : "warn", k * 2 * n < n * n ? `${(100 * k * 2 * n / (n * n)).toFixed(0)}% of the full matrix` : "factors now cost more than the matrix");
+      set("energy", (100 * kept / tot).toFixed(1) + "%", null, "Σ σ² kept / Σ σ² total");
+      set("err", errs[k].toFixed(3), errs[k] < 0.1 ? "good" : errs[k] < 0.4 ? "warn" : "bad", "√(dropped σ²) / ‖A‖_F");
+      set("next", k < n ? (sig[k] / sig[0]).toFixed(3) : "—", null, "size of the next term you'd add");
+    }
+    compute();
+  })();
+
+  /* ---------------------------------------------------------- Fig: SVD and LoRA shapes */
+  (function () {
+    const s = document.getElementById("fig-svd");
+    const box = (x, y, w_, h, fill, stroke, label, sub) => {
+      s.appendChild(svg("rect", { x, y, width: w_, height: h, rx: 4, fill, stroke, "stroke-width": 1.4 }));
+      if (label) txt(s, x + w_ / 2, y + h / 2 + 5, label, { anchor: "middle", size: 13, weight: 700 });
+      if (sub) txt(s, x + w_ / 2, y + h + 16, sub, { anchor: "middle", size: 11, color: palette.muted });
+    };
+    const op = (x, y, t) => txt(s, x, y, t, { anchor: "middle", size: 20, mono: false });
+    // Row 1: SVD
+    txt(s, 30, 22, "SVD", { size: 12, weight: 700, color: palette.blue });
+    box(30, 34, 90, 110, "rgba(47,93,138,.12)", palette.blue, "A", "[m, n]");
+    op(140, 95, "=");
+    box(160, 34, 44, 110, "rgba(26,122,82,.12)", palette.green, "U", "[m, r]");
+    box(214, 34, 44, 44, "#fff", palette.gold, null, "Σ [r, r]");
+    [9, 6.5, 4, 2].forEach((r, i) => s.appendChild(svg("circle", { cx: 214 + 6 + i * 10.5, cy: 34 + 6 + i * 10.5, r: r / 1.6, fill: palette.gold })));
+    box(268, 34, 90, 44, "rgba(176,67,46,.10)", palette.brick, "Vᵀ", "");
+    txt(s, 313, 94, "[r, n]", { anchor: "middle", size: 11, color: palette.muted });
+    op(385, 95, "=");
+    // rank-1 terms
+    const term = (x, sg, label, strong) => {
+      box(x, 50, 12, 80, strong ? "rgba(26,122,82,.25)" : "rgba(26,122,82,.10)", palette.green, null, null);
+      box(x + 18, 50, 70, 12, strong ? "rgba(176,67,46,.22)" : "rgba(176,67,46,.08)", palette.brick, null, null);
+      txt(s, x + 50, 100, label, { anchor: "middle", size: 12 });
+      txt(s, x + 50, 118, sg, { anchor: "middle", size: 10.5, color: palette.muted });
+    };
+    term(405, "largest σ", "σ₁ u₁v₁ᵀ", true); op(510, 95, "+");
+    term(525, "next", "σ₂ u₂v₂ᵀ", true); op(630, 95, "+");
+    txt(s, 665, 100, "…  + σ_r u_r v_rᵀ", { size: 12 });
+    txt(s, 405, 160, "keep the first k terms → best rank-k approximation, k(m + n) numbers", { size: 11.5, color: palette.ink });
+    s.appendChild(svg("line", { x1: 30, x2: 850, y1: 180, y2: 180, stroke: palette.line }));
+    // Row 2: LoRA
+    txt(s, 30, 204, "LoRA", { size: 12, weight: 700, color: palette.green });
+    box(30, 214, 100, 100, "#ecebe4", "rgba(28,27,25,.35)", "W₀", "");
+    txt(s, 80, 330, "[d, k] frozen", { anchor: "middle", size: 11, color: palette.muted });
+    op(152, 270, "+");
+    box(172, 214, 16, 100, "rgba(26,122,82,.25)", palette.green, null, null);
+    txt(s, 180, 330, "B [d, r]", { anchor: "middle", size: 11, color: palette.green });
+    op(204, 270, "·");
+    box(220, 214, 100, 16, "rgba(176,67,46,.22)", palette.brick, null, null);
+    txt(s, 270, 250, "A [r, k]", { anchor: "middle", size: 11, color: palette.brick });
+    op(345, 270, "=");
+    box(365, 214, 100, 100, "rgba(26,122,82,.08)", palette.green, "W", "");
+    txt(s, 415, 330, "[d, k], rank of update ≤ r", { anchor: "middle", size: 11, color: palette.muted });
+    const nx = 510;
+    [["d = k = 4096, r = 16  (one q_proj)", palette.ink], ["full update: 4096 × 4096 = 16,777,216 params", palette.brick], ["B and A: 16 × (4096 + 4096) = 131,072 params", palette.green], ["= 0.78% of the full matrix", palette.green], ["forward pass computes B(Ax), never BA", palette.muted]].forEach(([t, col], i) => txt(s, nx, 232 + i * 21, t, { size: 11.5, color: col }));
+  })();
+
+  /* ---------------------------------------------------------- Fig: arithmetic intensity */
+  (function () {
+    const host = document.getElementById("fig-ai");
+    const d = 4096, ai = T => T * d / (d + 2 * T);
+    const P = plot(host, { width: 760, height: 330, x: [1, 65536], y: [0.5, 4096], logx: true, logy: true, xticks: [1, 10, 100, 1000, 10000], yticks: [1, 10, 100, 1000], xfmt: v => fmtNum(v, 0), yfmt: v => fmtNum(v, 0), xlabel: "tokens multiplied together, T (log scale)", ylabel: "FLOPs per byte (log scale)", margin: { l: 58 } });
+    P.draw([
+      { fn: ai, color: palette.blue, width: 2.6, label: "[T, 4096] × [4096, 4096], bf16" },
+      { hline: 295, color: palette.brick, label: "H100 ridge ≈ 295" },
+      { hline: 30, color: palette.gold, label: "M-series Max ridge ≈ 30 (rough)" },
+      { marker: [1, ai(1)], color: palette.ink },
+      { text: [1.4, 1.5], label: "decode: 1 token, AI ≈ 1 (memory-bound)", color: palette.ink },
+      { marker: [2048, ai(2048)], color: palette.green },
+      { text: [1500, 1700], label: "prefill: 2048 tokens, AI ≈ 1024", color: palette.green, anchor: "end" }
+    ]);
+  })();
+})();
+</script>
+</body>
+</html>

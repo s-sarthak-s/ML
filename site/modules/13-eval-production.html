@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Evaluation &amp; production — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+</head>
+<body data-module="13">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 13 · Shipping it</p>
+<h1 class="title">Evaluation &amp; production: proving it <span class="it">works</span></h1>
+<p class="lede">LLM features rarely fail loudly. A prompt edit quietly costs a few points on one customer segment, the eval set has 80 examples so nobody can tell, and p99 latency doubled after a traffic shift nobody was watching. This module is the measurement toolkit: what to evaluate, how many examples you need before a difference is real, and the arithmetic that sizes and prices a deployment.</p>
+<div class="meta"><span class="tag">~3 hours</span><span class="tag n">prereqs: 03, 08, 11, 12</span><span class="tag g">hands-on: numpy, vLLM, llama.cpp</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Pick the right kind of evaluation for a decision, and say what a public benchmark score does and doesn't tell you.</li>
+    <li>Compute pass@k without bias, and put a confidence interval on any accuracy number.</li>
+    <li>Decide whether model B really beats model A on the same eval set, using a paired bootstrap, and estimate how many examples that takes.</li>
+    <li>Design an LLM judge, measure its agreement with humans, and correct for its known biases.</li>
+    <li>Size a GPU deployment from request rate, token counts, and a latency target, and compare its cost against an API.</li>
+    <li>Instrument a production system: traces, latency percentiles, drift checks, A/B guardrails, and caches that don't serve wrong answers.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="job">Evaluation is the job</h2>
+
+<p>Training a model, writing a prompt, adding retrieval, swapping a quantization: each of these is a guess that the system got better. An <strong>evaluation</strong> is the measurement that confirms or kills the guess. Teams that ship good LLM products usually aren't the ones with the cleverest prompts. They can tell within an hour whether a change helped, and on which kinds of input.</p>
+
+<div class="def"><b>Definition · eval</b>
+<p>A fixed set of inputs, a way to run the system on them, and a scoring rule, versioned together so that two runs a month apart are comparable. Change any of the three and you have a different eval.</p>
+</div>
+
+<p>There isn't one evaluation. There are several families, and each answers a different question at a different point in a project's life:</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 372" id="fig-tax"></svg>
+<figcaption>The eval taxonomy against the project lifecycle. Offline evals (green) run on fixed data before anything ships. Regression suites (gold) gate every change. Safety and red-team testing (brick) probes for harm, and online evaluation (blue) measures real users. The one bar that spans the whole lifecycle is your own task eval. Public benchmarks matter for about a week, while you shortlist candidate models.</figcaption></figure>
+
+<div class="grid2">
+  <div class="card"><div class="k">Offline</div><h4>Fixed inputs, automatic scores</h4><p>Cheap, repeatable, fast enough to run on every commit. Blind to anything your dataset doesn't contain: new user intents, a long-tail language, the way real users phrase things.</p></div>
+  <div class="card blue"><div class="k">Online</div><h4>Real traffic, real outcomes</h4><p>Measures what you actually care about (task completion, retention, escalations) but is slow, noisy, and exposes users to the change. You only get to run a few of these per quarter, so offline evals decide which changes get one.</p></div>
+</div>
+
+<details class="think"><summary>Think first: your RAG assistant's thumbs-up rate rose from 61% to 64% the week you shipped a new reranker. Did the reranker help?</summary>
+<div>You can't tell yet. The traffic mix may have changed that week (a holiday, a marketing push, a new customer), thumbs are given by a small and self-selected minority of users, and 3 points could be noise at that volume. The reranker's effect should first show up offline: retrieval recall and answer accuracy on a fixed golden set, old vs new. Then an A/B test with randomized traffic isolates it online. A before/after comparison over calendar time confounds the change with everything else that changed that week.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="offline">Perplexity and public benchmarks</h2>
+
+<h3>Perplexity: the pretraining metric</h3>
+<p>Module 03 introduced perplexity as the exponentiated cross-entropy on held-out text. It's the metric pretraining optimizes, and it stays useful wherever you need a quick, sensitive, label-free signal.</p>
+
+<div class="formula" data-name="Perplexity (recap)">
+  <div class="tex">$$\htmlClass{t1}{\text{PPL}} = \exp\!\left(-\frac{1}{\htmlClass{t2}{N}} \sum_{i=1}^{\htmlClass{t2}{N}} \log \htmlClass{t3}{p_\theta}(\htmlClass{t4}{x_i} \mid \htmlClass{t5}{x_{\lt i}})\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>PPL</dt><dd>perplexity: the effective number of equally likely tokens the model is choosing between</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>number of tokens in the evaluation text</dd></div>
+    <div data-t="t3"><dt>\(p_\theta\)</dt><dd>the model's predicted probability</dd></div>
+    <div data-t="t4"><dt>\(x_i\)</dt><dd>the actual \(i\)-th token</dd></div>
+    <div data-t="t5"><dt>\(x_{\lt i}\)</dt><dd>all tokens before it (the context)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Average the surprise (negative log-probability) of each true next token, then undo the log. A perplexity of 8 means the model is, on average, as unsure as if it were picking uniformly among 8 tokens.</p>
+  <p class="why"><b>Why it matters</b>It's how you catch a broken quantization, a bad data mix, or a domain mismatch in minutes, before running any task eval (Module 09 uses it this way).</p>
+</div>
+
+<p>Perplexity has hard limits as a product metric:</p>
+<ul>
+  <li><strong>It depends on the tokenizer.</strong> A model with a bigger vocabulary predicts fewer, longer tokens, so its per-token perplexity isn't comparable to another model's. Normalize by bytes instead (bits per byte, \(-\sum \log_2 p / \text{bytes}\)) when comparing across tokenizers.</li>
+  <li>It measures imitation of text, not usefulness. Instruction tuning and RLHF usually make perplexity on raw web text <em>worse</em> while making the model far more helpful. The distribution being matched has changed.</li>
+  <li>Behaviour is invisible to it. Refusing correctly, following a JSON schema, calling the right tool, not hallucinating a citation: none of these show up in the average log-probability of reference text.</li>
+</ul>
+
+<h3>Public benchmarks and what they measure</h3>
+<p>A benchmark is somebody else's eval, published so models can be compared. Read every score as "accuracy on <em>this</em> question set, with <em>this</em> prompt format and answer parser." Change the few-shot examples or the regex that extracts the final answer and scores move by several points.</p>
+
+<table class="t">
+  <thead><tr><th>Benchmark</th><th>What it contains</th><th>Scoring</th><th>What to watch</th></tr></thead>
+  <tbody>
+    <tr><td>MMLU (Hendrycks et al., 2021)</td><td>~14K four-option multiple-choice questions across 57 subjects</td><td>accuracy</td><td>Saturated at the top, and audits have found mislabelled questions. MMLU-Pro (Wang et al., 2024) uses ten options and harder items.</td></tr>
+    <tr><td>GPQA (Rein et al., 2023)</td><td>448 graduate-level science questions written to resist web search; the "Diamond" subset has 198</td><td>accuracy</td><td>Small. At 50% accuracy, 198 questions give a 95% CI of about ±7 points.</td></tr>
+    <tr><td>GSM8K (Cobbe et al., 2021)</td><td>8.5K grade-school math word problems, 1,319 in the test split</td><td>exact match on the final number</td><td>Saturated. GSM1k (Zhang et al., 2024) found some models drop on freshly written look-alikes, a contamination signal.</td></tr>
+    <tr><td>MATH (Hendrycks et al., 2021)</td><td>12.5K competition problems; the 500-problem MATH-500 subset is common</td><td>exact match after normalizing the answer</td><td>The answer-normalization code changes scores. Compare only runs that used the same parser.</td></tr>
+    <tr><td>HumanEval (Chen et al., 2021)</td><td>164 hand-written Python functions with unit tests</td><td>pass@k</td><td>Only 164 problems, so CIs are wide. MBPP (Austin et al., 2021) plays the same role with ~1K problems.</td></tr>
+    <tr><td>SWE-bench (Jimenez et al., 2023)</td><td>2,294 real GitHub issues from 12 Python repos; "Verified" is a 500-issue human-checked subset</td><td>% of issues whose patch passes the repo's hidden tests</td><td>Measures model <em>plus</em> agent scaffold. The same model scores very differently in different harnesses.</td></tr>
+    <tr><td>IFEval (Zhou et al., 2023)</td><td>~500 prompts with machine-checkable instructions ("no commas", "at least 300 words")</td><td>instruction-level accuracy</td><td>Format compliance, not helpfulness or truthfulness.</td></tr>
+    <tr><td>LiveCodeBench (Jain et al., 2024)</td><td>Contest problems collected continuously and tagged by release date</td><td>pass@1</td><td>Time-split by design: score only problems published after the model's training cutoff.</td></tr>
+    <tr><td>Chatbot Arena / LMArena (Chiang et al., 2024)</td><td>Crowdsourced pairwise votes on prompts users chose themselves</td><td>Bradley–Terry rating</td><td>Measures the preferences of the people who vote there. Length and markdown formatting move ratings.</td></tr>
+  </tbody>
+</table>
+
+<h3>Contamination</h3>
+<p>Benchmarks are published on the web, and models are trained on the web. If test questions (or their answers, or close paraphrases) were in the pretraining data, the score partly measures memory. Ways to detect or avoid it:</p>
+<ul>
+  <li><strong>N-gram overlap</strong> between the test set and the training corpus. The GPT-3 paper used 13-gram matches. You can only run this check if you have the training data.</li>
+  <li><strong>Canary strings.</strong> BIG-bench embeds a unique GUID in its files. If a model can complete the string, the files were in its training data.</li>
+  <li><strong>Fresh look-alikes.</strong> Write new items with the same distribution (GSM1k for GSM8K). A drop on the fresh set is evidence of memorization.</li>
+  <li><strong>Time splits.</strong> Only score items created after the training cutoff (LiveCodeBench, SWE-bench-style issue mining).</li>
+</ul>
+
+<h3>Saturation</h3>
+<p>When the best models all score within a couple of points of each other near the ceiling, the benchmark stops ranking them. The remaining errors are increasingly mislabelled items, ambiguous questions, and parser failures. Differences smaller than the label-error rate are noise. The response is a harder successor (MMLU → MMLU-Pro → GPQA) and, more usefully for you, your own eval.</p>
+
+<div class="flag"><b>What a leaderboard can't tell you</b>
+<p>Public benchmarks shortlist candidates. They don't measure your prompts, your documents, your tools, your users' phrasing, or your latency budget. A model two points higher on MMLU-Pro can easily be worse at extracting fields from your invoices. Treat leaderboard ranks within a few points as ties, then run your task eval on the shortlist.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="passk">pass@k: grading with many samples</h2>
+
+<p>For code generation the scorer is unambiguous: run the unit tests. But models sample, so one attempt per problem is a noisy measurement. And for some products (an agent that can run tests and retry, a tool that shows five suggestions) the question is whether <em>any</em> of \(k\) attempts works. That's <strong>pass@k</strong>: the probability that at least one of \(k\) samples passes.</p>
+
+<p>The obvious way to measure it is to draw exactly \(k\) samples per problem and check whether any passed. That has high variance. Chen et al. (2021), in the HumanEval paper, draw \(n \geq k\) samples per problem, count the \(c\) correct ones, and compute the probability that a random size-\(k\) subset of those \(n\) contains at least one correct sample:</p>
+
+<div class="formula" data-name="Unbiased pass@k (Chen et al., 2021)">
+  <div class="tex">$$\htmlClass{t1}{\text{pass@}k} = \mathbb{E}_{\text{problems}}\left[\,1 - \frac{\binom{\htmlClass{t2}{n} - \htmlClass{t3}{c}}{\htmlClass{t4}{k}}}{\binom{\htmlClass{t2}{n}}{\htmlClass{t4}{k}}}\,\right] \qquad \text{per problem} = 1 - \prod_{i=\htmlClass{t2}{n}-\htmlClass{t3}{c}+1}^{\htmlClass{t2}{n}} \left(1 - \frac{\htmlClass{t4}{k}}{i}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>pass@\(k\)</dt><dd>probability that at least one of \(k\) samples is correct, averaged over problems</dd></div>
+    <div data-t="t2"><dt>\(n\)</dt><dd>samples actually generated per problem (the paper used 200 for HumanEval); must satisfy \(n \geq k\)</dd></div>
+    <div data-t="t3"><dt>\(c\)</dt><dd>how many of those \(n\) samples passed the tests</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>attempts the product gets (1, 10, 100…)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>\(\binom{n-c}{k}/\binom{n}{k}\) is the chance that a random handful of \(k\) samples drawn from your \(n\) contains <em>only</em> failures. One minus that is the chance it contains a success. If fewer than \(k\) samples failed, every handful has a success, and the estimate is exactly 1.</p>
+  <p class="why"><b>Why it matters</b>The binomial form overflows for \(n = 200\), so use the product form, which never builds big numbers. The tempting plug-in \(1-(1-c/n)^k\) is <em>biased low</em>: it's a concave function of the estimated pass rate, so by Jensen's inequality its average falls below the truth. The subset form is exactly unbiased.</p>
+</div>
+
+<div id="w-passk"></div>
+
+<div class="intuition"><b>Intuition · pass@1 vs pass@10</b>
+<p>pass@1 rewards being <em>reliably</em> right. pass@10 rewards being <em>sometimes</em> right on many problems. A model that solves 30% of attempts on every problem has pass@1 = 0.30 and pass@10 ≈ \(1 - 0.7^{10} \approx 0.97\). A model that solves 40% of problems every time and the rest never has pass@1 = 0.40 and pass@10 = 0.40. Which one you want depends on whether your product has a verifier (tests, a type checker, a human picking) that can find the good sample.</p>
+</div>
+
+<div class="pitfall"><b>Pitfall · pass@k at temperature 0</b>
+<p>pass@k with \(k \gt 1\) only means something if the samples differ. At temperature 0 all \(n\) samples are (nearly) identical, so pass@10 collapses to pass@1. Chen et al. tuned temperature per \(k\): low for pass@1, higher (around 0.8) for pass@100. Report the sampling settings with the number.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="judge">LLM-as-judge</h2>
+
+<p>Most product outputs have no unit test: summaries, support replies, explanations, agent transcripts. Human grading is the gold standard and costs minutes per item. An <strong>LLM judge</strong> is a prompt that asks a strong model to grade an output against a rubric. Zheng et al. (2023), introducing MT-Bench and Chatbot Arena, found GPT-4's pairwise judgments agreed with human experts over 80% of the time (excluding ties), about as often as the humans agreed with each other. That result made judges the default for open-ended evals. It also came with a catalogue of biases.</p>
+
+<h3>Designing the rubric</h3>
+<ol>
+  <li><strong>One criterion per call.</strong> "Is every claim supported by the provided context? yes/no" is gradeable. "Rate overall quality 1–10" isn't: the judge invents its own weighting, and that weighting drifts.</li>
+  <li>Prefer binary or short ordinal scales with anchors. Describe what a 1, 2, and 3 look like, ideally with an example of each. Wide numeric scales cluster around a few values and are hard to calibrate.</li>
+  <li>Ask for a short justification before the score, in structured output (JSON with <code>reasoning</code> then <code>verdict</code>) so it's parseable and auditable.</li>
+  <li><strong>Give the judge what a human grader would need:</strong> the reference answer for factual questions, the retrieved passages for groundedness, the tool results for agent steps. A judge grading math without a reference mostly checks whether the solution <em>sounds</em> right.</li>
+</ol>
+
+<div class="grid2">
+  <div class="card"><div class="k">Pointwise</div><h4>Score one output against a rubric</h4><p>Gives absolute numbers you can track over time ("groundedness 0.93") and set thresholds on. More sensitive to the judge's own calibration, and a judge-model upgrade can shift every score at once.</p></div>
+  <div class="card blue"><div class="k">Pairwise</div><h4>Which of two outputs is better?</h4><p>Easier for judges and humans alike, and more sensitive to small improvements. Only gives relative results, needs a baseline output for each item, and is exposed to position bias.</p></div>
+</div>
+
+<h3>Known biases and their mitigations</h3>
+<table class="t">
+  <thead><tr><th>Bias</th><th>What happens</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>Position</td><td>The judge favours whichever answer appears first (or second) regardless of content</td><td>Judge both orders; count a win only if both agree, otherwise a tie</td></tr>
+    <tr><td>Verbosity</td><td>Longer, more elaborate answers win even when padding adds nothing</td><td>Rubric that penalizes unrequested content; report length alongside win rate; length-controlled win rates (Dubois et al., 2024)</td></tr>
+    <tr><td>Self-preference</td><td>A judge rates outputs from its own model family higher</td><td>Judge from a different family, or a panel of smaller judges from several families (Verga et al., 2024)</td></tr>
+    <tr><td>Limited reasoning</td><td>The judge accepts a confident wrong derivation</td><td>Reference-guided grading; programmatic checks for anything checkable</td></tr>
+    <tr><td>Drift</td><td>The judge model or its prompt changes and every historical score shifts</td><td>Pin the judge model version; re-calibrate against human labels on any change</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig wide"><svg viewBox="0 0 860 268" id="fig-judge"></svg>
+<figcaption>The swap protocol for pairwise judging. The same pair is judged twice with the order reversed. A verdict that flips with the order is position bias, not preference, and is recorded as a tie. The rate of flipped verdicts is itself worth tracking: a judge that flips on 30% of pairs is guessing on those items.</figcaption></figure>
+
+<h3>Calibrating the judge against humans</h3>
+<p>Before trusting a judge, have humans label a sample, run the judge on the same items, and measure agreement. Size the sample with the same arithmetic as any accuracy: at 85% agreement, 100 items pin it down to about ±7 points, and 300 items to about ±4. Raw percent agreement flatters: if 90% of outputs pass, a judge that always says "pass" agrees 90% of the time. <strong>Cohen's kappa</strong> subtracts the agreement you'd get by chance.</p>
+
+<div class="formula" data-name="Cohen's kappa">
+  <div class="tex">$$\htmlClass{t1}{\kappa} = \frac{\htmlClass{t2}{p_o} - \htmlClass{t3}{p_e}}{1 - \htmlClass{t3}{p_e}}, \qquad \htmlClass{t3}{p_e} = \sum_{\htmlClass{t6}{\ell}} \htmlClass{t4}{p^{\text{H}}_{\ell}}\,\htmlClass{t5}{p^{\text{J}}_{\ell}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\kappa\)</dt><dd>chance-corrected agreement: 1 = perfect, 0 = no better than chance, negative = worse than chance</dd></div>
+    <div data-t="t2"><dt>\(p_o\)</dt><dd>observed agreement: fraction of items where judge and human gave the same label</dd></div>
+    <div data-t="t3"><dt>\(p_e\)</dt><dd>agreement expected if both labelled independently at their own base rates</dd></div>
+    <div data-t="t4"><dt>\(p^{\text{H}}_{\ell}\)</dt><dd>fraction of items the human gave label \(\ell\)</dd></div>
+    <div data-t="t5"><dt>\(p^{\text{J}}_{\ell}\)</dt><dd>fraction of items the judge gave label \(\ell\)</dd></div>
+    <div data-t="t6"><dt>\(\ell\)</dt><dd>each possible label (pass/fail, or 1/2/3)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>How much of the agreement left over after chance did the judge achieve? Worked example: the human passes 70% of items and the judge passes 75%, and they agree on 85%. Chance agreement is \(0.7 \times 0.75 + 0.3 \times 0.25 = 0.60\), so \(\kappa = (0.85 - 0.60)/0.40 = 0.63\).</p>
+  <p class="why"><b>Why it matters</b>Common rules of thumb (Landis &amp; Koch, 1977) call 0.61–0.80 "substantial" agreement. Those bands are conventions, not laws. Compare the judge's kappa to the <em>human–human</em> kappa on the same items. That's the ceiling, and some tasks have a low one.</p>
+</div>
+
+<div class="mle"><b>MLE angle · read the confusion matrix, not just kappa</b>
+<p>A judge that's too lenient (passes items humans fail) and one that's too strict can have the same kappa. Decide which error is worse for your use. For a safety filter, missed failures matter most. For an eval that gates releases, false alarms waste days. Check agreement per slice too: judges are often worse on the languages and domains your eval set has fewest examples of.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="pairwise">Ranking from pairwise votes</h2>
+
+<p>Pairwise judgments (from humans or judges) give you a pile of "A beat B" results across many model pairs. To turn that pile into a ranking, assume each model has a latent strength and the probability of winning depends only on the difference. That's the <strong>Bradley–Terry</strong> model (1952). Elo ratings from chess are the same model on a base-10, 400-point scale.</p>
+
+<div class="formula" data-name="Elo / Bradley–Terry expected score">
+  <div class="tex">$$\htmlClass{t1}{E_A} = \frac{1}{1 + 10^{(\htmlClass{t3}{R_B} - \htmlClass{t2}{R_A})/400}}, \qquad \htmlClass{t2}{R_A} \leftarrow \htmlClass{t2}{R_A} + \htmlClass{t4}{K}\,(\htmlClass{t5}{S_A} - \htmlClass{t1}{E_A})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(E_A\)</dt><dd>predicted probability that A beats B (expected score)</dd></div>
+    <div data-t="t2"><dt>\(R_A\)</dt><dd>rating of model A</dd></div>
+    <div data-t="t3"><dt>\(R_B\)</dt><dd>rating of model B</dd></div>
+    <div data-t="t4"><dt>\(K\)</dt><dd>step size of the online Elo update (e.g. 4–32)</dd></div>
+    <div data-t="t5"><dt>\(S_A\)</dt><dd>actual outcome for A: 1 win, 0.5 tie, 0 loss</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Only the rating gap matters. 100 points ≈ 64% win probability, 200 ≈ 76%, 400 ≈ 91%. After each game, nudge the rating by how surprised you were. Bradley–Terry writes the same model as \(P(A \succ B) = \sigma(\beta_A - \beta_B)\), with \(\beta = R \ln 10 / 400\), which turns fitting the ratings into a logistic regression.</p>
+  <p class="why"><b>Why it matters</b>Online Elo depends on the order the games were played. Chatbot Arena switched to fitting Bradley–Terry by maximum likelihood over all votes at once, with bootstrap confidence intervals. Do the same with your own pairwise evals.</p>
+</div>
+
+<details class="think"><summary>Think first: model X has a rating 30 points above model Y. Your users will see one or the other. How much should you care?</summary>
+<div>A 30-point gap predicts X wins \(1/(1+10^{-30/400}) \approx 54\%\) of head-to-head votes, barely better than a coin flip, and the interval around a 30-point gap is often as wide as the gap. If Y is cheaper or faster, it probably wins on the dimensions that a preference vote doesn't measure. Ratings close together are ties until your own eval separates them.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="stats">Statistics you actually need</h2>
+
+<p>An eval score is an estimate from a sample of items. Run the same system on a different 200 questions drawn the same way and you'd get a different number. The question is always how different.</p>
+
+<h3>Standard error of an accuracy</h3>
+<div class="formula" data-name="Standard error and 95% confidence interval">
+  <div class="tex">$$\htmlClass{t1}{\text{SE}} = \sqrt{\frac{\htmlClass{t2}{\hat p}\,(1 - \htmlClass{t2}{\hat p})}{\htmlClass{t3}{n}}}, \qquad \text{95\% CI} \approx \htmlClass{t2}{\hat p} \pm \htmlClass{t4}{1.96}\,\htmlClass{t1}{\text{SE}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>SE</dt><dd>standard error: the standard deviation of the score across hypothetical re-draws of the eval set</dd></div>
+    <div data-t="t2"><dt>\(\hat p\)</dt><dd>observed accuracy (fraction of items correct)</dd></div>
+    <div data-t="t3"><dt>\(n\)</dt><dd>number of independent items</dd></div>
+    <div data-t="t4"><dt>1.96</dt><dd>the normal quantile that leaves 2.5% in each tail</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each item is a coin flip with bias \(p\). The spread of the average shrinks with \(\sqrt{n}\): four times the items for half the uncertainty. At \(n = 100\) and \(\hat p = 0.8\), SE = 0.04 and the 95% CI is 80% ± 7.8 points, i.e. [72%, 88%].</p>
+  <p class="why"><b>Why it matters</b>A 100-item eval can't distinguish 80% from 85%. Most "prompt v7 beats v6" claims made on small eval sets are noise.</p>
+</div>
+
+<div id="w-ci"></div>
+
+<div class="flag"><b>When the simple formula lies</b>
+<p>The normal approximation breaks near 0% or 100% and for small \(n\) (it can give intervals outside [0, 1]). Use the Wilson interval there, shown dashed in the widget. It also assumes independent items. Five questions about the same document, or ten turns of the same conversation, are correlated, and the true SE is larger. Use a <em>cluster</em> bootstrap that resamples whole documents (Miller, 2024, "Adding Error Bars to Evals").</p>
+</div>
+
+<h3>Is model B really better? Pair the comparison</h3>
+<p>You ran A and B on the same 500 items. A scored 82.0%, B scored 85.0%. Comparing two independent CIs is the wrong test, because the items are shared. Hard items are hard for both models, and easy items are easy for both. Look at the per-item <em>difference</em> instead:</p>
+
+<div class="formula" data-name="Paired difference: standard error">
+  <div class="tex">$$\htmlClass{t1}{\bar d} = \frac{1}{\htmlClass{t2}{n}}\sum_i (\htmlClass{t3}{b_i} - \htmlClass{t4}{a_i}), \qquad \text{SE}(\htmlClass{t1}{\bar d}) = \sqrt{\frac{\sigma_A^2 + \sigma_B^2 - 2\,\htmlClass{t5}{\sigma_{AB}}}{\htmlClass{t2}{n}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\bar d\)</dt><dd>mean per-item difference = accuracy(B) − accuracy(A)</dd></div>
+    <div data-t="t2"><dt>\(n\)</dt><dd>number of shared items</dd></div>
+    <div data-t="t3"><dt>\(b_i\)</dt><dd>model B's score on item \(i\) (0/1 or a graded score)</dd></div>
+    <div data-t="t4"><dt>\(a_i\)</dt><dd>model A's score on the same item</dd></div>
+    <div data-t="t5"><dt>\(\sigma_{AB}\)</dt><dd>covariance of the two models' per-item scores; positive when they find the same items hard</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Shared difficulty cancels in the difference. The more the models agree item by item, the larger the covariance and the tighter the comparison. For 0/1 scores, only the items where they <em>disagree</em> carry information about which is better.</p>
+  <p class="why"><b>Why it matters</b>The same eval set can detect a 3-point improvement when you pair the comparison and miss it entirely when you compare two separate confidence intervals.</p>
+</div>
+
+<p>The <strong>bootstrap</strong> gets the same answer without formulas, and works for any metric (F1, a judge's mean score, median latency). Resample the items with replacement, keeping each item's A and B scores together, recompute the difference, repeat a few thousand times, and read the 2.5th and 97.5th percentiles. The widget below simulates one eval run and bootstraps it.</p>
+
+<div id="w-boot"></div>
+
+<div class="def"><b>Deep cut · McNemar's test</b>
+<p>For 0/1 scores there's an exact test. Let \(n_{10}\) be the items only A got right and \(n_{01}\) the items only B got right. Under "no difference", each disagreement is a fair coin, so test \(n_{01}\) against Binomial\((n_{01} + n_{10}, 0.5)\). 30 disagreements split 21–9 gives a two-sided p ≈ 0.04. A 3-point gain on 500 items is only 15 net items, so whether it's significant depends entirely on how many disagreements there were.</p>
+</div>
+
+<h3>How many examples do you need?</h3>
+<div class="formula" data-name="Approximate sample size to detect a difference">
+  <div class="tex">$$\htmlClass{t1}{n} \approx \frac{(\htmlClass{t2}{z_{1-\alpha/2}} + \htmlClass{t3}{z_{1-\beta}})^2\;\htmlClass{t4}{\sigma_d^2}}{\htmlClass{t5}{\delta}^2}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(n\)</dt><dd>items needed (per model; they're shared in a paired eval)</dd></div>
+    <div data-t="t2"><dt>\(z_{1-\alpha/2}\)</dt><dd>1.96 for a 5% false-positive rate (two-sided)</dd></div>
+    <div data-t="t3"><dt>\(z_{1-\beta}\)</dt><dd>0.84 for 80% power: an 80% chance of detecting a real difference of size \(\delta\)</dd></div>
+    <div data-t="t4"><dt>\(\sigma_d^2\)</dt><dd>variance of the per-item difference. Unpaired: \(p_A(1-p_A) + p_B(1-p_B)\). Paired 0/1: (fraction of items where models disagree) − \(\delta^2\)</dd></div>
+    <div data-t="t5"><dt>\(\delta\)</dt><dd>the smallest difference worth detecting (e.g. 0.03 = 3 points)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>\((1.96 + 0.84)^2 \approx 7.85\). To detect a 3-point gain at 80% accuracy, unpaired: \(7.85 \times 0.32 / 0.0009 \approx 2{,}800\) items. Paired, if the models disagree on 10% of items: \(7.85 \times 0.099 / 0.0009 \approx 860\).</p>
+  <p class="why"><b>Why it matters</b>Halving the effect you want to see quadruples the eval set. Decide the smallest improvement that would change a decision, and size the set for that, before arguing over results.</p>
+</div>
+
+<div class="pitfall"><b>Pitfall · slicing until something is significant</b>
+<p>Break results into 20 slices and test each at 95% confidence, and on average one slice will show a "significant" difference by chance even when nothing changed. Decide the slices you'll test in advance. Correct for many comparisons (Bonferroni: use \(\alpha / m\) for \(m\) tests, conservative but simple), and treat surprising slice results as hypotheses to confirm on fresh data.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="evalset">Building a task eval set</h2>
+
+<p>The eval set usually outlives the prompt and the model it was first built for, so version it like code. Building it is mostly unglamorous data work.</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">Golden set</div><h4>Real inputs, agreed answers</h4><p>Sample from production logs (or realistic drafts before launch), add every bug report as a test case, and write labelling guidelines precise enough that two annotators agree. Measure their agreement; if humans can't agree on an item, fix or drop it.</p></div>
+  <div class="card blue"><div class="k">Slices</div><h4>Score by segment, not just overall</h4><p>Tag each item with language, customer tier, input length bucket, intent, tools involved. An overall +1 can hide a −8 on Japanese or on long documents. Size the slices you care about using the sample-size formula above.</p></div>
+  <div class="card warn"><div class="k">Versioning</div><h4>Freeze, hash, and log</h4><p>Store the set as immutable files with a content hash. Record the hash, prompt version, model ID and sampling parameters, and scorer version with every run. Keep a dev split to iterate on and a held-out split you look at rarely.</p></div>
+</div>
+
+<h3>Choosing the scorer</h3>
+<table class="t">
+  <thead><tr><th>Scorer</th><th>Use when</th><th>Watch out for</th></tr></thead>
+  <tbody>
+    <tr><td>Exact match / parsed field</td><td>Classification, extraction, short factual answers</td><td>Normalization (case, whitespace, number formats) changes the score; test the parser itself</td></tr>
+    <tr><td>Execution / unit tests</td><td>Code, SQL, tool calls with checkable effects</td><td>Weak tests pass wrong code; sandbox everything</td></tr>
+    <tr><td>Schema / constraint checks</td><td>JSON output, length limits, required sections</td><td>Valid format says nothing about correct content</td></tr>
+    <tr><td>LLM judge with rubric</td><td>Open-ended text, groundedness, tone, agent trajectories</td><td>Calibrate against humans first; pin the judge version</td></tr>
+    <tr><td>Human review</td><td>Calibrating judges, high-stakes launches, new task types</td><td>Slow and expensive; annotators drift too, so re-measure agreement</td></tr>
+  </tbody>
+</table>
+<p>Overlap metrics like BLEU and ROUGE reward wording that matches the reference and correlate poorly with quality on open-ended generation. Avoid them except as smoke tests.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 212" id="fig-harness"></svg>
+<figcaption>A minimal eval harness. Each stage is a plain function and every run writes one row per (item, run) with all version identifiers, so any two runs can be diffed item by item. The "Hands-on" section implements this pattern in about 60 lines.</figcaption></figure>
+
+<div class="mle"><b>MLE angle · close the loop</b>
+<p>Every production failure you find (a bad trace, an escalation, a user complaint) should become an eval item within a day, tagged with the slice it came from. After a few months the eval set is a record of everything that has gone wrong, and the regression suite blocks those failures from returning.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="serving">Serving metrics and capacity</h2>
+
+<p>Module 08 defined the latency metrics: <strong>TTFT</strong> (queue + prefill until the first token), <strong>TPOT</strong> (average gap between output tokens after the first), <strong>ITL</strong> (each individual gap; watch its p99), <strong>end-to-end latency</strong> \(\approx \text{TTFT} + (n_{\text{out}} - 1)\cdot\text{TPOT}\), and <strong>throughput</strong> (tokens per second across all requests). Revisit <a href="08-inference.html#latency">08 · Latency metrics</a> if those are hazy. In production, one more number ties them together.</p>
+
+<div class="formula" data-name="Goodput">
+  <div class="tex">$$\htmlClass{t1}{\text{goodput}} = \frac{\big|\{\, r : \htmlClass{t2}{\text{TTFT}_r} \le \htmlClass{t3}{T_{\text{TTFT}}} \,\land\, \htmlClass{t4}{\text{TPOT}_r} \le \htmlClass{t5}{T_{\text{TPOT}}} \,\}\big|}{\htmlClass{t6}{\Delta t}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>goodput</dt><dd>requests per second that met <em>every</em> latency target (term popularized by DistServe, Zhong et al., 2024)</dd></div>
+    <div data-t="t2"><dt>\(\text{TTFT}_r\)</dt><dd>time to first token of request \(r\)</dd></div>
+    <div data-t="t3"><dt>\(T_{\text{TTFT}}\)</dt><dd>TTFT target, e.g. 1 s</dd></div>
+    <div data-t="t4"><dt>\(\text{TPOT}_r\)</dt><dd>time per output token of request \(r\)</dd></div>
+    <div data-t="t5"><dt>\(T_{\text{TPOT}}\)</dt><dd>TPOT target, e.g. 40 ms (~25 tokens/s, faster than people read)</dd></div>
+    <div data-t="t6"><dt>\(\Delta t\)</dt><dd>length of the measurement window</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Throughput counts every token. Goodput counts only requests that were fast enough to be useful. Push concurrency too high and throughput keeps climbing while goodput falls off a cliff.</p>
+  <p class="why"><b>Why it matters</b>This is the number to maximize when tuning batch size and scheduler settings. <code>vllm bench serve --goodput ttft:1000 tpot:40</code> reports it directly.</p>
+</div>
+
+<div class="def"><b>Definition · Little's law</b>
+<p>In any stable system, the average number of requests in flight equals arrival rate × average time in the system: \(L = \lambda W\). At 10 requests/s with a 12-second average response, 120 requests are in flight at once. That's your batch size (summed across replicas), and each one holds KV cache memory (Module 08).</p>
+</div>
+
+<h3>Capacity planning</h3>
+<p>A first-order model is enough to size a deployment before you benchmark it. Treat each GPU (or each tensor-parallel replica) as a pool of GPU-seconds that prefill and decode both draw from. Prefill is compute-bound and fast per token. Decode is bandwidth-bound, and its aggregate throughput grows with batch size, but bigger batches make each step slower. The latency target caps how big the batch can get.</p>
+
+<div class="formula" data-name="GPUs needed (first-order)">
+  <div class="tex">$$\htmlClass{t1}{G} = \left\lceil \frac{\htmlClass{t2}{\lambda}\left(\dfrac{\htmlClass{t3}{n_{\text{in}}}}{\htmlClass{t4}{R_{\text{pre}}}} + \dfrac{\htmlClass{t5}{n_{\text{out}}}}{\htmlClass{t6}{R_{\text{dec}}}}\right)}{\htmlClass{t7}{u}} \right\rceil, \qquad \htmlClass{t6}{R_{\text{dec}}} = R_{\max}\left(1 - \frac{t_{\min}}{T_{\text{TPOT}}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(G\)</dt><dd>number of GPUs (or replicas) to provision</dd></div>
+    <div data-t="t2"><dt>\(\lambda\)</dt><dd>peak request rate, requests per second</dd></div>
+    <div data-t="t3"><dt>\(n_{\text{in}}\)</dt><dd>average prompt tokens per request (after prefix-cache hits)</dd></div>
+    <div data-t="t4"><dt>\(R_{\text{pre}}\)</dt><dd>prefill throughput per GPU, tokens/s</dd></div>
+    <div data-t="t5"><dt>\(n_{\text{out}}\)</dt><dd>average output tokens per request</dd></div>
+    <div data-t="t6"><dt>\(R_{\text{dec}}\)</dt><dd>decode throughput per GPU <em>at the batch size that still meets the TPOT target</em>. Modelled from the saturated throughput \(R_{\max}\) and the single-stream step time \(t_{\min}\)</dd></div>
+    <div data-t="t7"><dt>\(u\)</dt><dd>target utilization (0.6–0.8): headroom for bursts, uneven load balancing, and a replica failing</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each request costs some GPU-seconds of prefill plus some of decode. Multiply by the request rate to get GPUs kept busy, divide by how busy you're willing to run them, and round up. The decode term assumes a step takes \(t_{\min} + B/R_{\max}\) seconds at batch \(B\), so a looser TPOT target allows bigger batches and more tokens per GPU.</p>
+  <p class="why"><b>Why it matters</b>It tells you which knob matters. Long prompts with short answers (RAG, classification) are prefill-heavy, so prefix caching and prompt trimming are the big wins. Long answers (chat, reasoning models) are decode-heavy, so quantization, speculative decoding, and the TPOT target matter most.</p>
+</div>
+
+<div id="w-cap"></div>
+
+<div class="pitfall"><b>Pitfall · planning for the average</b>
+<p>Traffic has daily peaks, often several times the daily average, and output lengths are long-tailed: reasoning models can produce 10× the median on some requests. Size for the peak hour, use p90 lengths rather than means for KV-cache memory, and check that the batch the formula implies actually fits in memory (KV bytes per token × context × batch, Module 08). This model ignores memory, so treat its answer as a lower bound.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="cost">Cost and caching</h2>
+
+<h3>API pricing</h3>
+<p>Hosted APIs bill per token, with separate prices for input and output, and output usually costs several times more than input. Most providers now discount input tokens that hit a prompt cache (the KV-cache reuse from Module 08, sold back to you).</p>
+
+<div class="formula" data-name="API cost per request">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{req}}} = (\htmlClass{t2}{n_{\text{in}}} - \htmlClass{t3}{h})\,\htmlClass{t4}{p_{\text{in}}} + \htmlClass{t3}{h}\,\htmlClass{t5}{\rho}\,\htmlClass{t4}{p_{\text{in}}} + \htmlClass{t6}{n_{\text{out}}}\,\htmlClass{t7}{p_{\text{out}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{req}}\)</dt><dd>dollars per request</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{in}}\)</dt><dd>input tokens (system prompt + tools + history + user message)</dd></div>
+    <div data-t="t3"><dt>\(h\)</dt><dd>input tokens served from the provider's prompt cache</dd></div>
+    <div data-t="t4"><dt>\(p_{\text{in}}\)</dt><dd>price per input token (list prices are per 1M; divide by \(10^6\))</dd></div>
+    <div data-t="t5"><dt>\(\rho\)</dt><dd>cached-token price multiplier. Varies by provider and model, roughly 0.1–0.5. Some providers also charge extra to write the cache</dd></div>
+    <div data-t="t6"><dt>\(n_{\text{out}}\)</dt><dd>output tokens, including hidden reasoning tokens for reasoning models</dd></div>
+    <div data-t="t7"><dt>\(p_{\text{out}}\)</dt><dd>price per output token</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Pay full price for new input, a fraction for cached input, and the (higher) output price for everything generated. Worked example at illustrative prices of $3 / $15 per 1M tokens and \(\rho = 0.1\): an agent turn with 20K input tokens, 18K of them cached, and 500 output tokens costs $0.006 + $0.0054 + $0.0075 ≈ $0.019. Without the cache it costs $0.0675, 3.6× more.</p>
+  <p class="why"><b>Why it matters</b>Agents re-send the whole conversation every turn, so input usually dominates cost. Cache hits require a byte-identical prefix: put stable content (system prompt, tool definitions) first and anything that changes (timestamps, user IDs) last.</p>
+</div>
+
+<h3>Self-hosting</h3>
+<p>A GPU costs the same per hour whether it's busy or idle. The cost per token therefore depends entirely on how much traffic you keep it busy with.</p>
+
+<div class="formula" data-name="Self-hosted cost per 1M tokens and break-even volume">
+  <div class="tex">$$\htmlClass{t1}{c_{\text{1M}}} = \frac{\htmlClass{t2}{G}\,\htmlClass{t3}{P_{\text{GPU}}}}{3600\,\htmlClass{t4}{\Theta}} \times 10^6, \qquad \htmlClass{t5}{T^{*}} = \frac{\htmlClass{t6}{F}}{\htmlClass{t7}{\bar p_{\text{API}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(c_{\text{1M}}\)</dt><dd>dollars per million tokens served</dd></div>
+    <div data-t="t2"><dt>\(G\)</dt><dd>GPUs running (you pay for all of them, all hours)</dd></div>
+    <div data-t="t3"><dt>\(P_{\text{GPU}}\)</dt><dd>price per GPU-hour (cloud rental or amortized purchase + power)</dd></div>
+    <div data-t="t4"><dt>\(\Theta\)</dt><dd>tokens per second actually served across the fleet, averaged over the day including quiet hours</dd></div>
+    <div data-t="t5"><dt>\(T^{*}\)</dt><dd>monthly token volume above which self-hosting is cheaper</dd></div>
+    <div data-t="t6"><dt>\(F\)</dt><dd>fixed monthly cost of the minimum fleet plus the engineering time to run it</dd></div>
+    <div data-t="t7"><dt>\(\bar p_{\text{API}}\)</dt><dd>API price per token, blended across your input/output/cached mix</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Self-hosting is a fixed cost; the API is a variable cost. Below the break-even volume you're paying for idle GPUs. Above it, each extra token is nearly free until you need another GPU.</p>
+  <p class="why"><b>Why it matters</b>The comparison is only fair at equal quality. An open 8B model you can host is not interchangeable with a frontier API model. Run both through your task eval first; the cheaper option often loses on the slices that matter.</p>
+</div>
+
+<div id="w-break"></div>
+
+<h3>Caching layers</h3>
+<p>Three different caches get called "caching" in LLM systems. They save different amounts and fail in different ways.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 290" id="fig-cache"></svg>
+<figcaption>Caching layers in front of a model. An exact-match cache returns a stored response for an identical request. A semantic cache returns a stored response for a <em>similar</em> request, which saves the most and carries the most risk. The prefix (KV) cache inside the server skips recomputing the shared start of a prompt and still generates a fresh answer, so it's always safe.</figcaption></figure>
+
+<div class="pitfall"><b>Pitfall · semantic caches answer the wrong question</b>
+<p>"How do I cancel my order?" and "How do I un-cancel my order?" can land at cosine similarity above 0.9 with many embedding models, because the embedding mostly encodes topic and small words like "un" barely move it. A semantic cache will happily return the cancellation instructions. Other failures: answers that depend on the user (account balance, permissions) leaking across users, answers that depend on time (prices, stock), and answers that were wrong the first time getting replayed forever. Treat the cache as a classifier. Label a few hundred query pairs as same answer or different answer, pick the similarity threshold from measured precision, scope cache keys by user and permission, and set a TTL.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="observe">Observability</h2>
+
+<p>Once deployed, the system needs the same treatment as any production service, plus some LLM-specific signals. The core unit is a <strong>trace</strong>: one user request, with every model call, retrieval, and tool call inside it as nested spans. OpenTelemetry has (still-evolving) semantic conventions for generative-AI spans, and most LLM tracing tools follow them.</p>
+
+<table class="t">
+  <thead><tr><th>Record per call</th><th>Why you'll need it</th></tr></thead>
+  <tbody>
+    <tr><td>Prompt template version, model ID, sampling params</td><td>Attribute a regression to the change that caused it</td></tr>
+    <tr><td>Full prompt and completion (redacted, with a retention limit)</td><td>Debug individual failures; mine new eval items</td></tr>
+    <tr><td>Input, cached, output, and reasoning token counts</td><td>Cost dashboards per feature, per customer, per prompt version</td></tr>
+    <tr><td>TTFT, TPOT, end-to-end latency, queue time</td><td>Percentile dashboards and SLO alerts</td></tr>
+    <tr><td>Tool calls, retrieved doc IDs, errors, retries</td><td>Find which step of an agent or RAG pipeline failed</td></tr>
+    <tr><td>Guardrail decisions, judge scores on sampled traffic, user feedback</td><td>Quality monitoring between offline eval runs</td></tr>
+  </tbody>
+</table>
+
+<h3>Latency percentiles</h3>
+<figure class="fig"><div id="fig-pctl"></div>
+<figcaption>A simulated end-to-end latency distribution for 5,000 requests: most finish quickly, while a slow tail (long outputs, queueing behind long prompts, retries) stretches far to the right. The mean sits right of the median, pulled by the tail. Users who hit p99 experience the product as broken, and in an agent that makes 10 model calls per task, one of them usually lands near p90.</figcaption></figure>
+
+<p>Alert on percentiles, never on averages. And the tail compounds. If a task makes \(m\) independent calls, the chance that none of them exceeds the p99 is \(0.99^m\): 90% for 10 calls, 61% for 50. Agents feel slower than their per-call latency suggests.</p>
+
+<h3>Drift</h3>
+<p>The model didn't change, but the inputs did: a new customer with a different document format, a product launch that changes what users ask about, a different language mix. Watch input statistics (length, language, intent classifier output, embedding cluster shares) and output statistics (refusal rate, length, tool-call rate, sampled judge scores) against a reference window. The population stability index is a simple per-feature drift score:</p>
+
+<div class="formula" data-name="Population stability index">
+  <div class="tex">$$\htmlClass{t1}{\text{PSI}} = \sum_{\htmlClass{t2}{j}} (\htmlClass{t3}{a_j} - \htmlClass{t4}{e_j}) \,\ln\frac{\htmlClass{t3}{a_j}}{\htmlClass{t4}{e_j}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>PSI</dt><dd>drift score for one feature; 0 = identical distributions</dd></div>
+    <div data-t="t2"><dt>\(j\)</dt><dd>bins of the feature (length buckets, intent classes, topic clusters)</dd></div>
+    <div data-t="t3"><dt>\(a_j\)</dt><dd>fraction of <em>current</em> traffic in bin \(j\)</dd></div>
+    <div data-t="t4"><dt>\(e_j\)</dt><dd>fraction of the <em>reference</em> window (e.g. the period your eval set was sampled from) in bin \(j\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A symmetric KL divergence (Module 03) between this week's histogram and the reference histogram. Industry folklore reads below 0.1 as stable, 0.1–0.25 as worth a look, and above 0.25 as a real shift. Those thresholds are conventions, not statistics.</p>
+  <p class="why"><b>Why it matters</b>Drift tells you when your eval set has stopped representing traffic. When a slice grows, sample new eval items from it.</p>
+</div>
+
+<h3>Capturing feedback</h3>
+<p>Explicit feedback (thumbs, ratings) is sparse and skewed toward unhappy or very happy users. Implicit signals are denser: the user regenerated, edited the draft heavily, copied the answer, abandoned the session, escalated to a human, or re-asked the same question. Log them against the trace ID so a bad outcome can be traced back to the exact prompt, retrieval, and model version. Then sample the bad ones into the eval set.</p>
+
+<!-- ================================================================== -->
+<h2 id="online">Online evaluation, A/B tests, and guardrails</h2>
+
+<p>Offline evals decide what's worth shipping. Online tests decide whether it actually helped. The ladder, from least to most exposure:</p>
+<ol>
+  <li><strong>Shadow traffic.</strong> Run the new version on copies of real requests and log its outputs without showing them to anyone. Catches crashes, latency, cost, and format problems on the real input distribution.</li>
+  <li><strong>Canary.</strong> Serve 1–5% of traffic and watch guardrail metrics closely, with automatic rollback.</li>
+  <li><strong>A/B test.</strong> Randomize users (not requests, or one person sees both versions in one session) between control and treatment, at a split sized to reach the needed sample in a reasonable time.</li>
+</ol>
+
+<div class="grid2">
+  <div class="card"><div class="k">Primary metric</div><h4>The one thing you're trying to move</h4><p>Task completion rate, resolution without escalation, accepted-suggestion rate. Choose it before launch and compute the sample size it needs.</p></div>
+  <div class="card bad"><div class="k">Guardrail metrics</div><h4>Things that must not get worse</h4><p>p95 latency, error rate, cost per request, safety-flag rate, complaint rate. A win on the primary metric that breaks a guardrail doesn't ship.</p></div>
+</div>
+
+<p><strong>Minimum detectable effect (MDE)</strong> is the sample-size formula solved the other way: given the traffic you can get, what's the smallest true effect you'd reliably detect? \(\text{MDE} \approx 2.8\,\sqrt{2\sigma^2 / n}\) per arm at 5% significance and 80% power. For a 30% completion rate (\(\sigma^2 = 0.21\)) and 5,000 users per arm, that's about 2.6 points. If the change you're testing plausibly moves the metric by 1 point, this test can't see it. Run it longer, pick a more sensitive metric, or skip the test and rely on offline evidence.</p>
+
+<div class="pitfall"><b>Pitfall · peeking</b>
+<p>Checking the p-value every day and stopping the first time it dips below 0.05 inflates the false-positive rate far above 5%. Fix the duration in advance, or use a sequential testing method designed for continuous monitoring. Also watch for novelty effects (users try the new thing because it's new) and sample-ratio mismatch: if a 50/50 split delivers 50.8/49.2 on large traffic, the assignment is broken and the result is untrustworthy.</p>
+</div>
+
+<h3>Guardrails and safety checks in production</h3>
+<p>Guardrails are checks that run on every request, outside the model, and can block, rewrite, or escalate:</p>
+<table class="t">
+  <thead><tr><th>Where</th><th>Check</th><th>Typical implementation</th></tr></thead>
+  <tbody>
+    <tr><td>Input</td><td>Policy violations, prompt injection, PII in prompts</td><td>Small classifiers (e.g. Llama Guard, Inan et al., 2023), regexes for structured PII, injection heuristics on retrieved content</td></tr>
+    <tr><td>Output</td><td>Schema validity, unsupported claims, toxic content, leaked secrets or PII</td><td>JSON schema validation with retry, groundedness judge on sampled or high-risk traffic, pattern scanners</td></tr>
+    <tr><td>Actions</td><td>Agent tool calls with side effects</td><td>Allow-lists, argument validation, human confirmation for irreversible actions (Module 12)</td></tr>
+    <tr><td>Before release</td><td>Jailbreaks and known attacks</td><td>Red-team regression suite run like any other eval; grows with every incident</td></tr>
+  </tbody>
+</table>
+
+<p>A guardrail is a classifier, so evaluate it as one: precision and recall on a labelled set. Each check also adds latency and blocks some legitimate requests. A filter with 2% false positives on a million daily requests refuses 20,000 good ones. Put the guardrail's block rate on the dashboard next to the thing it protects.</p>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. pass@k, the numerically stable way</h3>
+<div class="code" data-lang="python" data-title="pass_at_k.py"><pre><code>
+import numpy as np
+from math import comb
+
+def pass_at_k(n: int, c: int, k: int) -&gt; float:
+    """Unbiased pass@k (Chen et al., 2021): n samples, c correct, k attempts."""
+    if n - c &lt; k:                       # every size-k subset contains a correct sample
+        return 1.0
+    # 1 - C(n-c, k) / C(n, k)  ==  1 - prod_{i=n-c+1}^{n} (1 - k / i)
+    return 1.0 - float(np.prod(1.0 - k / np.arange(n - c + 1, n + 1)))
+
+# per-problem estimates, then average over problems
+per_problem = [(200, 12), (200, 0), (200, 200), (200, 1), (200, 57)]   # (n, c)
+for k in (1, 10, 100):
+    print(f"pass@{k:&lt;3d} = {np.mean([pass_at_k(n, c, k) for n, c in per_problem]):.3f}")
+
+# sanity checks: matches the binomial form, and pass@1 is just c/n
+assert abs(pass_at_k(20, 3, 5) - (1 - comb(17, 5) / comb(20, 5))) &lt; 1e-12
+assert abs(pass_at_k(200, 12, 1) - 12 / 200) &lt; 1e-12
+</code></pre></div>
+
+<h3>2. Paired bootstrap CI for two models on the same items</h3>
+<div class="code" data-lang="python" data-title="paired_bootstrap.py"><pre><code>
+import numpy as np
+
+def paired_bootstrap(a, b, n_boot=10_000, seed=0, chunk=1_000):
+    """a, b: per-item scores for models A and B on the SAME items (0/1 or graded)."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    assert a.shape == b.shape
+    d = b - a                                    # keep each item's pair together
+    rng = np.random.default_rng(seed)
+    boots = []
+    for _ in range(n_boot // chunk):             # chunked so n_boot x n never sits in memory
+        idx = rng.integers(0, len(d), size=(chunk, len(d)))
+        boots.append(d[idx].mean(axis=1))
+    boots = np.concatenate(boots)
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return {"diff": d.mean(), "ci95": (lo, hi), "p_b_not_better": (boots &lt;= 0).mean(),
+            "se_paired": d.std(ddof=1) / np.sqrt(len(d)),
+            "se_unpaired": np.sqrt(a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b))}
+
+# simulate two correlated models on 500 items
+rng = np.random.default_rng(1)
+difficulty = rng.random(500)
+a = (difficulty &lt; 0.82).astype(int)
+b = ((difficulty &lt; 0.85) | (rng.random(500) &lt; 0.02)).astype(int)
+print(paired_bootstrap(a, b))
+</code></pre></div>
+
+<h3>3. A tiny eval harness: dataset → model → scorer → report</h3>
+<div class="code" data-lang="python" data-title="evalh.py"><pre><code>
+import hashlib, json, time
+import numpy as np
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")   # vLLM or any OpenAI-compatible server
+PROMPTS = {"v3": "Classify the support ticket into one of: billing, shipping, returns, other. Reply with the label only."}
+
+def load_dataset(path):
+    raw = open(path, "rb").read()
+    rows = [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+    return rows, hashlib.sha256(raw).hexdigest()[:12]          # content hash = dataset version
+
+def run_model(row, model, prompt_version):
+    t0 = time.perf_counter()
+    resp = client.chat.completions.create(
+        model=model, temperature=0, max_tokens=16,
+        messages=[{"role": "system", "content": PROMPTS[prompt_version]},
+                  {"role": "user", "content": row["input"]}])
+    return {"output": resp.choices[0].message.content or "",
+            "latency_s": time.perf_counter() - t0,
+            "tokens_in": resp.usage.prompt_tokens, "tokens_out": resp.usage.completion_tokens}
+
+def score(row, out):                                            # swap in unit tests or a judge per task
+    return float(out["output"].strip().lower() == row["expected"].lower())
+
+def report(results):
+    slices = {}
+    for r in results:
+        slices.setdefault("ALL", []).append(r["score"])
+        slices.setdefault(r["slice"], []).append(r["score"])
+    for name, xs in sorted(slices.items()):
+        p, n = float(np.mean(xs)), len(xs)
+        print(f"{name:18s} n={n:5d}  acc={p:.3f} ± {1.96 * np.sqrt(p * (1 - p) / n):.3f}")
+
+if __name__ == "__main__":
+    rows, ds_hash = load_dataset("tickets_golden_v2.jsonl")    # {"id","input","expected","slice"} per line
+    meta = {"dataset": ds_hash, "model": "Qwen/Qwen2.5-7B-Instruct", "prompt": "v3", "scorer": "exact-v1"}
+    results = []
+    with open(f"run-{ds_hash}-{meta['prompt']}-{int(time.time())}.jsonl", "w") as f:
+        for row in rows:
+            out = run_model(row, meta["model"], meta["prompt"])
+            rec = {**meta, "id": row["id"], "slice": row["slice"], **out, "score": score(row, out)}
+            results.append(rec)
+            f.write(json.dumps(rec) + "\n")                    # one row per (item, run): diffable later
+    report(results)
+</code></pre></div>
+
+<h3>4. Benchmark a server: latency percentiles and goodput</h3>
+<div class="code" data-lang="bash" data-title="vLLM serving benchmark"><pre><code>
+# terminal 1: serve (prefix caching is on by default in vLLM's V1 engine)
+vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 8192
+
+# terminal 2: synthetic load matching your traffic shape, reporting p50/p95/p99 and goodput (targets in ms)
+vllm bench serve --backend vllm --model Qwen/Qwen2.5-7B-Instruct \
+  --dataset-name random --random-input-len 1500 --random-output-len 300 \
+  --num-prompts 1000 --request-rate 8 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,95,99 \
+  --goodput ttft:1000 tpot:40
+
+# sweep the request rate to find where goodput stops tracking throughput
+for r in 2 4 8 16 32; do
+  vllm bench serve --backend vllm --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset-name random --random-input-len 1500 --random-output-len 300 \
+    --num-prompts 600 --request-rate $r --goodput ttft:1000 tpot:40 \
+    --save-result --result-filename rate-$r.json
+done
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="llama.cpp and lm-evaluation-harness"><pre><code>
+# single-stream prompt processing (pp) and generation (tg) speed, 5 repetitions, markdown table
+llama-bench -m model-Q4_K_M.gguf -p 512,2048 -n 128 -r 5 -o md
+
+# public benchmarks with a standard harness (same prompts and parsers as published numbers)
+pip install "lm-eval[vllm]"
+lm_eval --model vllm --model_args pretrained=Qwen/Qwen2.5-7B-Instruct --tasks gsm8k --batch_size auto
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have: (1) a golden set of at least 300 items from a real task, with slice tags and a content hash; (2) a harness run for two prompt or model variants, with per-slice accuracy ± 95% CI and a paired bootstrap CI on the difference; (3) a judge calibrated against 100 of your own labels, with its kappa and confusion matrix; (4) a <code>vllm bench serve</code> sweep showing throughput and goodput against request rate, and a GPU count from the capacity formula that you can check against the sweep's knee.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="13-main" data-title="Check yourself · Evaluation &amp; production">
+  <div class="q" data-answer="1"><p>A model scores 80% on a 100-item eval. What is the approximate 95% confidence interval?</p>
+    <ol><li>80% ± 0.8 points</li><li>80% ± 7.8 points</li><li>80% ± 4 points</li><li>80% ± 16 points</li></ol>
+    <div class="explain">SE = √(0.8 × 0.2 / 100) = 0.04. The 95% CI is ± 1.96 × 0.04 ≈ ± 0.078, i.e. [72%, 88%]. ± 4 points is one standard error, not a 95% interval. A prompt change that moves this eval from 80 to 84 is well inside the noise.</div></div>
+  <div class="q" data-answer="3"><p>Model P has pass@1 = 0.40 and pass@10 = 0.45. Model Q has pass@1 = 0.30 and pass@10 = 0.75. Your product runs the unit tests on 10 samples and shows the first passing one. Which is better, and why?</p>
+    <ol><li>P, because pass@1 is the standard metric</li><li>P, because its samples are more consistent</li><li>They're equivalent: the averages are similar</li><li>Q, because with a verifier choosing among 10 samples, what matters is how many problems have <em>some</em> correct sample</li></ol>
+    <div class="explain">P is reliably right on ~40% of problems and almost never right on the rest. Q is right sometimes on many more problems. With a verifier, Q solves 75% of tasks vs P's 45%. Without a verifier (one shot, shown directly to a user), P would win.</div></div>
+  <div class="q" data-answer="0"><p>Your pairwise LLM judge prefers the answer shown first 62% of the time, even on pairs where both answers are identical. What's the standard mitigation?</p>
+    <ol><li>Judge every pair in both orders and count a win only when both orders agree; otherwise record a tie</li><li>Always put the baseline model's answer first</li><li>Switch to a 1–10 scale</li><li>Lower the judge's temperature to 0</li></ol>
+    <div class="explain">Position bias is systematic, so temperature doesn't remove it, and fixing the order just bakes the bias in favour of whichever slot you chose. Swapping and requiring consistency cancels it, and the rate of inconsistent verdicts tells you how often the judge is effectively guessing.</div></div>
+  <div class="q" data-answer="2"><p>Peak load is 20 requests/s, each with 2,000 input tokens and 250 output tokens. Per GPU: prefill 20,000 tok/s, decode 4,000 tok/s at your TPOT target. You plan for 70% utilization. How many GPUs?</p>
+    <ol><li>2</li><li>4</li><li>5</li><li>8</li></ol>
+    <div class="explain">GPU-seconds per request = 2000/20000 + 250/4000 = 0.100 + 0.0625 = 0.1625. Busy GPUs = 20 × 0.1625 = 3.25. Divided by 0.7 = 4.64, rounded up to 5. Four would run at 81%, leaving little headroom for bursts or a replica failure. Note that prefill is 62% of the GPU time here: prefix caching would be the first optimization to try.</div></div>
+  <div class="q" data-answer="3"><p>A request has TTFT = 300 ms and TPOT = 30 ms and produces 401 output tokens. Roughly how long until the last token arrives?</p>
+    <ol><li>0.33 s</li><li>9.0 s</li><li>12.0 s</li><li>12.3 s</li></ol>
+    <div class="explain">E2E ≈ TTFT + (n_out − 1) × TPOT = 0.3 + 400 × 0.030 = 12.3 s. For long outputs TPOT dominates, and shaving 100 ms off TTFT barely changes total latency. For a chat UI that streams, though, TTFT is what the user notices first.</div></div>
+  <div class="q" data-answer="1"><p>Models A and B are run on the same 500 items: 82% vs 85%. Two separate 95% CIs overlap. Why can a paired bootstrap still show B is better?</p>
+    <ol><li>The bootstrap always produces narrower intervals</li><li>The models get mostly the same items right and wrong, so shared difficulty cancels in the per-item difference and only the disagreements add variance</li><li>The paired test uses a lower confidence level</li><li>Overlapping intervals never indicate anything</li></ol>
+    <div class="explain">Var(B − A) = Var(A) + Var(B) − 2 Cov(A, B). Positive covariance (both stumble on the same hard items) shrinks the variance of the difference. The unpaired comparison ignores that covariance and is far too conservative. Overlapping CIs aren't a valid test of a difference even for independent samples.</div></div>
+  <div class="q" data-answer="2"><p>You want to add a semantic cache (embedding similarity ≥ 0.92 returns the stored answer) in front of a support bot. What should you do before enabling it?</p>
+    <ol><li>Nothing: cosine 0.92 means the questions are equivalent</li><li>Raise the threshold to 0.99 so it can't make mistakes</li><li>Label a few hundred query pairs as same or different answer, measure false-hit precision at candidate thresholds, and scope keys by user/permissions with a TTL</li><li>Only cache answers that users gave a thumbs-up</li></ol>
+    <div class="explain">Similarity measures topic closeness, not answer equivalence ("cancel" vs "un-cancel"). A very high threshold reduces false hits but can still produce them, and it kills the hit rate. The only way to know is to measure the cache as a classifier. Thumbs-up answers can still be personalized or go stale.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, widget, fmtNum, fmtSI, rng, palette, clamp } = C;
+
+  /* small helper: a slider that moves on a log10 scale */
+  function logSlider(parent, o) {
+    return slider(parent, { label: o.label, min: Math.log10(o.min), max: Math.log10(o.max), step: o.step || 0.01, value: Math.log10(o.value), fmt: v => o.fmt(10 ** v), onInput: o.onInput });
+  }
+  const money = v => {
+    const a = Math.abs(v);
+    if (a >= 1e6) return "$" + fmtNum(v / 1e6, 2) + "M";
+    if (a >= 1e4) return "$" + fmtNum(v / 1e3, 1) + "K";
+    if (a >= 100) return "$" + fmtNum(v, 0);
+    if (a >= 1) return "$" + fmtNum(v, 2);
+    if (a >= 0.01) return "$" + v.toFixed(3);
+    return "$" + v.toFixed(5);
+  };
+  const pct = (v, d) => (v * 100).toFixed(d == null ? 1 : d) + "%";
+
+  /* ---------------------------------------------------------- taxonomy figure */
+  (function () {
+    const s = document.getElementById("fig-tax");
+    const phases = ["Select a model", "Build & iterate", "Pre-release gate", "In production"];
+    const x0 = 290, pw = 140, y0 = 66, rh = 40;
+    const px = p => x0 + p * pw;
+    phases.forEach((p, i) => {
+      s.appendChild(svg("text", { x: px(i) + pw / 2, y: 34, "text-anchor": "middle", "font-size": 12.5, "font-weight": 600, fill: palette.ink, text: p }));
+      s.appendChild(svg("line", { x1: px(i), x2: px(i), y1: 44, y2: y0 + 7 * rh - 6, stroke: palette.line, "stroke-dasharray": "3 3" }));
+    });
+    s.appendChild(svg("line", { x1: px(4), x2: px(4), y1: 44, y2: y0 + 7 * rh - 6, stroke: palette.line, "stroke-dasharray": "3 3" }));
+    s.appendChild(svg("text", { x: 20, y: 34, "font-size": 11, class: "mono", fill: palette.muted, text: "EVAL TYPE · QUESTION IT ANSWERS" }));
+    const G = ["rgba(26,122,82,.75)", "rgba(26,122,82,.16)"], Gd = ["rgba(154,123,34,.8)", "rgba(154,123,34,.18)"], Br = ["rgba(176,67,46,.8)", "rgba(176,67,46,.15)"], Bl = ["rgba(47,93,138,.8)", "rgba(47,93,138,.15)"];
+    const rows = [
+      ["Public benchmarks", "Is this model in the right league?", G, 0, 1, "MMLU-Pro, GPQA…"],
+      ["Task eval (golden set)", "Does it do our job, on every slice?", G, 0, 4, "200–2,000 labelled items from your own traffic, scored automatically"],
+      ["LLM-as-judge", "Can we grade open-ended output at scale?", G, 1, 4, "rubric prompts, calibrated against human labels"],
+      ["Regression suite", "Did this change break anything known?", Gd, 1, 3, "every prompt / model / config change, in CI"],
+      ["Safety / red-team", "Can it be pushed into doing harm?", Br, 1.6, 4, "jailbreak + injection suites, human red teams"],
+      ["A/B test", "Do users do better with B than A?", Bl, 3, 4, "primary + guardrails"],
+      ["Monitoring & feedback", "Is it still working today?", Bl, 3, 4, "traces, judges, thumbs"]
+    ];
+    rows.forEach(([name, q, col, a, b, inside], i) => {
+      const y = y0 + i * rh;
+      s.appendChild(svg("text", { x: 20, y: y + 11, "font-size": 12.5, "font-weight": 600, fill: palette.ink, text: name }));
+      s.appendChild(svg("text", { x: 20, y: y + 25, "font-size": 10.5, fill: palette.muted, text: q }));
+      s.appendChild(svg("rect", { x: px(a) + 3, y: y + 1, width: px(b) - px(a) - 6, height: 26, rx: 5, fill: col[1], stroke: col[0], "stroke-width": 1 }));
+      s.appendChild(svg("text", { x: px(a) + 12, y: y + 18, "font-size": 10.5, fill: palette.ink, text: inside }));
+    });
+    const ly = y0 + 7 * rh + 20;
+    [["offline", G], ["regression gate", Gd], ["safety", Br], ["online", Bl]].forEach(([t, c], i) => {
+      const x = x0 + i * 140;
+      s.appendChild(svg("rect", { x, y: ly - 10, width: 12, height: 12, rx: 2, fill: c[1], stroke: c[0] }));
+      s.appendChild(svg("text", { x: x + 18, y: ly, "font-size": 11.5, fill: palette.muted, text: t }));
+    });
+  })();
+
+  /* ---------------------------------------------------------- pass@k widget */
+  (function () {
+    const w = widget("w-passk", { title: "pass@k: unbiased estimator vs the naive plug-in", kicker: "Interactive", note: "Green: the subset estimator \\(1-\\binom{n-c}{k}/\\binom{n}{k}\\) for this one problem. Brick dashed: the plug-in \\(1-(1-c/n)^k\\). The last tile averages each estimator over every outcome \\(c \\sim \\text{Binomial}(n, p)\\) with \\(p = c/n\\), the bias you'd see averaged over many problems with that true pass rate. The unbiased estimator's average is exactly \\(1-(1-p)^k\\)." });
+    const sn = slider(w.controls, { label: "Samples per problem n", min: 1, max: 200, step: 1, value: 20, fmt: v => String(v), onInput: onN });
+    const sc = slider(w.controls, { label: "Correct samples c", min: 0, max: 20, step: 1, value: 3, fmt: v => String(v), onInput: draw });
+    const sk = slider(w.controls, { label: "Attempts k", min: 1, max: 20, step: 1, value: 5, fmt: v => String(v), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [1, 20], y: [0, 1.02], xlabel: "k (attempts)", ylabel: "pass@k", yfmt: v => Math.round(v * 100) + "%", yticks: [0, 0.2, 0.4, 0.6, 0.8, 1] });
+    const set = stats(w.body, [{ key: "p1", label: "pass@1 = c/n" }, { key: "ub", label: "Unbiased pass@k" }, { key: "pi", label: "Plug-in estimate" }, { key: "bias", label: "Plug-in bias, on average" }]);
+    function passK(n, c, k) { if (n - c < k) return 1; let p = 1; for (let i = n - c + 1; i <= n; i++) p *= 1 - k / i; return 1 - p; }
+    const plug = (n, c, k) => 1 - Math.pow(1 - c / n, k);
+    function expPlug(n, p, k) { // E over c ~ Binom(n, p) of the plug-in
+      if (p <= 0) return 0; if (p >= 1) return 1;
+      let pmf = Math.pow(1 - p, n), e = 0;
+      for (let j = 0; j <= n; j++) { e += pmf * plug(n, j, k); pmf *= (n - j) / (j + 1) * p / (1 - p); }
+      return e;
+    }
+    function onN() {
+      const n = sn.value;
+      sc.input.max = n; sk.input.max = n;
+      if (sc.value > n) sc.value = n;
+      if (sk.value > n) sk.value = n;
+      draw();
+    }
+    function draw() {
+      const n = sn.value, c = Math.min(sc.value, n), k = Math.min(sk.value, n);
+      P.x = [1, Math.max(n, 2)];
+      const ks = Array.from({ length: n }, (_, i) => i + 1);
+      const ub = ks.map(kk => [kk, passK(n, c, kk)]), pl = ks.map(kk => [kk, plug(n, c, kk)]);
+      P.draw([
+        { points: ub, color: palette.green, width: 2.5, label: "unbiased: 1 − C(n−c,k)/C(n,k)", dots: n <= 40 },
+        { points: pl, color: palette.brick, dash: "5 4", width: 2, label: "plug-in: 1 − (1 − c/n)^k" },
+        { vline: k, color: palette.ink, dash: "3 3" },
+        { marker: [k, passK(n, c, k)], color: palette.green },
+        { marker: [k, plug(n, c, k)], color: palette.brick }
+      ]);
+      const u = passK(n, c, k), q = plug(n, c, k), p = c / n;
+      const truth = 1 - Math.pow(1 - p, k), eb = expPlug(n, p, k) - truth;
+      set("p1", pct(p), null, c + " of " + n + " samples passed");
+      set("ub", pct(u), "good", n - c < k ? "n − c < k: every k-subset passes" : "k = " + k);
+      set("pi", pct(q), Math.abs(q - u) > 0.02 ? "warn" : null, (q - u >= 0 ? "+" : "") + ((q - u) * 100).toFixed(1) + " pts vs unbiased");
+      set("bias", (eb >= 0 ? "+" : "") + (eb * 100).toFixed(1) + " pts", Math.abs(eb) > 0.02 ? "bad" : null, "vs true " + pct(truth) + " at p = " + p.toFixed(2));
+    }
+    onN();
+  })();
+
+  /* ---------------------------------------------------------- judge swap figure */
+  (function () {
+    const s = document.getElementById("fig-judge");
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arrJ", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.muted }))); s.appendChild(defs);
+    const box = (x, y, w, h, title, lines, fill, stroke) => {
+      s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 9, fill: fill || "#fff", stroke: stroke || "rgba(28,27,25,.25)", "stroke-width": 1.2 }));
+      s.appendChild(svg("text", { x: x + 14, y: y + 22, "font-size": 13, "font-weight": 600, fill: palette.ink, text: title }));
+      (lines || []).forEach((t, i) => s.appendChild(svg("text", { x: x + 14, y: y + 42 + i * 15, "font-size": 11.5, fill: palette.muted, text: t })));
+    };
+    const arrow = (x1, y1, x2, y2) => s.appendChild(svg("path", { d: `M${x1},${y1} C ${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2 - 4},${y2}`, fill: "none", stroke: palette.muted, "stroke-width": 1.3, "marker-end": "url(#arrJ)" }));
+    box(16, 92, 176, 84, "One comparison", ["question + rubric", "answer A (model 1)", "answer B (model 2)"], "#fbfaf7");
+    box(252, 22, 250, 90, "Judge call 1", ["slot 1: answer A", "slot 2: answer B", "→ verdict v₁ ∈ {A, B, tie}"]);
+    box(252, 156, 250, 90, "Judge call 2 (swapped)", ["slot 1: answer B", "slot 2: answer A", "→ verdict v₂ ∈ {A, B, tie}"]);
+    arrow(192, 120, 252, 67); arrow(192, 148, 252, 201);
+    arrow(502, 67, 560, 110); arrow(502, 201, 560, 158);
+    s.appendChild(svg("rect", { x: 560, y: 40, width: 284, height: 188, rx: 9, fill: "rgba(26,122,82,.06)", stroke: "rgba(26,122,82,.5)", "stroke-width": 1.2 }));
+    s.appendChild(svg("text", { x: 576, y: 64, "font-size": 13, "font-weight": 600, fill: palette.ink, text: "Combine" }));
+    const rowsT = [["v₁ = A,  v₂ = A", "A wins", palette.green], ["v₁ = B,  v₂ = B", "B wins", palette.green], ["v₁ ≠ v₂", "tie: order decided", palette.brick], ["either is tie", "tie", palette.muted]];
+    rowsT.forEach(([a, b, c], i) => {
+      const y = 94 + i * 30;
+      s.appendChild(svg("text", { x: 576, y, "font-size": 12, class: "mono", fill: palette.ink, text: a }));
+      s.appendChild(svg("text", { x: 700, y, "font-size": 12, fill: c, "font-weight": 600, text: b }));
+      if (i < 3) s.appendChild(svg("line", { x1: 576, x2: 828, y1: y + 11, y2: y + 11, stroke: palette.line }));
+    });
+    s.appendChild(svg("text", { x: 16, y: 262, "font-size": 11.5, fill: palette.faint, text: "Track the flip rate (share of v₁ ≠ v₂). It doubles the judge cost and buys you a direct measurement of position bias." }));
+  })();
+
+  /* ---------------------------------------------------------- CI width widget */
+  (function () {
+    const w = widget("w-ci", { title: "How wide is the error bar?", kicker: "Calculator", note: "Solid green: normal-approximation 95% half-width \\(1.96\\sqrt{p(1-p)/n}\\). Dashed: Wilson interval half-width (better for small \\(n\\) or \\(p\\) near 0 or 1). Faint: worst case \\(p = 0.5\\). MDE is the smallest true difference two <em>independent</em> runs of this size would detect 80% of the time at 5% significance. A paired comparison does better." });
+    const sp = slider(w.controls, { label: "Accuracy p", min: 0.5, max: 0.99, step: 0.01, value: 0.8, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const snl = logSlider(w.controls, { label: "Eval items n", min: 20, max: 20000, value: 100, fmt: v => fmtNum(snap(v), 0), onInput: draw });
+    function snap(v) { return v < 100 ? Math.round(v) : v < 1000 ? Math.round(v / 10) * 10 : Math.round(v / 100) * 100; }
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [20, 20000], y: [0, 25], logx: true, xticks: [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000], xfmt: v => v >= 1000 ? (v / 1000) + "K" : String(v), yfmt: v => "±" + v, xlabel: "eval items n (log scale)", ylabel: "95% half-width (points)" });
+    const set = stats(w.body, [{ key: "se", label: "Standard error" }, { key: "ci", label: "95% CI" }, { key: "n2", label: "n for ±2 points" }, { key: "mde", label: "MDE, two runs" }]);
+    const half = (p, n) => 196 * Math.sqrt(p * (1 - p) / n);
+    function wilson(p, n) { const z = 1.96, d = 1 + z * z / n, c = (p + z * z / (2 * n)) / d, h = z / d * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)); return [c - h, c + h]; }
+    function draw() {
+      const p = sp.value, n = snap(10 ** snl.value);
+      P.draw([
+        { fn: x => half(0.5, x), color: palette.faint, width: 1.2, label: "p = 50% (worst case)" },
+        { fn: x => half(p, x), color: palette.green, width: 2.5, label: "normal approx, p = " + Math.round(p * 100) + "%" },
+        { fn: x => { const [a, b] = wilson(p, x); return (b - a) * 50; }, color: palette.blue, dash: "5 4", width: 2, label: "Wilson" },
+        { hline: 2, color: palette.gold, label: "±2 points" },
+        { marker: [n, half(p, n)], color: palette.brick, label: "n = " + fmtNum(n, 0) + " → ±" + half(p, n).toFixed(1) }
+      ]);
+      const se = Math.sqrt(p * (1 - p) / n), [wl, wh] = wilson(p, n);
+      set("se", (se * 100).toFixed(2) + " pts", null, "√(p(1−p)/n)");
+      set("ci", Math.max(0, (p - 1.96 * se) * 100).toFixed(1) + "–" + Math.min(100, (p + 1.96 * se) * 100).toFixed(1) + "%", half(p, n) > 5 ? "bad" : half(p, n) > 2 ? "warn" : "good", "Wilson " + (wl * 100).toFixed(1) + "–" + (wh * 100).toFixed(1) + "%");
+      set("n2", fmtNum(Math.ceil(1.96 * 1.96 * p * (1 - p) / 0.0004), 0), null, "±1 point needs " + fmtNum(Math.ceil(1.96 * 1.96 * p * (1 - p) / 0.0001), 0));
+      set("mde", (2.8 * Math.sqrt(2 * p * (1 - p) / n) * 100).toFixed(1) + " pts", null, "80% power, α = 0.05, unpaired");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- paired bootstrap widget */
+  (function () {
+    const w = widget("w-boot", { title: "Is model B really better? A paired bootstrap", kicker: "Simulation", note: "Each run simulates one eval: per-item correctness for A and B with the chosen true accuracies. <b>Item overlap</b> is how often both models face the same draw of difficulty on an item. Real models trained on similar data usually overlap a lot. The histogram is 1,500 bootstrap resamples of the paired differences. The brick dashed curve is the sampling distribution you'd assume if you treated A and B as independent." });
+    const sn = slider(w.controls, { label: "Shared items n", min: 50, max: 2000, step: 50, value: 500, fmt: v => String(v), onInput: draw });
+    const sa = slider(w.controls, { label: "True accuracy A", min: 0.5, max: 0.98, step: 0.01, value: 0.82, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const sb = slider(w.controls, { label: "True accuracy B", min: 0.5, max: 0.98, step: 0.01, value: 0.85, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const so = slider(w.controls, { label: "Item overlap", min: 0, max: 0.95, step: 0.05, value: 0.8, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    let seed = 3;
+    const btns = el("div", { class: "btnrow" });
+    btns.appendChild(el("button", { class: "btn", text: "Re-run the eval (new seed)", onclick: () => { seed++; draw(); } }));
+    w.controls.appendChild(btns);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 280, x: [-0.1, 0.1], y: [0, 1], yticks: [], xlabel: "accuracy(B) − accuracy(A), bootstrap resamples", margin: { l: 20 }, xfmt: v => (v > 0 ? "+" : "") + (Math.abs(v) < 1e-9 ? "0" : (v * 100).toFixed(Math.abs(v * 100) % 1 > 1e-6 ? 1 : 0)) });
+    const set = stats(w.body, [{ key: "obs", label: "Observed (this run)" }, { key: "pci", label: "Paired 95% CI" }, { key: "uci", label: "Unpaired 95% CI" }, { key: "p", label: "Resamples with B ≤ A" }]);
+    function draw() {
+      const n = sn.value, pA = sa.value, pB = sb.value, r = so.value;
+      const R = rng(1000 + seed);
+      const d = new Int8Array(n); let ca = 0, cb = 0, disc = 0;
+      for (let i = 0; i < n; i++) {
+        const uA = R(), uB = R() < r ? uA : R();
+        const a = uA < pA ? 1 : 0, b = uB < pB ? 1 : 0;
+        ca += a; cb += b; d[i] = b - a; if (a !== b) disc++;
+      }
+      const accA = ca / n, accB = cb / n, diff = accB - accA;
+      const B = 1500, R2 = rng(77 + seed), boots = new Float64Array(B);
+      for (let t = 0; t < B; t++) { let sum = 0; for (let i = 0; i < n; i++) sum += d[Math.floor(R2() * n)]; boots[t] = sum / n; }
+      const sorted = Array.from(boots).sort((x, y) => x - y);
+      const lo = sorted[Math.floor(0.025 * B)], hi = sorted[Math.floor(0.975 * B)];
+      const pLe = sorted.filter(v => v <= 0).length / B;
+      const seU = Math.sqrt(accA * (1 - accA) / n + accB * (1 - accB) / n) || 1e-3;
+      const span = Math.max(4.5 * seU, 0.02);
+      const x0 = diff - span, x1 = diff + span;
+      const nb = 45, bw = (x1 - x0) / nb, counts = new Array(nb).fill(0);
+      boots.forEach(v => { const j = Math.floor((v - x0) / bw); if (j >= 0 && j < nb) counts[j]++; });
+      const dens = counts.map(c => c / (B * bw));
+      const normU = x => Math.exp(-0.5 * ((x - diff) / seU) ** 2) / (seU * Math.sqrt(2 * Math.PI));
+      const ymax = Math.max(...dens, normU(diff)) * 1.12;
+      const step = [[x0, 0]];
+      dens.forEach((v, j) => { step.push([x0 + j * bw, v]); step.push([x0 + (j + 1) * bw, v]); });
+      step.push([x1, 0]);
+      P.x = [x0, x1]; P.y = [0, ymax];
+      P.draw([
+        { band: [lo, hi], color: palette.green, opacity: 0.1 },
+        { points: step, color: palette.green, width: 1.5, area: true, areaOpacity: 0.35 },
+        { fn: normU, color: palette.brick, dash: "5 4", width: 1.8, label: "unpaired assumption" },
+        { vline: 0, color: palette.ink, dash: "2 0", width: 1.4, label: "no difference" },
+        { vline: diff, color: palette.green, dash: "4 3", width: 1.2 }
+      ]);
+      const sign = v => (v >= 0 ? "+" : "") + (v * 100).toFixed(1);
+      set("obs", sign(diff) + " pts", null, "A " + pct(accA) + " · B " + pct(accB) + " · " + disc + " disagreements");
+      set("pci", "[" + sign(lo) + ", " + sign(hi) + "]", lo > 0 ? "good" : hi < 0 ? "bad" : "warn", lo > 0 ? "excludes 0: B is better" : hi < 0 ? "excludes 0: A is better" : "includes 0: not shown");
+      const uLo = diff - 1.96 * seU, uHi = diff + 1.96 * seU;
+      set("uci", "[" + sign(uLo) + ", " + sign(uHi) + "]", uLo > 0 ? "good" : "warn", "width " + ((uHi - uLo) * 100).toFixed(1) + " vs " + ((hi - lo) * 100).toFixed(1) + " paired");
+      set("p", pct(pLe), pLe < 0.025 ? "good" : pLe < 0.1 ? "warn" : "bad", "≈ one-sided p-value");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- harness figure */
+  (function () {
+    const s = document.getElementById("fig-harness");
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arrH", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.ink }))); s.appendChild(defs);
+    const stages = [
+      ["Dataset", ["JSONL: id, input,", "expected, slice", "version = content hash"], palette.green],
+      ["System under test", ["model ID + params", "prompt version", "retrieval / tools"], palette.blue],
+      ["Scorer", ["exact / tests / schema", "or calibrated judge", "scorer version"], palette.gold],
+      ["Results store", ["one row per", "(item, run) with all", "versions + latency, cost"], palette.plum],
+      ["Report", ["accuracy ± CI", "per slice; paired diff", "vs baseline run"], palette.brick]
+    ];
+    const bw = 150, gap = 21, y = 30, h = 112;
+    stages.forEach(([t, lines, c], i) => {
+      const x = 12 + i * (bw + gap);
+      s.appendChild(svg("rect", { x, y, width: bw, height: h, rx: 9, fill: "#fff", stroke: "rgba(28,27,25,.25)", "stroke-width": 1.2 }));
+      s.appendChild(svg("rect", { x, y, width: bw, height: 5, rx: 2, fill: c }));
+      s.appendChild(svg("text", { x: x + bw / 2, y: y + 30, "text-anchor": "middle", "font-size": 13, "font-weight": 600, fill: palette.ink, text: t }));
+      lines.forEach((l, k) => s.appendChild(svg("text", { x: x + bw / 2, y: y + 54 + k * 16, "text-anchor": "middle", "font-size": 11, fill: palette.muted, text: l })));
+      if (i < stages.length - 1) s.appendChild(svg("line", { x1: x + bw + 2, x2: x + bw + gap - 2, y1: y + h / 2, y2: y + h / 2, stroke: palette.ink, "stroke-width": 1.4, "marker-end": "url(#arrH)" }));
+    });
+    s.appendChild(svg("path", { d: `M${12 + 4 * (bw + gap) + bw / 2},${y + h + 4} C ${12 + 4 * (bw + gap) + bw / 2},${y + h + 40} ${12 + bw / 2},${y + h + 40} ${12 + bw / 2},${y + h + 6}`, fill: "none", stroke: palette.muted, "stroke-width": 1.2, "stroke-dasharray": "4 3", "marker-end": "url(#arrH)" }));
+    s.appendChild(svg("text", { x: 430, y: y + h + 58, "text-anchor": "middle", "font-size": 11.5, fill: palette.muted, text: "failures found in reports and production traces become new dataset items (new hash)" }));
+  })();
+
+  /* ---------------------------------------------------------- capacity planner */
+  (function () {
+    const w = widget("w-cap", { title: "Capacity planner", kicker: "Calculator", note: "First-order model: prefill and decode share each GPU's time, decode step time = \\(t_{\\min} + B/R_{\\max}\\) at batch \\(B\\). Defaults are <em>illustrative</em>, roughly an 8B model in bf16 on one H100-class GPU. Measure your own \\(R_{\\text{pre}}\\), \\(R_{\\max}\\), and \\(t_{\\min}\\) with <code>vllm bench</code>. Ignores KV-cache memory limits, queueing delay, and prefix-cache hits (subtract cached tokens from input length to approximate them)." });
+    const sl = logSlider(w.controls, { label: "Peak requests/s λ", min: 0.5, max: 200, value: 10, fmt: v => fmtNum(v, v < 10 ? 1 : 0), onInput: draw });
+    const si = logSlider(w.controls, { label: "Avg input tokens", min: 100, max: 32000, value: 1500, fmt: v => fmtNum(Math.round(v / 10) * 10, 0), onInput: draw });
+    const so = logSlider(w.controls, { label: "Avg output tokens", min: 16, max: 4000, value: 300, fmt: v => fmtNum(Math.round(v), 0), onInput: draw });
+    const sp = logSlider(w.controls, { label: "Prefill tok/s per GPU", min: 2000, max: 100000, value: 20000, fmt: v => fmtSI(Math.round(v / 100) * 100, 1), onInput: draw });
+    const sd = logSlider(w.controls, { label: "Decode tok/s per GPU (saturated)", min: 500, max: 20000, value: 5000, fmt: v => fmtSI(Math.round(v / 50) * 50, 1), onInput: draw });
+    const st = slider(w.controls, { label: "Single-stream TPOT t_min", min: 3, max: 60, step: 1, value: 8, fmt: v => v + " ms", onInput: draw });
+    const sT = slider(w.controls, { label: "TPOT target", min: 10, max: 200, step: 1, value: 40, fmt: v => v + " ms", onInput: draw });
+    const su = slider(w.controls, { label: "Target utilization u", min: 0.3, max: 0.95, step: 0.05, value: 0.7, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const sc = slider(w.controls, { label: "$ per GPU-hour", min: 0.5, max: 10, step: 0.1, value: 2.5, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 270, x: [0.5, 200], y: [0.8, 1000], logx: true, logy: true, xticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200], xfmt: v => String(v), yfmt: v => String(v), xlabel: "peak requests per second (log)", ylabel: "GPUs needed (log)" });
+    const set = stats(w.body, [{ key: "g", label: "GPUs needed" }, { key: "split", label: "GPU time per request" }, { key: "lat", label: "Latency estimate" }, { key: "c1m", label: "Cost per 1M tokens" }, { key: "creq", label: "Cost per request" }, { key: "month", label: "Fleet cost / month" }]);
+    function draw() {
+      const lam = 10 ** sl.value, nin = Math.round(10 ** si.value / 10) * 10, nout = Math.round(10 ** so.value);
+      const Rp = 10 ** sp.value, Rmax = 10 ** sd.value, tmin = st.value / 1000, tslo = sT.value / 1000, u = su.value, price = sc.value;
+      if (tslo <= tmin) {
+        P.draw([{ text: [1, 10], label: "TPOT target is below the single-stream step time: unreachable at any batch size.", color: palette.brick }]);
+        ["g", "split", "lat", "c1m", "creq", "month"].forEach(k => set(k, "—", "bad", "infeasible"));
+        return;
+      }
+      const Rdec = Rmax * (1 - tmin / tslo), Bmax = (tslo - tmin) * Rmax;
+      const tPre = nin / Rp, tDec = nout / Rdec, gsec = tPre + tDec;
+      const gpus = l => Math.max(1, Math.ceil(l * gsec / u));
+      const G = gpus(lam);
+      const maxG = gpus(200);
+      P.y = [0.8, Math.max(10, 10 ** Math.ceil(Math.log10(maxG * 1.5)))];
+      P.draw([
+        { fn: gpus, color: palette.green, width: 2.2, samples: 500, label: "GPUs = ⌈λ · GPU-s per request / u⌉" },
+        { fn: l => Math.max(l * gsec, 0.8), color: palette.faint, dash: "4 3", width: 1.2, label: "GPUs kept busy (at 100%)" },
+        { vline: lam, color: palette.ink, dash: "3 3" },
+        { marker: [lam, G], color: palette.brick, label: G + " GPU" + (G > 1 ? "s" : "") }
+      ]);
+      const busy = lam * gsec, util = busy / G;
+      const perGpuBatch = lam * nout * tslo / G;
+      const costHr = G * price, reqHr = lam * 3600, tokHr = reqHr * (nin + nout);
+      const ttft = tPre, e2e = ttft + (nout - 1) * tslo;
+      set("g", String(G), null, "running at " + pct(util, 0) + " · decode batch ≈ " + fmtNum(perGpuBatch, 0) + "/GPU (max " + fmtNum(Bmax, 0) + ")");
+      set("split", fmtNum(gsec * 1000, 0) + " ms", null, "prefill " + pct(tPre / gsec, 0) + " · decode " + pct(tDec / gsec, 0));
+      set("lat", fmtNum(e2e, 1) + " s", e2e > 30 ? "warn" : null, "TTFT ≈ " + fmtNum(ttft * 1000, 0) + " ms unloaded + " + (nout - 1) + " × " + sT.value + " ms");
+      set("c1m", money(costHr / tokHr * 1e6), null, "in+out; " + money(costHr / (reqHr * nout) * 1e6) + " per 1M output");
+      set("creq", money(costHr / reqHr), null, fmtNum(reqHr, 0) + " requests/hour at peak");
+      set("month", money(costHr * 730), null, G + " × $" + price.toFixed(2) + " × 730 h");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- API vs self-host break-even */
+  (function () {
+    const w = widget("w-break", { title: "API or self-host? The break-even volume", kicker: "Calculator", note: "All prices are <em>illustrative</em> placeholders. Plug in current numbers from your provider's price sheet and your own benchmark. Self-hosted capacity = sustained tok/s × average utilization × 2.63M seconds/month per GPU; the fleet never drops below the minimum you keep for redundancy. The comparison assumes the self-hosted model matches the API model's quality on your eval, which is the assumption most likely to be false." });
+    const sT = logSlider(w.controls, { label: "Tokens per month (in + out)", min: 1e6, max: 1e11, step: 0.02, value: 2e9, fmt: v => fmtSI(v, 1), onInput: draw });
+    const spi = slider(w.controls, { label: "API $ / 1M input", min: 0.1, max: 20, step: 0.05, value: 3, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const spo = slider(w.controls, { label: "API $ / 1M output", min: 0.2, max: 80, step: 0.1, value: 15, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const ssh = slider(w.controls, { label: "Input share of tokens", min: 0.5, max: 0.98, step: 0.01, value: 0.85, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const sh = slider(w.controls, { label: "Input served from cache", min: 0, max: 0.9, step: 0.05, value: 0.5, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    let rho = 0.1, minG = 2;
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Cached price ×" })));
+    seg(c1, { options: [{ value: 0.1, label: "0.1" }, { value: 0.25, label: "0.25" }, { value: 0.5, label: "0.5" }, { value: 1, label: "none" }], value: 0.1, onChange: v => { rho = v; draw(); } });
+    w.controls.appendChild(c1);
+    const sg = slider(w.controls, { label: "$ per GPU-hour", min: 0.5, max: 10, step: 0.1, value: 2.5, fmt: v => "$" + v.toFixed(2), onInput: draw });
+    const stp = logSlider(w.controls, { label: "Sustained tok/s per GPU", min: 200, max: 20000, value: 2500, fmt: v => fmtSI(Math.round(v / 50) * 50, 1), onInput: draw });
+    const sut = slider(w.controls, { label: "Average utilization", min: 0.1, max: 0.9, step: 0.05, value: 0.4, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Minimum GPUs" })));
+    seg(c2, { options: [{ value: 1, label: "1" }, { value: 2, label: "2" }, { value: 4, label: "4" }, { value: 8, label: "8" }], value: 2, onChange: v => { minG = v; draw(); } });
+    w.controls.appendChild(c2);
+    const sops = slider(w.controls, { label: "Ops / engineering $ per month", min: 0, max: 40000, step: 500, value: 5000, fmt: v => "$" + fmtNum(v, 0), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [1e6, 1e11], y: [10, 1e7], logx: true, logy: true, xfmt: v => fmtSI(v, 0), yfmt: v => "$" + fmtSI(v, 0), xlabel: "tokens per month (log)", ylabel: "$ per month (log)" });
+    const set = stats(w.body, [{ key: "api", label: "API $/month" }, { key: "self", label: "Self-host $/month" }, { key: "be", label: "Break-even volume" }, { key: "blend", label: "Blended API price" }]);
+    function draw() {
+      const T = 10 ** sT.value, sIn = ssh.value, h = sh.value;
+      const blend = sIn * ((1 - h) * spi.value + h * rho * spi.value) + (1 - sIn) * spo.value; // $ per 1M tokens
+      const capPerGpu = 10 ** stp.value * sut.value * 2.628e6;
+      const gpusFor = t => Math.max(minG, Math.ceil(t / capPerGpu));
+      const api = t => t / 1e6 * blend;
+      const self = t => gpusFor(t) * sg.value * 730 + sops.value;
+      let be = null;
+      for (let i = 0; i <= 2000; i++) { const t = 10 ** (6 + 5 * i / 2000); if (self(t) <= api(t)) { be = t; break; } }
+      const layers = [
+        { fn: api, color: palette.blue, width: 2.4, label: "API (pay per token)" },
+        { fn: self, color: palette.green, width: 2.4, samples: 700, label: "self-host (pay per GPU-hour)" },
+        { vline: T, color: palette.ink, dash: "3 3" },
+        { marker: [T, api(T)], color: palette.blue },
+        { marker: [T, self(T)], color: palette.green }
+      ];
+      if (be) layers.push({ vline: be, color: palette.gold, dash: "6 3", label: "break-even ≈ " + fmtSI(be, 1) });
+      P.draw(layers);
+      const a = api(T), s = self(T);
+      set("api", money(a), a <= s ? "good" : null, fmtSI(T, 1) + " tokens");
+      set("self", money(s), s < a ? "good" : null, gpusFor(T) + " GPU" + (gpusFor(T) > 1 ? "s" : "") + " · " + money(s / (T / 1e6)) + " per 1M");
+      set("be", be ? fmtSI(be, 1) + "/mo" : "never", be ? null : "warn", be ? "≈ " + fmtSI(be / 30 / 86400, 1) + " tok/s average" : "API is cheaper at every volume shown");
+      set("blend", "$" + blend.toFixed(2) + " / 1M", null, "cache saves " + pct(1 - blend / (sIn * spi.value + (1 - sIn) * spo.value), 0));
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- caching layers figure */
+  (function () {
+    const s = document.getElementById("fig-cache");
+    const defs = svg("defs"); defs.appendChild(svg("marker", { id: "arrC", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: palette.muted }))); s.appendChild(defs);
+    const line = (d, col, dash) => s.appendChild(svg("path", { d, fill: "none", stroke: col || palette.muted, "stroke-width": 1.4, "stroke-dasharray": dash || null, "marker-end": "url(#arrC)" }));
+    const box = (x, y, w, h, n, title, sub, tint, stroke) => {
+      s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 9, fill: tint, stroke, "stroke-width": 1.2 }));
+      if (n) { s.appendChild(svg("circle", { cx: x + 18, cy: y + 20, r: 9, fill: palette.ink })); s.appendChild(svg("text", { x: x + 18, y: y + 24, "text-anchor": "middle", "font-size": 11, fill: "#fff", class: "mono", text: n })); }
+      s.appendChild(svg("text", { x: x + (n ? 34 : w / 2), y: y + 25, "text-anchor": n ? "start" : "middle", "font-size": 13, "font-weight": 600, fill: palette.ink, text: title }));
+      (sub || []).forEach((t, i) => s.appendChild(svg("text", { x: x + 14, y: y + 46 + i * 15, "font-size": 11, fill: palette.muted, text: t })));
+    };
+    box(14, 120, 96, 56, null, "Request", [], "#fbfaf7", "rgba(28,27,25,.25)");
+    box(150, 102, 200, 92, "1", "Exact-match cache", ["key: hash(prompt + params)", "saves: the whole call", "safe only if deterministic"], "#fff", "rgba(26,122,82,.55)");
+    box(390, 102, 200, 92, "2", "Semantic cache", ["key: query embedding", "hit if cosine ≥ τ", "biggest saving, biggest risk"], "#fff", "rgba(176,67,46,.6)");
+    box(630, 102, 216, 92, "3", "Server prefix (KV) cache", ["key: token blocks of the prefix", "saves: prefill of shared prefix", "answer still freshly generated"], "#fff", "rgba(47,93,138,.55)");
+    line("M110,148 L148,148"); line("M350,148 L388,148"); line("M590,148 L628,148");
+    s.appendChild(svg("text", { x: 369, y: 140, "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted, text: "miss" }));
+    s.appendChild(svg("text", { x: 609, y: 140, "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted, text: "miss" }));
+    s.appendChild(svg("rect", { x: 150, y: 18, width: 696, height: 36, rx: 8, fill: "rgba(26,122,82,.07)", stroke: "rgba(26,122,82,.35)" }));
+    s.appendChild(svg("text", { x: 498, y: 41, "text-anchor": "middle", "font-size": 12.5, "font-weight": 600, fill: palette.ink, text: "Response to user" }));
+    line("M250,102 L250,58", palette.green); line("M490,102 L490,58", palette.brick); line("M738,102 L738,58", palette.blue);
+    s.appendChild(svg("text", { x: 258, y: 84, "font-size": 10.5, class: "mono", fill: palette.green, text: "hit: ~0 ms, $0" }));
+    s.appendChild(svg("text", { x: 498, y: 84, "font-size": 10.5, class: "mono", fill: palette.brick, text: "hit: ~10 ms, $0" }));
+    s.appendChild(svg("text", { x: 730, y: 84, "text-anchor": "end", "font-size": 10.5, class: "mono", fill: palette.blue, text: "lower TTFT + price" }));
+    const notes = [
+      [150, ["rarely hits for chat; useful", "for repeated batch jobs, evals"]],
+      [390, ["false hits, cross-user leaks,", "stale answers: measure, scope, TTL"]],
+      [630, ["needs a byte-identical prefix:", "stable content first, variable last"]]
+    ];
+    notes.forEach(([x, ls]) => ls.forEach((t, i) => s.appendChild(svg("text", { x: x + 4, y: 222 + i * 15, "font-size": 11, fill: palette.ink, text: t }))));
+    s.appendChild(svg("text", { x: 14, y: 276, "font-size": 11, fill: palette.faint, text: "Latency and cost labels are rough orders of magnitude, not measurements." }));
+  })();
+
+  /* ---------------------------------------------------------- latency percentiles figure */
+  (function () {
+    const host = document.getElementById("fig-pctl");
+    const R = rng(13), N = 5000, xs = [];
+    for (let i = 0; i < N; i++) {
+      const slow = R() < 0.08;
+      xs.push(Math.exp((slow ? Math.log(3.6) : Math.log(1.25)) + (slow ? 0.4 : 0.33) * R.normal()));
+    }
+    const sorted = xs.slice().sort((a, b) => a - b);
+    const q = p => sorted[Math.min(N - 1, Math.floor(p * N))];
+    const mean = xs.reduce((a, b) => a + b, 0) / N;
+    const p50 = q(0.5), p95 = q(0.95), p99 = q(0.99);
+    const bw = 0.1, nb = 80, counts = new Array(nb).fill(0);
+    xs.forEach(v => { const j = Math.floor(v / bw); if (j < nb) counts[j]++; });
+    const step = [[0, 0]];
+    counts.forEach((c, j) => { step.push([j * bw, c]); step.push([(j + 1) * bw, c]); });
+    step.push([nb * bw, 0]);
+    const ymax = Math.max(...counts) * 1.25;
+    const P = plot(host, { width: 760, height: 290, x: [0, 8], y: [0, ymax], yticks: [], xlabel: "end-to-end latency (s)", xfmt: v => v + " s", margin: { l: 20 } });
+    P.draw([
+      { points: step, color: palette.blue, width: 1.4, area: true, areaOpacity: 0.22 },
+      { vline: p50, color: palette.green, dash: "4 3", width: 1.6 },
+      { vline: mean, color: palette.muted, dash: "2 3", width: 1.3 },
+      { vline: p95, color: palette.gold, dash: "4 3", width: 1.6 },
+      { vline: p99, color: palette.brick, dash: "4 3", width: 1.6 },
+      { text: [p50 + 0.06, ymax * 0.94], label: "p50 " + p50.toFixed(2) + " s", color: palette.green },
+      { text: [mean + 0.06, ymax * 0.84], label: "mean " + mean.toFixed(2) + " s", color: palette.muted },
+      { text: [p95 + 0.06, ymax * 0.62], label: "p95 " + p95.toFixed(2) + " s", color: palette.gold },
+      { text: [p99 + 0.06, ymax * 0.48], label: "p99 " + p99.toFixed(2) + " s", color: palette.brick },
+      { text: [5.55, ymax * 0.3], label: "slow tail (8%):", color: palette.muted },
+      { text: [5.55, ymax * 0.22], label: "long outputs, queueing, retries", color: palette.muted }
+    ]);
+  })();
+})();
+</script>
+</body>
+</html>

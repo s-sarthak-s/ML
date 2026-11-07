@@ -1,0 +1,1200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Gradients &amp; optimization — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+.two-up{display:grid;grid-template-columns:1.45fr 1fr;gap:14px;align-items:start}
+@media (max-width:760px){.two-up{grid-template-columns:1fr}}
+.dyn-tex{margin:10px 0 0;font-size:14px;overflow-x:auto}
+</style>
+</head>
+<body data-module="02">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 02 · Foundations</p>
+<h1 class="title">Gradients: how a model learns to walk <span class="it">downhill</span></h1>
+<p class="lede">Training a 7B-parameter model means nudging seven billion numbers, a few hundred thousand times, each one a little in the direction that lowers the loss. This module builds that loop from the ground up: derivatives, the gradient, the chain rule, and the optimizers (SGD, momentum, Adam, AdamW) that every training script calls in one line.</p>
+<div class="meta"><span class="tag">~2.5 hours</span><span class="tag n">prereqs: 01</span><span class="tag g">hands-on: PyTorch, NumPy</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Read a derivative as "how far the output moves per unit nudge of the input", and compute it for the activation functions networks actually use.</li>
+    <li>Compute a gradient by hand and explain why stepping along \(-\nabla \mathcal{L}\) is the fastest way down.</li>
+    <li>Push derivatives through a computational graph with the chain rule, which is all backprop is.</li>
+    <li>Predict from the learning rate and the curvature whether gradient descent will converge, zigzag, or blow up.</li>
+    <li>Write Adam/AdamW from memory with every symbol explained, and wire up warmup + cosine decay + gradient clipping in PyTorch.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="objective">What training actually minimizes</h2>
+
+<p>Strip away the GPUs and the data pipelines and training is one sentence: <strong>find the parameter values that make a single number, the loss, as small as possible</strong>. The parameters are all the weights in the model, flattened into one very long vector \(\theta\). The loss measures how wrong the model's predictions are on the training data.</p>
+
+<div class="formula" data-name="Training objective">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}}(\htmlClass{t2}{\theta}) = \frac{1}{\htmlClass{t3}{N}} \sum_{i=1}^{\htmlClass{t3}{N}} \htmlClass{t4}{\ell}\big(f(\htmlClass{t5}{x_i};\, \htmlClass{t2}{\theta}),\; \htmlClass{t6}{y_i}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}\)</dt><dd>the loss: one scalar summarizing how wrong the model is on average</dd></div>
+    <div data-t="t2"><dt>\(\theta\)</dt><dd>every trainable parameter, viewed as one vector (7 billion entries for a 7B model)</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>number of training examples. For an LLM, each next-token prediction counts as one</dd></div>
+    <div data-t="t4"><dt>\(\ell\)</dt><dd>per-example loss, e.g. cross-entropy of the correct next token (Module 03)</dd></div>
+    <div data-t="t5"><dt>\(x_i\)</dt><dd>the \(i\)-th input (a context window of tokens)</dd></div>
+    <div data-t="t6"><dt>\(y_i\)</dt><dd>its target (the token that actually came next)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Run the model on every example, score how wrong each prediction was, and average the scores. Training means turning the knobs \(\theta\) until that average is small.</p>
+  <p class="why"><b>Why it matters</b>There's one output and billions of inputs. You can't try knob settings at random. You need, for every knob at once, the answer to "which way should I turn you, and how much does it matter?" That answer is the gradient, and one backward pass computes all of it for roughly twice the cost of a forward pass.</p>
+</div>
+
+<div class="intuition"><b>Intuition</b>
+<p>You're standing on a foggy hillside at night and want to reach the valley floor. You can't see the valley, but you can feel the slope under your boots. So you take a step in the steepest downhill direction, feel again, and step again. The first half of this module is about measuring the slope (derivatives, gradients, chain rule). The second half is about how to step: how far, with how much memory of past steps, and with what per-direction adjustments.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="derivative">Derivatives: slope and sensitivity</h2>
+
+<p>Start with one input and one output. The derivative \(f'(x)\) answers: <em>if I nudge \(x\) a tiny bit, how much does \(f(x)\) move, per unit of nudge?</em> Geometrically it's the slope of the tangent line at \(x\). Practically it's a sensitivity: a derivative of 3 means the output moves about three times as far as the input, in the same direction.</p>
+
+<div class="formula" data-name="Derivative (limit definition)">
+  <div class="tex">$$\htmlClass{t1}{f'(x)} = \lim_{\htmlClass{t2}{h} \to 0} \frac{\htmlClass{t3}{f(x + h) - f(x)}}{\htmlClass{t2}{h}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(f'(x)\)</dt><dd>the derivative of \(f\) at the point \(x\), also written \(\frac{df}{dx}\)</dd></div>
+    <div data-t="t2"><dt>\(h\)</dt><dd>the size of the nudge to the input; we take it toward zero</dd></div>
+    <div data-t="t3"><dt>\(f(x+h)-f(x)\)</dt><dd>how much the output changed because of the nudge</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Rise over run, with the run shrunk until the curve looks straight. The ratio before taking the limit is the slope of a <em>secant</em> line through two nearby points; in the limit it becomes the tangent.</p>
+  <p class="why"><b>Why it matters</b>The un-limited version is also your debugging tool. To check a hand-written backward pass, compare it against \((f(x+h)-f(x-h))/2h\) with \(h \approx 10^{-5}\) in float64. That's a <em>gradient check</em>.</p>
+</div>
+
+<p>The reason the derivative is useful for optimization is the next formula. Near any point, a smooth function looks like a straight line, and the derivative is that line's slope:</p>
+
+<div class="formula" data-name="First-order (linear) approximation">
+  <div class="tex">$$f(x + \htmlClass{t2}{\Delta x}) \;\approx\; f(x) + \htmlClass{t1}{f'(x)}\, \htmlClass{t2}{\Delta x}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(f'(x)\)</dt><dd>local slope: the exchange rate between input change and output change</dd></div>
+    <div data-t="t2"><dt>\(\Delta x\)</dt><dd>a small step in the input. The approximation gets worse as the step grows</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>For small steps, output change ≈ slope × step. If you want the output to go <em>down</em>, step against the sign of the slope: \(\Delta x = -\eta f'(x)\) gives a change of \(-\eta f'(x)^2\), which is never positive.</p>
+  <p class="why"><b>Why it matters</b>That one line is the whole justification for gradient descent. Everything about learning rates is about how small "small" has to be before this approximation stops being trustworthy.</p>
+</div>
+
+<p>You'll only ever need a handful of derivatives to read ML code. Here they are, with where each one shows up:</p>
+
+<table class="t">
+  <thead><tr><th>Function</th><th>Derivative</th><th>Where you meet it</th></tr></thead>
+  <tbody>
+    <tr><td>\(x^2\)</td><td>\(2x\)</td><td>Squared-error loss; the \(2e\) at the end of every regression backward pass</td></tr>
+    <tr><td>\(e^x\)</td><td>\(e^x\)</td><td>Softmax and attention weights</td></tr>
+    <tr><td>\(\log x\)</td><td>\(1/x\)</td><td>Cross-entropy and log-probs. Small probabilities produce large gradients</td></tr>
+    <tr><td>\(\mathrm{ReLU}(x)=\max(0,x)\)</td><td>1 if \(x\gt 0\), 0 if \(x \lt 0\)</td><td>MLP activations. Undefined at exactly 0; PyTorch uses 0 there</td></tr>
+    <tr><td>\(\sigma(x)=\frac{1}{1+e^{-x}}\)</td><td>\(\sigma(x)\,(1-\sigma(x))\), at most 0.25</td><td>Gates (LSTM, SwiGLU's SiLU = \(x\sigma(x)\)), logistic loss</td></tr>
+    <tr><td>\(\tanh x\)</td><td>\(1-\tanh^2 x\), at most 1</td><td>Older RNNs, the tanh approximation of GELU</td></tr>
+    <tr><td>\(\sin x\)</td><td>\(\cos x\)</td><td>Rotary position embeddings (Module 06)</td></tr>
+  </tbody>
+</table>
+
+<div id="w-deriv"></div>
+
+<div class="pitfall"><b>Pitfall · finite differences in float32</b>
+<p>Shrinking \(h\) doesn't keep helping on a computer. With \(h = 10^{-8}\) in float32, \(x+h\) rounds back to \(x\) and the quotient is 0 or garbage, because float32 only carries about 7 significant digits. The truncation error falls with \(h\) while the rounding error grows like \(\varepsilon/h\). For gradient checks use float64, the central difference, and \(h\) around \(10^{-5}\) to \(10^{-6}\).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="gradient">Partial derivatives and the gradient</h2>
+
+<p>A loss depends on many parameters. A <strong>partial derivative</strong> \(\partial f / \partial \theta_j\) is the ordinary derivative with respect to one parameter while every other parameter is held fixed. Take</p>
+$$f(w_1, w_2) = w_1^2 + w_1 w_2 + 3 w_2^2.$$
+<p>Treat \(w_2\) as a constant and differentiate in \(w_1\): \(\partial f/\partial w_1 = 2w_1 + w_2\). Treat \(w_1\) as a constant: \(\partial f/\partial w_2 = w_1 + 6 w_2\). At the point \((1, 1)\) these are 3 and 7: nudging \(w_2\) moves the loss more than twice as much as nudging \(w_1\).</p>
+
+<div class="formula" data-name="The gradient">
+  <div class="tex">$$\htmlClass{t1}{\nabla f}(\htmlClass{t2}{\theta}) = \left( \htmlClass{t3}{\frac{\partial f}{\partial \theta_1}},\; \htmlClass{t3}{\frac{\partial f}{\partial \theta_2}},\; \ldots,\; \htmlClass{t3}{\frac{\partial f}{\partial \theta_{\htmlClass{t4}{d}}}} \right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\nabla f\)</dt><dd>the gradient ("nabla f"): a vector with one entry per parameter</dd></div>
+    <div data-t="t2"><dt>\(\theta\)</dt><dd>the point where we evaluate it: the current parameter values</dd></div>
+    <div data-t="t3"><dt>\(\partial f/\partial \theta_j\)</dt><dd>partial derivative: sensitivity of \(f\) to parameter \(j\) alone</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>number of parameters. The gradient has the same shape as \(\theta\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Measure each knob's sensitivity separately and stack the answers into a vector. In PyTorch this is literally <code>p.grad</code>, a tensor with exactly the same shape as the parameter <code>p</code>.</p>
+  <p class="why"><b>Why it matters</b>The gradient points in the direction of steepest <em>increase</em>, and its length is the slope in that direction. So \(-\nabla f\) is steepest descent. The next card is why.</p>
+</div>
+
+<div class="formula" data-name="Directional derivative">
+  <div class="tex">$$D_{\htmlClass{t1}{u}} f \;=\; \htmlClass{t2}{\nabla f} \cdot \htmlClass{t1}{u} \;=\; \lVert \htmlClass{t2}{\nabla f} \rVert \cos \htmlClass{t3}{\phi}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(u\)</dt><dd>a direction to move in, as a unit vector (length 1)</dd></div>
+    <div data-t="t2"><dt>\(\nabla f\)</dt><dd>the gradient at the current point</dd></div>
+    <div data-t="t3"><dt>\(\phi\)</dt><dd>angle between the chosen direction and the gradient</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The slope in any direction is a dot product with the gradient (Module 01). It's largest when \(u\) points along the gradient (\(\cos\phi = 1\)), zero when \(u\) is perpendicular to it, and most negative when \(u\) points exactly opposite.</p>
+  <p class="why"><b>Why it matters</b>Moving perpendicular to the gradient keeps the loss constant, so the gradient is always perpendicular to the contour line through your point. The widget below shows it.</p>
+</div>
+
+<div id="w-grad"></div>
+
+<div class="flag"><b>Caveat · steepest is not shortest</b>
+<p>"Steepest descent" is a local statement about the current point. On a stretched-out bowl the steepest direction points mostly across the valley rather than along it toward the minimum. Drag the point in the widget to the end of a long ellipse and compare the green arrow with the direction to the centre. Most of the rest of this module deals with that mismatch.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="chain">The chain rule</h2>
+
+<p>Networks are compositions: a linear layer feeds an activation, which feeds another layer, then a softmax, then a loss. The chain rule says how sensitivities compose: <strong>rates multiply</strong>. If \(u\) moves 3 units per unit of \(x\), and \(y\) moves 2 units per unit of \(u\), then \(y\) moves 6 units per unit of \(x\).</p>
+
+<div class="formula" data-name="Chain rule (single variable)">
+  <div class="tex">$$\frac{d\htmlClass{t1}{y}}{d\htmlClass{t3}{x}} = \frac{d\htmlClass{t1}{y}}{d\htmlClass{t2}{u}} \cdot \frac{d\htmlClass{t2}{u}}{d\htmlClass{t3}{x}} \qquad \text{for } \htmlClass{t1}{y} = f(\htmlClass{t2}{u}),\;\; \htmlClass{t2}{u} = g(\htmlClass{t3}{x})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(y\)</dt><dd>the final output (eventually: the loss)</dd></div>
+    <div data-t="t2"><dt>\(u\)</dt><dd>an intermediate value computed along the way</dd></div>
+    <div data-t="t3"><dt>\(x\)</dt><dd>the input (eventually: a weight)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Sensitivity of the end to the start = (sensitivity of the end to the middle) × (sensitivity of the middle to the start). Example: \(y = \sin(3x^2)\). Let \(u = 3x^2\). Then \(dy/du = \cos u\) and \(du/dx = 6x\), so \(dy/dx = 6x\cos(3x^2)\).</p>
+</div>
+
+<p>When one value feeds into several places, each path contributes, and the contributions <strong>add</strong>:</p>
+
+<div class="formula" data-name="Chain rule (multivariable: sum over paths)">
+  <div class="tex">$$\frac{\partial \htmlClass{t1}{L}}{\partial \htmlClass{t3}{x}} = \sum_{\htmlClass{t4}{k}} \frac{\partial \htmlClass{t1}{L}}{\partial \htmlClass{t2}{u_k}} \, \frac{\partial \htmlClass{t2}{u_k}}{\partial \htmlClass{t3}{x}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(L\)</dt><dd>the scalar at the end of the graph, usually the loss</dd></div>
+    <div data-t="t2"><dt>\(u_k\)</dt><dd>every intermediate value that \(x\) feeds into directly</dd></div>
+    <div data-t="t3"><dt>\(x\)</dt><dd>the variable we want the gradient for</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>runs over the outgoing edges of \(x\) in the graph</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Multiply local derivatives along each path from \(x\) to \(L\), then add up the paths. A weight used in many places (a shared embedding, a weight applied at every sequence position) collects a gradient contribution from each use.</p>
+  <p class="why"><b>Why it matters</b>This is exactly why PyTorch <em>accumulates</em> into <code>.grad</code> with <code>+=</code> instead of overwriting it, and why you must zero gradients between steps.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 940 340" id="fig-graph"></svg>
+<figcaption>A one-neuron model with squared-error loss, \(L = (\sigma(wx+b) - y)^2\), drawn as a computational graph with \(x=2,\ w=0.5,\ b=-0.5,\ y=1\). Black labels are forward values. Brick labels on each edge are <em>local</em> derivatives, each computable from that node alone. Green labels are the accumulated gradient \(\partial L/\partial(\cdot)\), obtained by multiplying local derivatives right to left: \(\partial L/\partial w = 2e \cdot 1 \cdot a(1-a) \cdot 1 \cdot x = (-0.755)(0.235)(2) = -0.355\). Module 04 turns this into backprop for whole networks.</figcaption></figure>
+
+<figure class="fig"><svg viewBox="0 0 820 220" id="fig-paths"></svg>
+<figcaption>When a variable fans out, gradients from each path add. Here \(f = u\cdot v\) with \(u = x^2\) and \(v = \sin x\). Path 1 contributes \(\frac{\partial f}{\partial u}\frac{du}{dx} = \sin x \cdot 2x\) and path 2 contributes \(\frac{\partial f}{\partial v}\frac{dv}{dx} = x^2 \cos x\). Their sum is the product rule, which falls out of the chain rule for free.</figcaption></figure>
+
+<details class="think"><summary>Think first: stack 10 sigmoid layers. What happens to the gradient reaching the first layer?</summary>
+<div>Each layer contributes a factor \(\sigma'(z) \le 0.25\) to the product (times a weight). Ten of them give at most \(0.25^{10} \approx 9.5\times10^{-7}\), so the early layers barely learn. That's the <em>vanishing gradient</em> problem. ReLU's derivative is exactly 1 for positive inputs, which is a big reason it displaced sigmoid in hidden layers. Residual connections (Module 06) fix the rest: \(\frac{d}{dx}(x + F(x)) = 1 + F'(x)\), so there is always a path with factor 1.</div>
+</details>
+
+<div class="mle"><b>MLE angle · why backprop runs backwards</b>
+<p>You can multiply the chain of local derivatives starting from the input end (forward mode) or from the loss end (reverse mode). Forward mode gives the derivative of <em>every output</em> with respect to <em>one input</em> per pass. Reverse mode gives the derivative of <em>one output</em> with respect to <em>every input</em> per pass. Training has one output (the loss) and billions of inputs (the weights), so reverse mode wins by a factor of billions. The cost is memory: the backward pass needs the forward activations, which is why activation memory dominates training (Module 07) and why activation checkpointing trades recompute for memory.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="gd">Gradient descent</h2>
+
+<p>Now we can take steps. Gradient descent applies the linear approximation over and over: compute the gradient, step a short distance against it, repeat.</p>
+
+<div class="formula" data-name="Gradient descent update">
+  <div class="tex">$$\htmlClass{t1}{\theta_{t+1}} = \htmlClass{t2}{\theta_t} - \htmlClass{t3}{\eta}\, \htmlClass{t4}{\nabla \mathcal{L}(\theta_t)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\theta_{t+1}\)</dt><dd>parameters after this step</dd></div>
+    <div data-t="t2"><dt>\(\theta_t\)</dt><dd>parameters before this step (\(t\) counts steps)</dd></div>
+    <div data-t="t3"><dt>\(\eta\)</dt><dd><b>learning rate</b> ("eta"): how far to move per unit of gradient</dd></div>
+    <div data-t="t4"><dt>\(\nabla\mathcal{L}(\theta_t)\)</dt><dd>gradient of the loss at the current parameters</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Move every parameter a little in the direction that lowers the loss, by an amount proportional to how much that parameter matters right now.</p>
+  <p class="why"><b>Why it matters</b>From the linear approximation, \(\mathcal{L}(\theta - \eta g) \approx \mathcal{L}(\theta) - \eta\lVert g\rVert^2\), a guaranteed decrease if \(\eta\) is small enough. The whole question is: how small is small enough?</p>
+</div>
+
+<h3>How big can the learning rate be?</h3>
+<p>The linear approximation ignores curvature. Near a minimum, any smooth loss looks like a bowl, and after rotating to the bowl's principal axes it becomes \(\mathcal{L} = \tfrac12 \sum_i \lambda_i \theta_i^2\). Each \(\lambda_i\) is the curvature along one axis, an eigenvalue of the Hessian (definition below). The gradient along axis \(i\) is \(\lambda_i\theta_i\), so one step of gradient descent does</p>
+$$\theta_i \;\leftarrow\; \theta_i - \eta\lambda_i\theta_i \;=\; (1 - \eta\lambda_i)\,\theta_i.$$
+<p>Every axis gets multiplied by its own factor \((1-\eta\lambda_i)\), every step. That single observation explains every behaviour you'll see in the widget.</p>
+
+<div class="formula" data-name="Stable learning rate on a quadratic">
+  <div class="tex">$$\big|\,1 - \htmlClass{t1}{\eta}\,\htmlClass{t2}{\lambda_i}\,\big| \lt 1 \;\text{ for all } i \quad\Longleftrightarrow\quad 0 \lt \htmlClass{t1}{\eta} \lt \frac{2}{\htmlClass{t3}{\lambda_{\max}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\eta\)</dt><dd>learning rate</dd></div>
+    <div data-t="t2"><dt>\(\lambda_i\)</dt><dd>curvature along principal direction \(i\) (an eigenvalue of the Hessian)</dd></div>
+    <div data-t="t3"><dt>\(\lambda_{\max}\)</dt><dd>the sharpest curvature anywhere; the direction most likely to blow up</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>If \(\eta\lambda \lt 1\), that coordinate shrinks smoothly. If \(1 \lt \eta\lambda \lt 2\), it overshoots and flips sign every step but still shrinks: a zigzag. If \(\eta\lambda \gt 2\), it overshoots by more than it started and grows every step: divergence.</p>
+  <p class="why"><b>Why it matters</b>The sharpest direction caps the learning rate, but the flattest direction sets how many steps you need. With \(\eta \approx 1/\lambda_{\max}\), the flat axis shrinks by \((1 - \lambda_{\min}/\lambda_{\max})\) per step, so you need on the order of \(\kappa = \lambda_{\max}/\lambda_{\min}\) steps. \(\kappa\) is the <em>condition number</em>. Momentum, Adam, and normalization layers are all, in part, attacks on a large \(\kappa\).</p>
+</div>
+
+<div class="def"><b>Definition · Hessian</b>
+<p>The matrix of second derivatives, \(H_{jk} = \partial^2 \mathcal{L}/\partial\theta_j\partial\theta_k\). It describes curvature: how fast the gradient itself changes as you move. Its eigenvectors are the principal axes of the local bowl and its eigenvalues are the curvatures \(\lambda_i\). For \(\mathcal{L} = \tfrac12(\theta_1^2 + 10\theta_2^2)\) the Hessian is \(\mathrm{diag}(1, 10)\), so \(\lambda_{\max} = 10\) and the stable range is \(\eta \lt 0.2\). For a 7B model it's a \(7\mathrm{B}\times7\mathrm{B}\) matrix nobody ever forms; you only need to know it exists and that its top eigenvalue (the "sharpness") limits your learning rate.</p>
+</div>
+
+<div id="w-gd"></div>
+
+<details class="think"><summary>Think first: on the quadratic, set η = 0.15. Which coordinate zigzags, and which crawls?</summary>
+<div>Along \(\theta_2\) (curvature 10) the factor is \(1 - 1.5 = -0.5\): it flips sign each step and halves, a fast zigzag. Along \(\theta_1\) (curvature 1) the factor is \(0.85\): no zigzag, steady shrinking. After the zigzag dies out in a few steps, the remaining time is spent crawling along \(\theta_1\). Raise η to 0.19 and the zigzag lasts much longer (factor −0.9) while the crawl speeds up (0.81). Past 0.2, \(\theta_2\) explodes.</div>
+</details>
+
+<div class="flag"><b>Deep cut · the edge of stability</b>
+<p>Real loss surfaces aren't fixed quadratics; the curvature changes as you train. Cohen et al. (2021) found that full-batch gradient descent on neural nets drives the sharpness \(\lambda_{\max}\) <em>up</em> until it reaches about \(2/\eta\), then hovers there while the loss keeps falling, non-monotonically. The Rosenbrock option shows a cousin of this: past a certain learning rate the iterate neither converges nor diverges but bounces across the valley indefinitely. Treat \(\eta \lt 2/\lambda_{\max}\) as the local law, not a global guarantee.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="sgd">Stochastic and minibatch gradients</h2>
+
+<p>The true gradient averages over all \(N\) training examples. For an LLM that's trillions of tokens, so computing it once per step is out of the question. Instead each step samples a <strong>minibatch</strong> and uses its average gradient as an estimate.</p>
+
+<div class="formula" data-name="Minibatch gradient">
+  <div class="tex">$$\htmlClass{t1}{\hat{g}} = \frac{1}{\htmlClass{t2}{B}} \sum_{i \in \htmlClass{t3}{\mathcal{B}}} \nabla_{\theta}\, \htmlClass{t4}{\ell_i}(\theta), \qquad \mathbb{E}\big[\htmlClass{t1}{\hat{g}}\big] = \nabla\mathcal{L}(\theta)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat{g}\)</dt><dd>the gradient estimate actually used for this step</dd></div>
+    <div data-t="t2"><dt>\(B\)</dt><dd>batch size: examples (or tokens) per step</dd></div>
+    <div data-t="t3"><dt>\(\mathcal{B}\)</dt><dd>the randomly sampled set of example indices for this step</dd></div>
+    <div data-t="t4"><dt>\(\ell_i\)</dt><dd>loss on example \(i\); its gradient is one noisy "vote" for the direction</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Poll a random sample of examples instead of all of them. On average the poll points the right way (it's <em>unbiased</em>), but any single poll is off by some noise.</p>
+</div>
+
+<div class="formula" data-name="Gradient noise vs batch size">
+  <div class="tex">$$\operatorname{Std}\big[\htmlClass{t1}{\hat{g}}\big] = \frac{\htmlClass{t2}{\sigma}}{\sqrt{\htmlClass{t3}{B}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat{g}\)</dt><dd>minibatch gradient (each coordinate)</dd></div>
+    <div data-t="t2"><dt>\(\sigma\)</dt><dd>spread of individual per-example gradients around the true mean</dd></div>
+    <div data-t="t3"><dt>\(B\)</dt><dd>batch size, assuming independently sampled examples</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Averaging \(B\) independent noisy votes cuts the noise by \(\sqrt{B}\), not by \(B\). Going from 32 to 512 (16× the compute per step) only cuts the noise 4×.</p>
+  <p class="why"><b>Why it matters</b>Doubling the batch eventually stops halving the number of steps you need. McCandlish et al. (2018) call the turning point the <em>critical batch size</em>; past it, extra batch is mostly wasted compute. LLM pretraining batches are measured in tokens: Llama 2 used about 4M tokens per step (Touvron et al., 2023).</p>
+</div>
+
+<figure class="fig wide"><div id="fig-noisy" class="two-up"></div>
+<figcaption>Left: 60 steps on the same tilted bowl with the same learning rate, using the exact gradient (black), minibatches of 16 (blue), and single examples (brick). Gradient noise is simulated as Gaussian with per-example spread \(\sigma = 5\). Noisy runs still head downhill, but they never settle; they jitter in a cloud whose size scales with \(\eta\) and with the noise. Right: noise falls as \(1/\sqrt{B}\), so each 4× increase in batch only halves it.</figcaption></figure>
+
+<p>Noise is not purely a cost. It's what lets cheap steps make progress, and there's some evidence that it steers training toward flatter regions that generalize better (Keskar et al., 2017, observed that very large batches tended to find sharper minima). It's also why the learning rate has to come down at the end of training: the size of the jitter cloud is proportional to \(\eta\), so lowering \(\eta\) shrinks it. That's half of the motivation for the schedules later in this module.</p>
+
+<div class="pitfall"><b>Pitfall · gradient accumulation and the mean</b>
+<p>To fake batch 64 on a GPU that fits 16, run four micro-batches and call <code>backward()</code> on each before one <code>optimizer.step()</code>. Gradients add up across calls, so divide each micro-batch loss by 4 (the accumulation steps), or you've silently multiplied your learning rate by 4. With token-level losses and variable-length sequences, "the mean" has a further subtlety: averaging per micro-batch then across micro-batches weighs short and long sequences differently than one big batch would.</p>
+</div>
+
+<div class="mle"><b>MLE angle · batch size and learning rate move together</b>
+<p>For SGD, Goyal et al. (2017) popularized the <em>linear scaling rule</em>: multiply the batch by \(k\), multiply the learning rate by \(k\) (with warmup), up to a limit. For Adam-family optimizers the relationship is different, and a square-root rule has been proposed (Malladi et al., 2022). In practice, if you change the batch size of a known-good recipe, re-sweep the learning rate rather than trusting either rule.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="momentum">Momentum</h2>
+
+<p>On an ill-conditioned bowl, plain gradient descent wastes most of its effort zigzagging across the narrow direction while it crawls along the long one. Momentum (Polyak, 1964, the "heavy ball") gives the iterate inertia: instead of stepping along the current gradient, step along a running sum of recent gradients.</p>
+
+<div class="formula" data-name="SGD with momentum (PyTorch convention)">
+  <div class="tex">$$\htmlClass{t1}{v_t} = \htmlClass{t2}{\mu}\, \htmlClass{t1}{v_{t-1}} + \htmlClass{t3}{g_t}, \qquad \theta_{t+1} = \theta_t - \htmlClass{t4}{\eta}\, \htmlClass{t1}{v_t}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(v_t\)</dt><dd>"velocity": a decaying sum of past gradients, one entry per parameter, starting at 0</dd></div>
+    <div data-t="t2"><dt>\(\mu\)</dt><dd>momentum coefficient, typically 0.9: how much of the old velocity survives each step</dd></div>
+    <div data-t="t3"><dt>\(g_t\)</dt><dd>this step's (minibatch) gradient</dd></div>
+    <div data-t="t4"><dt>\(\eta\)</dt><dd>learning rate</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Keep pushing in the direction you've been going, and let the new gradient adjust it. Components that point the same way step after step pile up. Components that flip sign every step cancel.</p>
+  <p class="why"><b>Why it matters</b>With a constant gradient \(g\), the velocity settles at \(g/(1-\mu)\), so \(\mu=0.9\) gives a 10× longer step along consistent directions. With a gradient that alternates \(+g, -g\) (the zigzag), the velocity settles at only about \(g/(1+\mu) \approx 0.53g\). Momentum boosts the long valley direction and damps the cross-valley one, exactly what ill-conditioning needs.</p>
+</div>
+
+<div class="flag"><b>Convention check</b>
+<p>Some texts write the velocity as an exponential moving average, \(v_t = \mu v_{t-1} + (1-\mu) g_t\). That version's velocity is \((1-\mu)\) times smaller, so the same trajectory needs a 10× larger \(\eta\) at \(\mu = 0.9\). PyTorch's <code>torch.optim.SGD(momentum=0.9)</code> uses the sum form above. Adam's first moment (next section) uses the average form. When you port a learning rate between codebases, check which one you're in.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="adam">Adam and AdamW</h2>
+
+<p>Momentum still uses one learning rate for every parameter. Parameters in a transformer have wildly different gradient scales: an embedding row for a rare token gets a gradient only when that token appears, a norm gain sees different magnitudes than a big attention matrix, and the scales drift during training. Adam (Kingma &amp; Ba, 2015) gives every parameter its own step size by dividing its momentum by a running estimate of its typical gradient size. It's four lines, applied elementwise to every parameter:</p>
+
+<div class="formula" data-name="Adam · first moment (momentum)">
+  <div class="tex">$$\htmlClass{t1}{m_t} = \htmlClass{t2}{\beta_1}\, m_{t-1} + (1 - \htmlClass{t2}{\beta_1})\, \htmlClass{t3}{g_t}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(m_t\)</dt><dd>first-moment estimate: an exponential moving average of the gradient. Starts at \(m_0 = 0\)</dd></div>
+    <div data-t="t2"><dt>\(\beta_1\)</dt><dd>decay rate, default 0.9. It averages over roughly \(1/(1-\beta_1) = 10\) recent steps</dd></div>
+    <div data-t="t3"><dt>\(g_t\)</dt><dd>this parameter's gradient at step \(t\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A smoothed gradient: the direction this parameter has been pushed lately, with noise averaged out.</p>
+</div>
+
+<div class="formula" data-name="Adam · second moment (scale)">
+  <div class="tex">$$\htmlClass{t1}{v_t} = \htmlClass{t2}{\beta_2}\, v_{t-1} + (1 - \htmlClass{t2}{\beta_2})\, \htmlClass{t3}{g_t^{2}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(v_t\)</dt><dd>second-moment estimate: moving average of the <em>squared</em> gradient. \(\sqrt{v_t}\) is the typical gradient size (RMS). Starts at 0</dd></div>
+    <div data-t="t2"><dt>\(\beta_2\)</dt><dd>decay rate, default 0.999 (memory ≈ 1000 steps). Many LLM recipes use 0.95 (memory ≈ 20 steps)</dd></div>
+    <div data-t="t3"><dt>\(g_t^2\)</dt><dd>elementwise square of the gradient, so it's always positive and sign doesn't cancel</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>How big this parameter's gradients usually are, regardless of direction.</p>
+  <p class="why"><b>Why it matters</b>GPT-3 (Brown et al., 2020) and Llama 2 (Touvron et al., 2023) both used \(\beta_2 = 0.95\). The commonly given reason: with a 1000-step memory, \(v\) reacts slowly when gradient scales jump, so a sudden large gradient meets a stale, too-small denominator and produces an outsized update. A shorter memory adapts faster and is less prone to that kind of instability.</p>
+</div>
+
+<div class="formula" data-name="Adam · bias correction">
+  <div class="tex">$$\htmlClass{t1}{\hat{m}_t} = \frac{m_t}{1 - \htmlClass{t3}{\beta_1^{\,t}}}, \qquad \htmlClass{t2}{\hat{v}_t} = \frac{v_t}{1 - \htmlClass{t4}{\beta_2^{\,t}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat{m}_t\)</dt><dd>bias-corrected first moment</dd></div>
+    <div data-t="t2"><dt>\(\hat{v}_t\)</dt><dd>bias-corrected second moment</dd></div>
+    <div data-t="t3"><dt>\(\beta_1^{\,t}\)</dt><dd>\(\beta_1\) raised to the power \(t\) (step count), not a superscript index</dd></div>
+    <div data-t="t4"><dt>\(\beta_2^{\,t}\)</dt><dd>\(\beta_2\) to the power \(t\). With 0.999 it's still 0.37 at step 1000</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Both averages start at zero, so early on they're dragged toward zero. At step 1, \(m_1 = 0.1\,g_1\); dividing by \(1-0.9 = 0.1\) recovers exactly \(g_1\). Likewise \(\hat v_1 = g_1^2\). As \(t\) grows, \(\beta^t \to 0\) and the correction fades to 1.</p>
+  <p class="why"><b>Why it matters</b>Without it, the first steps would use \(m_1/\sqrt{v_1} = 0.1g/(\sqrt{0.001}\,|g|) \approx 3.2\) instead of 1: about 3× too large, right when the model is most fragile.</p>
+</div>
+
+<div class="formula" data-name="Adam · parameter update">
+  <div class="tex">$$\htmlClass{t1}{\theta_{t+1}} = \theta_t - \htmlClass{t2}{\eta}\, \frac{\htmlClass{t3}{\hat{m}_t}}{\sqrt{\htmlClass{t4}{\hat{v}_t}} + \htmlClass{t5}{\epsilon}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\theta_{t+1}\)</dt><dd>updated parameter</dd></div>
+    <div data-t="t2"><dt>\(\eta\)</dt><dd>learning rate. Now roughly the largest change any parameter makes in one step</dd></div>
+    <div data-t="t3"><dt>\(\hat{m}_t\)</dt><dd>smoothed direction (signed)</dd></div>
+    <div data-t="t4"><dt>\(\hat{v}_t\)</dt><dd>typical squared size; its square root normalizes the step</dd></div>
+    <div data-t="t5"><dt>\(\epsilon\)</dt><dd>small constant (PyTorch default \(10^{-8}\); Llama 2 used \(10^{-5}\)) that prevents division by zero and caps the step for parameters with tiny gradients</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Step size = learning rate × (average gradient ÷ typical gradient size). When a parameter's gradients consistently agree, the ratio is near ±1 and it moves about \(\eta\) per step. When they're mostly noise that cancels, the ratio is near 0 and it barely moves.</p>
+  <p class="why"><b>Why it matters</b>The units cancel: multiply every gradient by 1000 and Adam's update is unchanged (as long as \(\epsilon\) is negligible). That's why Adam learning rates like \(3\times10^{-4}\) transfer across models much better than SGD's, and why fp16 loss scaling doesn't distort Adam updates. If you set \(\beta_1 = \beta_2 = 0\), the update becomes \(\eta\,\mathrm{sign}(g)\): Adam is a smoothed cousin of sign descent, which is the core of the Lion optimizer (Chen et al., 2023).</p>
+</div>
+
+<h3>AdamW: weight decay done right</h3>
+<p>Weight decay pulls weights toward zero to keep them from growing without bound. The textbook way adds \(\frac{\lambda}{2}\lVert\theta\rVert^2\) to the loss, which adds \(\lambda\theta\) to the gradient. Inside plain SGD that's the same as shrinking the weights directly. Inside Adam it isn't: the extra \(\lambda\theta\) gets divided by \(\sqrt{\hat v}\) like everything else, so parameters with large gradients get almost no decay and parameters with small gradients get a lot. Loshchilov &amp; Hutter (2019) proposed <em>decoupling</em> it:</p>
+
+<div class="formula" data-name="AdamW · decoupled weight decay">
+  <div class="tex">$$\htmlClass{t1}{\theta_{t+1}} = \theta_t - \htmlClass{t2}{\eta} \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \htmlClass{t3}{\lambda}\, \htmlClass{t4}{\theta_t} \right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\theta_{t+1}\)</dt><dd>updated parameter</dd></div>
+    <div data-t="t2"><dt>\(\eta\)</dt><dd>scheduled learning rate. In PyTorch it multiplies the decay term too</dd></div>
+    <div data-t="t3"><dt>\(\lambda\)</dt><dd>weight decay coefficient. PyTorch default 0.01; LLM pretraining commonly uses 0.1</dd></div>
+    <div data-t="t4"><dt>\(\theta_t\)</dt><dd>the current weight itself: every weight shrinks by the same fraction \(\eta\lambda\) per step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Take the normal Adam step, and separately shrink every weight by a fixed small fraction. The shrink bypasses the per-parameter normalization, so it treats all weights alike.</p>
+  <p class="why"><b>Why it matters</b>AdamW is the default optimizer for essentially all LLM pretraining and fine-tuning. <code>torch.optim.Adam(weight_decay=0.1)</code> is the <em>coupled</em> L2 version, not AdamW. Biases and norm gains are usually excluded from decay.</p>
+</div>
+
+<div id="w-opt"></div>
+
+<div class="intuition"><b>What the race shows</b>
+<p>On the axis-aligned bowl, Adam's per-coordinate scaling acts like a custom learning rate for each axis and it beats plain SGD easily. Rotate the same bowl 45° and the narrow direction no longer lines up with any single parameter. Adam's diagonal rescaling can't help as much, and its advantage shrinks. In real networks the bad curvature is partly axis-aligned (different layers and parameter types have different scales), which is a large part of why Adam works so well on transformers. Optimizers like Shampoo and Muon go further by preconditioning whole weight matrices; Muon has been used in some recent large pretraining runs (e.g. Moonshot AI's Kimi K2, 2025).</p>
+</div>
+
+<div class="mle"><b>MLE angle · Adam's memory bill</b>
+<p>Adam keeps \(m\) and \(v\) for every parameter, usually in fp32: 8 extra bytes per parameter. For a 7B model that's 56 GB of optimizer state before weights, gradients, or activations. Mixed-precision training with fp32 master weights lands around 16 bytes per parameter in total (Module 07). That bill is why ZeRO/FSDP shard optimizer state across GPUs, why 8-bit Adam exists, and why LoRA (Module 10) is so cheap: frozen weights need no optimizer state.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="schedule">Learning-rate schedules: warmup and cosine decay</h2>
+
+<p>Almost no serious training run uses a constant learning rate. The near-universal recipe for transformers is a <strong>linear warmup</strong> from zero to a peak over the first few hundred or thousand steps, followed by a <strong>cosine decay</strong> down to a small floor (Loshchilov &amp; Hutter, 2017, introduced cosine annealing).</p>
+
+<div class="formula" data-name="Linear warmup + cosine decay">
+  <div class="tex">$$\htmlClass{t1}{\eta_t} = \htmlClass{t2}{\eta_{\text{peak}}}\,\frac{\htmlClass{t6}{t}}{\htmlClass{t4}{T_w}} \;\;\text{if } \htmlClass{t6}{t} \lt \htmlClass{t4}{T_w}, \qquad \htmlClass{t1}{\eta_t} = \htmlClass{t3}{\eta_{\min}} + \tfrac{1}{2}\big(\htmlClass{t2}{\eta_{\text{peak}}} - \htmlClass{t3}{\eta_{\min}}\big)\Big(1 + \cos\Big(\pi\,\frac{\htmlClass{t6}{t} - \htmlClass{t4}{T_w}}{\htmlClass{t5}{T} - \htmlClass{t4}{T_w}}\Big)\Big) \;\;\text{otherwise}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\eta_t\)</dt><dd>learning rate used at step \(t\)</dd></div>
+    <div data-t="t2"><dt>\(\eta_{\text{peak}}\)</dt><dd>maximum learning rate, reached at the end of warmup (Llama 2 7B: \(3\times10^{-4}\))</dd></div>
+    <div data-t="t3"><dt>\(\eta_{\min}\)</dt><dd>floor at the end of training, often 10% of peak in pretraining, 0 in many fine-tuning scripts</dd></div>
+    <div data-t="t4"><dt>\(T_w\)</dt><dd>number of warmup steps (Llama 2: 2000; fine-tuning: often a few percent of the run)</dd></div>
+    <div data-t="t5"><dt>\(T\)</dt><dd>total training steps</dd></div>
+    <div data-t="t6"><dt>\(t\)</dt><dd>current step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Ramp up in a straight line, then glide down along half a cosine wave: slow decrease at first, fastest in the middle, gentle again near the end.</p>
+  <p class="why"><b>Why it matters</b>The decay half shrinks the minibatch-noise cloud from the previous sections, which is why loss curves often drop noticeably in the last stretch of a cosine schedule. The warmup half is about the first few hundred steps, explained below.</p>
+</div>
+
+<div id="w-sched"></div>
+
+<h3>Why warmup helps</h3>
+<p>There's no single proven reason, but two explanations have solid support and both match the rest of this module.</p>
+<ul>
+  <li>At the start, Adam's statistics are unreliable. At step 5, \(\hat v\) is an average of five squared gradients. For some parameters it's badly underestimated, and dividing by a too-small \(\sqrt{\hat v}\) produces huge steps. Liu et al. (2020, RAdam) traced warmup's benefit largely to this variance problem.</li>
+  <li>The network also tends to start in a sharp region. At initialization the curvature can be high, so the full peak learning rate would violate \(\eta \lt 2/\lambda_{\max}\) and blow up. Small early steps let training move into flatter territory where a large \(\eta\) is stable (Gilmer et al., 2022, and Kalra &amp; Barkeshli, 2024, study this). It's the edge-of-stability idea run in reverse.</li>
+</ul>
+<p>Transformers with the original post-LayerNorm arrangement were notoriously dependent on warmup. Pre-LN (Xiong et al., 2020), now standard, is more forgiving but still uses it.</p>
+
+<div class="pitfall"><b>Pitfall · schedules count optimizer steps, not batches</b>
+<p>With gradient accumulation of 8, 80,000 micro-batches is 10,000 optimizer steps. Pass the scheduler the number of <code>optimizer.step()</code> calls, and call <code>scheduler.step()</code> once per optimizer step, after <code>optimizer.step()</code>. Get this wrong and your cosine finishes an eighth of the way through training, or never decays at all. Also note that Hugging Face's <code>get_cosine_schedule_with_warmup</code> decays to exactly 0 and starts warmup at 0, so the very first update uses a learning rate of 0.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="clipping">Gradient clipping and loss spikes</h2>
+
+<p>Every so often a batch produces a gradient tens or hundreds of times larger than normal: an odd document, a rare token, a numerical hiccup. One giant step can undo hours of training. The standard guard is to cap the gradient's overall length before the optimizer sees it.</p>
+
+<div class="formula" data-name="Clip by global norm">
+  <div class="tex">$$\htmlClass{t1}{g} \;\leftarrow\; \htmlClass{t1}{g} \cdot \min\!\left(1,\; \frac{\htmlClass{t2}{c}}{\lVert \htmlClass{t1}{g} \rVert_2}\right), \qquad \lVert \htmlClass{t1}{g} \rVert_2 = \sqrt{\textstyle\sum_{\htmlClass{t3}{p}} \lVert g_{\htmlClass{t3}{p}} \rVert_2^2}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(g\)</dt><dd>the full gradient: all parameter tensors' gradients viewed as one long vector</dd></div>
+    <div data-t="t2"><dt>\(c\)</dt><dd>the threshold, <code>max_norm</code>. 1.0 is the common LLM value (GPT-3, Llama 2)</dd></div>
+    <div data-t="t3"><dt>\(p\)</dt><dd>each parameter tensor. The norm is <em>global</em>, computed over all of them together</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>If the whole gradient vector is longer than \(c\), shrink it to length exactly \(c\). If it's shorter, leave it alone. Every tensor gets the same scale factor, so the direction never changes.</p>
+  <p class="why"><b>Why it matters</b>It bounds the damage from one bad batch while leaving normal steps untouched. The norm before clipping (what <code>clip_grad_norm_</code> returns) is one of the most useful numbers to log during training.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 760 270" id="fig-clip"></svg>
+<figcaption>Left: clipping by global norm rescales the whole gradient onto the sphere of radius \(c\); the direction is preserved. Right: clipping each component independently (<code>clip_grad_value_</code>) clamps coordinates to \([-c, c]\), which changes the direction. Global-norm clipping is the standard choice for transformers.</figcaption></figure>
+
+<h3>Loss spikes</h3>
+<p>Large runs occasionally show a sudden jump in loss, sometimes recovering in a few hundred steps, sometimes diverging for good. Causes vary: a learning rate near the stability edge, bad data, attention logits that grow until softmax saturates, or Adam's \(\hat v\) lagging behind a sudden change in gradient scale. The remedies teams report, roughly in the order they reach for them:</p>
+<ol>
+  <li>Make sure clipping is on, and watch the gradient-norm curve. Spikes in the norm usually precede spikes in the loss.</li>
+  <li>Lower the peak learning rate, lengthen warmup, or drop \(\beta_2\) from 0.999 to 0.95.</li>
+  <li>Restart from a checkpoint before the spike and skip the offending batches. The PaLM team did exactly this, rewinding about 100 steps and skipping roughly 200–500 batches (Chowdhery et al., 2022).</li>
+  <li>Architectural stabilizers: QK-norm on attention (Dehghani et al., 2023) and an auxiliary z-loss on the softmax normalizer (used in PaLM).</li>
+</ol>
+
+<div class="mle"><b>MLE angle · what to log every step</b>
+<p>Loss, learning rate, and pre-clip gradient norm, at minimum. If the gradient norm sits above <code>max_norm</code> most of the time, clipping has quietly become your learning-rate schedule. The fix is usually a lower learning rate, not a higher threshold. A slow upward drift in the norm over thousands of steps is an early warning worth investigating before it becomes a spike.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="surface">Saddle points, local minima, and high-dimensional loss surfaces</h2>
+
+<p>Where the gradient is zero, gradient descent stops. These <em>critical points</em> come in three kinds, told apart by the Hessian's eigenvalues, the curvatures along each principal direction:</p>
+
+<table class="t">
+  <thead><tr><th>Critical point</th><th>Hessian eigenvalues</th><th>Shape</th><th>Problem for training?</th></tr></thead>
+  <tbody>
+    <tr><td>Local minimum</td><td>all positive</td><td>bowl</td><td>Only if its loss is much worse than other minima</td></tr>
+    <tr><td>Local maximum</td><td>all negative</td><td>dome</td><td>No; any nudge rolls you off</td></tr>
+    <tr><td>Saddle point</td><td>mixed signs</td><td>mountain pass</td><td>It slows training: gradients are tiny nearby</td></tr>
+  </tbody>
+</table>
+
+<p>Low-dimensional intuition says local minima are the danger. In high dimensions it's the reverse. For a point to be a minimum, the curvature must be positive in <em>every one</em> of millions of directions at once; if the signs behaved anything like independent coin flips, that would essentially never happen by chance. Dauphin et al. (2014) argued that most critical points with high loss in large networks are saddles, and that the plateaus seen in training are often the optimizer lingering near them. Noise from minibatches helps push it off.</p>
+
+<figure class="fig wide"><div id="fig-saddle" class="two-up"></div>
+<figcaption>Left: \(\mathcal{L} = \tfrac12\theta_1^2 - \tfrac12\theta_2^2 + \tfrac14\theta_2^4\) has a saddle at the origin (curvature +1 along \(\theta_1\), −1 along \(\theta_2\)) and two minima at \(\theta_2 = \pm1\). Gradient descent started almost on the \(\theta_1\) axis slides into the saddle, sits there while the tiny \(\theta_2\) offset grows by a factor of 1.1 per step, then escapes. Right: the same run as a loss curve. The flat stretch is the plateau you see in real training runs; it's not a sign of convergence.</figcaption></figure>
+
+<div class="intuition"><b>What we believe about real loss surfaces</b>
+<p>A few empirical findings to calibrate your mental picture, each from a different line of work. In large networks, the local minima that training actually finds tend to have similar loss to each other (Choromanska et al., 2015). Different solutions can often be joined by paths along which the loss stays low (Garipov et al., 2018; Draxler et al., 2018). Pretty 3D loss-surface renderings (Li et al., 2018) are 2D slices through a space with billions of dimensions, useful for comparisons and misleading as literal maps. And the Hessian of a trained network typically has a handful of large eigenvalues and a huge bulk near zero: most directions are almost flat.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Autograd does the chain rule for you</h3>
+<p>Reproduce the computational-graph figure in PyTorch. The printed gradients should match the green labels.</p>
+<div class="code" data-lang="python" data-title="autograd_neuron.py"><pre><code>
+import torch
+
+x, y = torch.tensor(2.0), torch.tensor(1.0)
+w = torch.tensor(0.5, requires_grad=True)    # leaves we want gradients for
+b = torch.tensor(-0.5, requires_grad=True)
+
+a = torch.sigmoid(w * x + b)                 # forward pass records the graph
+L = (a - y) ** 2
+L.backward()                                 # reverse-mode chain rule
+print(L.item(), w.grad, b.grad)              # 0.1425  tensor(-0.3549)  tensor(-0.1774)
+
+# Gradients ACCUMULATE: run forward/backward again without zeroing...
+L = (torch.sigmoid(w * x + b) - y) ** 2
+L.backward()
+print(w.grad)                                # tensor(-0.7098): doubled, the sum-over-uses rule
+w.grad = None; b.grad = None                 # what optimizer.zero_grad() does
+
+# Gradient check against a central finite difference, in float64
+def loss_fn(w_):
+    return (torch.sigmoid(w_ * x.double() + b.detach().double()) - y.double()) ** 2
+w64 = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+loss_fn(w64).backward()
+h = 1e-6
+fd = (loss_fn(torch.tensor(0.5 + h, dtype=torch.float64)) - loss_fn(torch.tensor(0.5 - h, dtype=torch.float64))) / (2 * h)
+print(w64.grad.item(), fd.item())            # agree to ~1e-10
+</code></pre></div>
+
+<h3>2. Adam in fifteen lines of NumPy</h3>
+<p>Write it yourself, then check it against <code>torch.optim.AdamW</code> step for step. If the two disagree, one of the four formulas is wrong.</p>
+<div class="code" data-lang="python" data-title="adam_numpy.py"><pre><code>
+import numpy as np
+
+class AdamW:
+    def __init__(self, shape, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        self.m, self.v, self.t = np.zeros(shape), np.zeros(shape), 0
+        self.lr, (self.b1, self.b2), self.eps, self.wd = lr, betas, eps, weight_decay
+
+    def step(self, theta, g):
+        self.t += 1
+        self.m = self.b1 * self.m + (1 - self.b1) * g          # first moment
+        self.v = self.b2 * self.v + (1 - self.b2) * g * g      # second moment
+        m_hat = self.m / (1 - self.b1 ** self.t)               # bias correction
+        v_hat = self.v / (1 - self.b2 ** self.t)
+        theta = theta * (1 - self.lr * self.wd)                # decoupled weight decay
+        return theta - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+# --- verify against PyTorch on an ill-conditioned quadratic L = 0.5 * theta^T A theta
+import torch
+A = np.diag([1.0, 25.0])
+theta = np.array([-3.0, 2.0])
+mine = AdamW(2, lr=0.1, weight_decay=0.01)
+p = torch.tensor(theta.copy(), requires_grad=True)             # float64, like NumPy
+ref = torch.optim.AdamW([p], lr=0.1, weight_decay=0.01)
+for _ in range(200):
+    theta = mine.step(theta, A @ theta)                        # gradient of the quadratic is A theta
+    ref.zero_grad()
+    (0.5 * p @ torch.from_numpy(A) @ p).backward()
+    ref.step()
+print(theta, p.detach().numpy())                               # identical to ~1e-12
+</code></pre></div>
+
+<h3>3. A real training loop: AdamW + warmup/cosine + clipping</h3>
+<p>The same skeleton appears in nanoGPT, the Hugging Face <code>Trainer</code>, and most fine-tuning scripts. This version is self-contained so you can run it on a laptop CPU and watch the logged learning rate and gradient norm.</p>
+<div class="code" data-lang="python" data-title="train_loop.py"><pre><code>
+import torch
+from torch import nn
+from transformers import get_cosine_schedule_with_warmup
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(32, 256), nn.GELU(), nn.LayerNorm(256), nn.Linear(256, 1))
+w_true = torch.randn(32, 1) / 32 ** 0.5                       # keeps x @ w_true at unit scale
+
+# No weight decay on biases and norm gains (1-D tensors); decay the matrices.
+decay    = [p for p in model.parameters() if p.ndim &gt;= 2]
+no_decay = [p for p in model.parameters() if p.ndim &lt; 2]
+opt = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}],
+    lr=3e-3, betas=(0.9, 0.95), eps=1e-8,
+)
+total_steps, warmup_steps = 2000, 100
+sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+
+for step in range(total_steps):
+    xb = torch.randn(64, 32)                                   # a fresh minibatch, B = 64
+    yb = torch.sin(xb @ w_true) + 0.1 * torch.randn(64, 1)
+    loss = nn.functional.mse_loss(model(xb), yb)
+
+    loss.backward()
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # returns pre-clip norm
+    opt.step()
+    sched.step()                                               # once per optimizer step, after opt.step()
+    opt.zero_grad(set_to_none=True)
+
+    if step % 200 == 0 or step == total_steps - 1:
+        print(f"step {step:4d}  loss {loss.item():.4f}  lr {sched.get_last_lr()[0]:.2e}  grad_norm {gnorm.item():.3f}")
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when (1) your NumPy AdamW matches <code>torch.optim.AdamW</code> to within \(10^{-10}\) after 200 steps; (2) on the quadratic \(\tfrac12(\theta_1^2 + 10\theta_2^2)\), plain gradient descent converges at \(\eta = 0.19\) and diverges at \(\eta = 0.21\), and you can say why from the \(2/\lambda_{\max}\) bound; and (3) in the training loop you can point to the step where warmup ends in the logged LR, and you've re-run with <code>max_norm=0.1</code> and explained what changed in the loss curve.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="02-main" data-title="Check yourself · Gradients &amp; optimization">
+  <div class="q" data-answer="2"><p>\(f(w_1, w_2) = w_1^2 w_2 + 3w_2\). What is \(\nabla f\) at \((w_1, w_2) = (1, 2)\)?</p>
+    <ol><li>\((2, 4)\)</li><li>\((4, 1)\)</li><li>\((4, 4)\)</li><li>\((4, 7)\)</li></ol>
+    <div class="explain">\(\partial f/\partial w_1 = 2w_1w_2 = 4\). \(\partial f/\partial w_2 = w_1^2 + 3 = 4\). Hold the other variable constant for each partial, then evaluate at the point.</div></div>
+  <div class="q" data-answer="3"><p>Plain gradient descent on \(\mathcal{L} = \tfrac12(4\theta_1^2 + 100\theta_2^2)\) with \(\eta = 0.025\). What happens?</p>
+    <ol><li>Converges smoothly in both coordinates</li><li>Zigzags along \(\theta_2\) but converges</li><li>Converges along \(\theta_2\) but diverges along \(\theta_1\)</li><li>Diverges along \(\theta_2\) while \(\theta_1\) converges</li></ol>
+    <div class="explain">The curvatures are 4 and 100. Along \(\theta_2\): \(\eta\lambda = 2.5 \gt 2\), so the factor is \(1-2.5 = -1.5\) and \(\theta_2\) grows 1.5× (with a sign flip) every step. Along \(\theta_1\): \(\eta\lambda = 0.1\), factor 0.9, converges. The stable range is \(\eta \lt 2/100 = 0.02\).</div></div>
+  <div class="q" data-answer="0"><p>Adam with default \(\beta_1 = 0.9,\ \beta_2 = 0.999\), \(\eta = 10^{-3}\). At step 1, a parameter's gradient is \(g_1 = 0.02\). How large is its first update (ignore \(\epsilon\))?</p>
+    <ol><li>About \(10^{-3}\), i.e. \(\eta\), whatever the size of \(g_1\)</li><li>\(2\times10^{-5}\), i.e. \(\eta g_1\)</li><li>About \(3.2\times10^{-3}\)</li><li>\(2\times10^{-6}\)</li></ol>
+    <div class="explain">\(m_1 = 0.1 \cdot 0.02 = 0.002\), so \(\hat m_1 = 0.002/0.1 = 0.02\). \(v_1 = 0.001 \cdot 0.0004\), so \(\hat v_1 = 0.0004\) and \(\sqrt{\hat v_1} = 0.02\). The ratio is exactly 1, and the update is \(\eta\). Option C is what you'd get <em>without</em> bias correction: \(0.002/\sqrt{4\times10^{-7}} \approx 3.16\).</div></div>
+  <div class="q" data-answer="1"><p>\(L = (a-1)^2\), \(a = \sigma(z)\), \(z = 2w\). At the current \(w\), \(a = 0.8\). What is \(dL/dw\)?</p>
+    <ol><li>\(-0.4\)</li><li>\(-0.128\)</li><li>\(-0.064\)</li><li>\(0.16\)</li></ol>
+    <div class="explain">Multiply the local derivatives along the chain: \(\frac{dL}{da} = 2(a-1) = -0.4\), \(\frac{da}{dz} = a(1-a) = 0.16\), \(\frac{dz}{dw} = 2\). Product: \(-0.4 \times 0.16 \times 2 = -0.128\). Option C forgets the factor 2 from \(z = 2w\).</div></div>
+  <div class="q" data-answer="2"><p>You raise the batch size from 32 to 512, keeping everything else fixed. By how much does the standard deviation of the minibatch gradient fall?</p>
+    <ol><li>16×</li><li>2×</li><li>4×</li><li>It doesn't; the noise comes from the data, not the batch</li></ol>
+    <div class="explain">Noise scales as \(\sigma/\sqrt{B}\). The batch grew 16×, so the noise falls by \(\sqrt{16} = 4\). That square root is why bigger batches show diminishing returns past the critical batch size.</div></div>
+  <div class="q" data-answer="1"><p>A model has two parameter tensors whose gradients have norms 6 and 8. You call <code>clip_grad_norm_(params, max_norm=5)</code>. What are their norms afterwards?</p>
+    <ol><li>5 and 5</li><li>3 and 4</li><li>5 and 8</li><li>2.5 and 2.5</li></ol>
+    <div class="explain">The global norm is \(\sqrt{6^2 + 8^2} = 10 \gt 5\), so every gradient is multiplied by \(5/10 = 0.5\), giving 3 and 4. The combined norm is now exactly 5 and the direction is unchanged. Option A is what per-tensor clipping would do, which changes the direction.</div></div>
+  <div class="q" data-answer="3"><p>SGD with momentum (PyTorch convention), \(\mu = 0.9\), learning rate \(\eta\). The gradient stays at the same value \(g\) for many steps. What does each step's displacement approach?</p>
+    <ol><li>\(\eta g\)</li><li>\(0.9\,\eta g\)</li><li>\(1.9\,\eta g\)</li><li>\(10\,\eta g\)</li></ol>
+    <div class="explain">The velocity converges to the fixed point of \(v = 0.9v + g\), which is \(v = g/(1-0.9) = 10g\). Each step moves \(\eta v = 10\eta g\). That's the 10× acceleration along consistent directions; it's also why switching from plain SGD to momentum usually requires lowering \(\eta\).</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, widget, fmtNum, rng, palette, clamp, lerp, heat, katex } = C;
+
+  /* ============================================================ shared helpers */
+  let uidN = 0;
+  const uid = p => p + "-" + (++uidN) + "-" + Math.random().toString(36).slice(2, 6);
+  function arrowMarker(s, id, color) {
+    const defs = svg("defs");
+    defs.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color })));
+    s.appendChild(defs);
+  }
+  function line(g, x1, y1, x2, y2, color, o) {
+    o = o || {};
+    const n = svg("line", { x1, y1, x2, y2, stroke: color, "stroke-width": o.w || 1.6, "stroke-dasharray": o.dash || null, "marker-end": o.marker ? `url(#${o.marker})` : null, opacity: o.opacity || null });
+    g.appendChild(n); return n;
+  }
+  function txt(g, x, y, t, o) {
+    o = o || {};
+    const n = svg("text", { x, y, "font-size": o.size || 11.5, fill: o.color || palette.ink, "text-anchor": o.anchor || "start", class: o.mono === false ? null : "mono", "font-weight": o.bold ? 600 : null, text: t });
+    g.appendChild(n); return n;
+  }
+  const finite = p => isFinite(p[0]) && isFinite(p[1]);
+  function pathD(pts, sx, sy) {
+    return pts.filter(finite).map((p, i) => (i ? "L" : "M") + clamp(sx(p[0]), -4000, 4000).toFixed(1) + "," + clamp(sy(p[1]), -4000, 4000).toFixed(1)).join("");
+  }
+  function thin(pts, max) {
+    if (pts.length <= max) return pts;
+    const k = Math.ceil(pts.length / max);
+    return pts.filter((_, i) => i % k === 0 || i === pts.length - 1);
+  }
+
+  /* Marching-squares contour lines of f(x, y) at the given levels. */
+  function contours(g, f, xr, yr, levels, sx, sy, o) {
+    o = o || {};
+    const nx = o.nx || 110, ny = o.ny || 64;
+    const X = i => xr[0] + (xr[1] - xr[0]) * i / nx, Y = j => yr[0] + (yr[1] - yr[0]) * j / ny;
+    const V = [];
+    for (let j = 0; j <= ny; j++) { const row = []; for (let i = 0; i <= nx; i++) row.push(f(X(i), Y(j))); V.push(row); }
+    levels.forEach((lv, k) => {
+      let d = "";
+      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+        const c = [[X(i), Y(j), V[j][i]], [X(i + 1), Y(j), V[j][i + 1]], [X(i + 1), Y(j + 1), V[j + 1][i + 1]], [X(i), Y(j + 1), V[j + 1][i]]];
+        const pts = [];
+        for (let e = 0; e < 4; e++) {
+          const a = c[e], b = c[(e + 1) % 4];
+          if ((a[2] < lv) !== (b[2] < lv)) { const t = (lv - a[2]) / (b[2] - a[2]); pts.push([sx(a[0] + (b[0] - a[0]) * t), sy(a[1] + (b[1] - a[1]) * t)]); }
+        }
+        for (let p = 0; p + 1 < pts.length; p += 2) d += "M" + pts[p][0].toFixed(1) + "," + pts[p][1].toFixed(1) + "L" + pts[p + 1][0].toFixed(1) + "," + pts[p + 1][1].toFixed(1);
+      }
+      const t = levels.length > 1 ? k / (levels.length - 1) : 0;
+      g.appendChild(svg("path", { d, fill: "none", stroke: o.stroke ? o.stroke(t, lv) : heat(0.85 - 0.6 * t, "green"), "stroke-width": o.width || 1.1, opacity: o.opacity || null }));
+    });
+  }
+
+  /* A contour plot with clipped overlay layers, click-to-data mapping, equal aspect option. */
+  function surface(container, o) {
+    const W = o.width || 760, H = o.height || 400, m = { l: 44, r: 14, t: 12, b: 40 };
+    const innerW = W - m.l - m.r, innerH = H - m.t - m.b;
+    const P = plot(container, { width: W, height: H, x: o.x || [-1, 1], y: o.y || [-1, 1], xlabel: o.xlabel || "θ₁", ylabel: o.ylabel || "θ₂", margin: m });
+    const S = { P };
+    S.set = (f, levels, xr, yr) => {
+      if (o.equal) { const cy = yr ? (yr[0] + yr[1]) / 2 : 0, half = (xr[1] - xr[0]) * innerH / innerW / 2; yr = [cy - half, cy + half]; }
+      P.x = xr.slice(); P.y = yr.slice();
+      P.draw([]);
+      const id = uid("clip");
+      const defs = svg("defs"); defs.appendChild(svg("clipPath", { id }, svg("rect", { x: m.l, y: m.t, width: innerW, height: innerH }))); P.svg.appendChild(defs);
+      (o.markers || []).forEach(([mid, col]) => arrowMarker(P.svg, mid, col));
+      S.base = svg("g", { "clip-path": `url(#${id})` }); P.svg.appendChild(S.base);
+      S.over = svg("g", { "clip-path": `url(#${id})` }); P.svg.appendChild(S.over);
+      S.top = svg("g"); P.svg.appendChild(S.top);
+      contours(S.base, f, P.x, P.y, levels, P.sx, P.sy, o.contour);
+    };
+    S.clear = () => { [S.over, S.top].forEach(g => { while (g.firstChild) g.removeChild(g.firstChild); }); };
+    S.toData = evt => {
+      const pt = P.svg.createSVGPoint(); pt.x = evt.clientX; pt.y = evt.clientY;
+      const q = pt.matrixTransform(P.svg.getScreenCTM().inverse());
+      return [P.x[0] + (q.x - m.l) / innerW * (P.x[1] - P.x[0]), P.y[0] + (H - m.b - q.y) / innerH * (P.y[1] - P.y[0])];
+    };
+    S.inside = p => p[0] >= P.x[0] && p[0] <= P.x[1] && p[1] >= P.y[0] && p[1] <= P.y[1];
+    S.dot = (p, color, r, g) => { if (finite(p)) (g || S.over).appendChild(svg("circle", { cx: P.sx(p[0]), cy: P.sy(p[1]), r: r || 4, fill: color, stroke: "#fff", "stroke-width": 1.2 })); };
+    S.ring = (p, color, r) => { if (finite(p)) S.over.appendChild(svg("circle", { cx: P.sx(p[0]), cy: P.sy(p[1]), r: r || 6, fill: "none", stroke: color, "stroke-width": 1.8 })); };
+    S.cross = (p, color) => { const x = P.sx(p[0]), y = P.sy(p[1]); S.over.appendChild(svg("path", { d: `M${x - 6},${y - 6}L${x + 6},${y + 6}M${x - 6},${y + 6}L${x + 6},${y - 6}`, stroke: color, "stroke-width": 2.2 })); };
+    if (o.f) S.set(o.f, o.levels, o.x, o.y);
+    return S;
+  }
+  const logLevels = (a, r, n) => Array.from({ length: n }, (_, i) => a * r ** i);
+  const etaFmt = v => { const e = 10 ** v; return e >= 0.01 ? e.toFixed(3) : e.toExponential(1); };
+  const sig = x => 1 / (1 + Math.exp(-x));
+
+  /* ============================================================ derivative explorer */
+  (function () {
+    const w = widget("w-deriv", { title: "Slope at a point: tangent vs secant", kicker: "Interactive", note: "The green line is the tangent, with slope f′(x). The gold dashed line is the secant through x and x + h; its slope is the quotient inside the limit. Shrink h and the two slopes agree. The lower panel plots f′ itself: the derivative is a function too. At the ReLU kink (x = 0) the derivative is undefined, and PyTorch uses 0." });
+    const FN = {
+      sq:   { label: "x²",    f: x => x * x, d: x => 2 * x, x: [-3, 3], y: [-1, 12], dy: [-6.5, 6.5], s: [-2.8, 2.8], x0: 1.5, dtex: "2x" },
+      sin:  { label: "sin x", f: Math.sin, d: Math.cos, x: [-6.3, 6.3], y: [-1.6, 2.6], dy: [-1.3, 1.3], s: [-6, 6], x0: 1, dtex: "\\cos x" },
+      relu: { label: "ReLU",  f: x => Math.max(0, x), d: x => (x > 0 ? 1 : 0), x: [-3, 3], y: [-1, 3], dy: [-0.4, 1.4], s: [-2.8, 2.8], x0: 1, dtex: "\\begin{cases}1 \\text{ if } x \\gt 0 \\\\ 0 \\text{ if } x \\lt 0\\end{cases}" },
+      sig:  { label: "σ(x)",  f: sig, d: x => sig(x) * (1 - sig(x)), x: [-6, 6], y: [-0.2, 1.2], dy: [-0.03, 0.3], s: [-5.5, 5.5], x0: 0, dtex: "\\sigma(x)\\,(1-\\sigma(x))" },
+      log:  { label: "log x", f: Math.log, d: x => 1 / x, x: [0.05, 5], y: [-3, 2], dy: [0, 6], s: [0.15, 4.5], x0: 1, dtex: "1/x" }
+    };
+    let key = "sq";
+    const xOf = t => lerp(FN[key].s[0], FN[key].s[1], t);
+    const tOf = x => (x - FN[key].s[0]) / (FN[key].s[1] - FN[key].s[0]);
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Function" })));
+    seg(c1, { options: Object.keys(FN).map(k => ({ value: k, label: FN[k].label })), value: "sq", onChange: v => { key = v; xs.value = tOf(FN[v].x0); draw(); } });
+    w.controls.appendChild(c1);
+    const xs = slider(w.controls, { label: "Point x", min: 0, max: 1, step: 0.0025, value: tOf(FN.sq.x0), fmt: t => xOf(t).toFixed(2), onInput: draw });
+    const hs = slider(w.controls, { label: "Nudge h (secant)", min: -3, max: 0, step: 0.05, value: -0.3, fmt: v => { const h = 10 ** v; return h >= 0.01 ? h.toFixed(3) : h.toExponential(1); }, onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [-3, 3], y: [-1, 9], xlabel: "x", ylabel: "f(x)" });
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const D = plot(wrap2, { width: 760, height: 170, x: [-3, 3], y: [-1, 1], xlabel: "x", ylabel: "f′(x)" });
+    const texOut = el("div", { class: "dyn-tex" }); w.body.appendChild(texOut);
+    const set = stats(w.body, [{ key: "f", label: "f(x)" }, { key: "d", label: "f′(x), exact" }, { key: "sec", label: "Secant slope" }, { key: "err", label: "Secant error" }]);
+    function draw() {
+      const F = FN[key], x = xOf(xs.value), h = 10 ** hs.value;
+      P.x = F.x.slice(); P.y = F.y.slice(); D.x = F.x.slice(); D.y = F.dy.slice();
+      const fx = F.f(x), kink = key === "relu" && Math.abs(x) < 1e-9;
+      const dx = F.d(x), sec = (F.f(x + h) - fx) / h;
+      P.draw([
+        { fn: F.f, color: palette.ink, width: 2.2, label: "f(x) = " + F.label },
+        { fn: t => fx + dx * (t - x), color: palette.green, width: 1.8, label: "tangent: slope f′(x)" },
+        { fn: t => fx + sec * (t - x), color: palette.gold, width: 1.5, dash: "5 4", label: "secant: slope [f(x+h) − f(x)] / h" },
+        { marker: [x + h, F.f(x + h)], color: palette.gold, r: 4 },
+        { marker: [x, fx], color: palette.green }
+      ]);
+      D.draw([
+        { hline: 0, color: palette.faint, dash: "2 3" },
+        { fn: F.d, color: palette.blue, width: 2, label: "f′(x)" },
+        { marker: [x, dx], color: palette.blue, label: kink ? "undefined (0 used)" : fmtNum(dx, 3) }
+      ]);
+      texOut.innerHTML = katex(`f'(x) = ${F.dtex} \\quad\\Rightarrow\\quad f'(${x.toFixed(2)}) = ${kink ? "\\text{undefined}" : dx.toFixed(4)}`);
+      set("f", fmtNum(fx, 3));
+      set("d", kink ? "undefined" : fmtNum(dx, 4), null, kink ? "kink: PyTorch returns 0" : "slope of the tangent");
+      set("sec", fmtNum(sec, 4), null, "h = " + (h >= 0.01 ? h.toFixed(3) : h.toExponential(1)));
+      const err = Math.abs(sec - dx);
+      set("err", kink ? "—" : err.toExponential(1), kink ? null : err < 1e-3 ? "good" : err < 0.05 ? "warn" : "bad", "shrinks roughly ∝ h");
+    }
+    draw();
+  })();
+
+  /* ============================================================ gradient on a contour plot */
+  (function () {
+    const f = (a, b) => a * a + a * b + 3 * b * b;
+    const gr = (a, b) => [2 * a + b, a + 6 * b];
+    const w = widget("w-grad", { title: "The gradient is perpendicular to the contour", kicker: "Interactive", note: "Loss f(w₁, w₂) = w₁² + w₁w₂ + 3w₂². Thin lines are contours (equal loss); the dark one passes through your point. Brick: the gradient (uphill), drawn at 0.15× scale, with its two partial-derivative components dashed. Green: the negative gradient, the steepest-descent direction. Small grey arrows show the downhill direction across the whole surface. Click the plot to move the point." });
+    const M = { up: uid("gup"), dn: uid("gdn"), comp: uid("gc"), fld: uid("gf") };
+    const s1 = slider(w.controls, { label: "w₁", min: -3.6, max: 3.6, step: 0.05, value: -2.5, fmt: v => v.toFixed(2), onInput: draw });
+    const s2 = slider(w.controls, { label: "w₂", min: -1.9, max: 1.9, step: 0.05, value: 1.2, fmt: v => v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const S = surface(wrap, { width: 760, height: 400, equal: true, xlabel: "w₁", ylabel: "w₂", markers: [[M.up, palette.brick], [M.dn, palette.green], [M.comp, palette.muted], [M.fld, palette.faint]] });
+    S.set(f, [0.25, 1, 2, 4, 7, 11, 16, 22, 30], [-4, 4], [-2, 2]);
+    // downhill field on the static layer
+    for (let i = 0; i <= 14; i++) for (let j = 0; j <= 7; j++) {
+      const a = -3.75 + i * 7.5 / 14, b = -1.8 + j * 3.6 / 7, g = gr(a, b), n = Math.hypot(g[0], g[1]);
+      if (n < 1e-6) continue;
+      const L = 0.22, ex = a - L * g[0] / n, ey = b - L * g[1] / n;
+      line(S.base, S.P.sx(a), S.P.sy(b), S.P.sx(ex), S.P.sy(ey), palette.faint, { w: 1, marker: M.fld, opacity: 0.8 });
+    }
+    S.cross([0, 0], palette.green);
+    const texOut = el("div", { class: "dyn-tex" }); w.body.appendChild(texOut);
+    const set = stats(w.body, [{ key: "f", label: "f(w)" }, { key: "g1", label: "∂f/∂w₁ = 2w₁ + w₂" }, { key: "g2", label: "∂f/∂w₂ = w₁ + 6w₂" }, { key: "n", label: "‖∇f‖" }]);
+    S.P.svg.addEventListener("click", e => { const p = S.toData(e); if (!S.inside(p)) return; s1.value = clamp(p[0], -3.6, 3.6); s2.value = clamp(p[1], -1.9, 1.9); draw(); });
+    S.P.svg.style.cursor = "crosshair";
+    function draw() {
+      S.clear();
+      const a = s1.value, b = s2.value, f0 = f(a, b), g = gr(a, b), n = Math.hypot(g[0], g[1]), k = 0.15;
+      const sx = S.P.sx, sy = S.P.sy;
+      if (f0 > 1e-6) contours(S.over, f, S.P.x, S.P.y, [f0], sx, sy, { stroke: () => palette.ink, width: 1.8, nx: 160, ny: 84 });
+      if (n > 1e-6) {
+        line(S.over, sx(a), sy(b), sx(a + k * g[0]), sy(b), palette.muted, { w: 1.3, dash: "4 3", marker: M.comp });
+        line(S.over, sx(a), sy(b), sx(a), sy(b + k * g[1]), palette.muted, { w: 1.3, dash: "4 3", marker: M.comp });
+        line(S.over, sx(a), sy(b), sx(a + k * g[0]), sy(b + k * g[1]), palette.brick, { w: 2.4, marker: M.up });
+        line(S.over, sx(a), sy(b), sx(a - k * g[0]), sy(b - k * g[1]), palette.green, { w: 2.4, marker: M.dn });
+        txt(S.top, sx(a + k * g[0]) + 6, sy(b + k * g[1]) - 6, "∇f", { color: palette.brick, size: 12.5, bold: true });
+        txt(S.top, sx(a - k * g[0]) + 6, sy(b - k * g[1]) + 14, "−∇f", { color: palette.green, size: 12.5, bold: true });
+      }
+      S.dot([a, b], palette.ink, 5);
+      texOut.innerHTML = katex(`\\nabla f(${a.toFixed(2)},\\, ${b.toFixed(2)}) = \\big(2w_1 + w_2,\\; w_1 + 6w_2\\big) = \\big(${g[0].toFixed(2)},\\; ${g[1].toFixed(2)}\\big)`);
+      set("f", fmtNum(f0, 3), null, "loss at this point");
+      set("g1", fmtNum(g[0], 2), null, "sensitivity to w₁ alone");
+      set("g2", fmtNum(g[1], 2), null, "sensitivity to w₂ alone");
+      set("n", fmtNum(n, 2), null, "slope in the steepest direction");
+    }
+    draw();
+  })();
+
+  /* ============================================================ gradient descent runner */
+  (function () {
+    const SURF = {
+      quad: { f: (x, y) => 0.5 * (x * x + 10 * y * y), g: (x, y) => [x, 10 * y], lmax: 10, x: [-4, 4], start: [-3.5, 1.5], min: [0, 0], levels: [0.05, 0.25, 0.75, 1.5, 3, 5, 8, 12, 18, 26], eta: Math.log10(0.05), max: 250, sps: 20, note: "Hessian diag(1, 10): λ_max = 10 exactly" },
+      rosen: { f: (x, y) => (1 - x) ** 2 + 100 * (y - x * x) ** 2, g: (x, y) => [-2 * (1 - x) - 400 * x * (y - x * x), 200 * (y - x * x)], lmax: 1001.6, x: [-2, 2], yc: 0.5, start: [-1.2, 1], min: [1, 1], levels: [0.05, 0.3, 1.5, 5, 15, 40, 100, 250, 600], eta: -3, max: 4000, sps: 500, note: "λ_max ≈ 1002 at the minimum, ≈ 1500 at the start" }
+    };
+    const w = widget("w-gd", { title: "Gradient descent: converge, zigzag, or explode", kicker: "Simulation", note: "Each dot is one step θ ← θ − η∇L. Dragging the learning rate recomputes the whole run instantly; <b>Run</b> replays it step by step. Click anywhere on the plot to start from there. On the quadratic, the 2/λ_max rule predicts the outcome exactly. On Rosenbrock, curvature changes along the path, so the rule is only a local guide: try η ≈ 0.002 (fast), 0.004 (stuck bouncing across the valley), and 0.01 (diverges)." });
+    let key = "quad", st = null, running = false, raf = null, lastTs = 0, acc = 0, startPt = SURF.quad.start.slice();
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Surface" })));
+    seg(c1, { options: [{ value: "quad", label: "quadratic ½(θ₁² + 10θ₂²)" }, { value: "rosen", label: "Rosenbrock valley" }], value: "quad", onChange: v => { key = v; startPt = SURF[v].start.slice(); es.value = SURF[v].eta; build(); computeAll(); } });
+    w.controls.appendChild(c1);
+    const es = slider(w.controls, { label: "Learning rate η", min: -4, max: -0.3, step: 0.01, value: SURF.quad.eta, fmt: etaFmt, onInput: () => { stop(); computeAll(); } });
+    const btns = el("div", { class: "btnrow" });
+    const runBtn = el("button", { class: "btn primary", text: "Run", onclick: () => (running ? stop() : start()) });
+    btns.appendChild(runBtn);
+    btns.appendChild(el("button", { class: "btn", text: "Step", onclick: () => { stop(); if (!st || st.done) reset(); stepOnce(); render(); } }));
+    btns.appendChild(el("button", { class: "btn", text: "Reset", onclick: () => { stop(); reset(); render(); } }));
+    w.controls.appendChild(btns);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const S = surface(wrap, { width: 760, height: 400, equal: true });
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const LP = plot(wrap2, { width: 760, height: 170, x: [0, 150], y: [1e-8, 1e4], logy: true, xlabel: "step", ylabel: "loss", yticks: [1e-8, 1e-4, 1, 1e4], yfmt: v => (v === 1 ? "1" : "1e" + Math.round(Math.log10(v))) });
+    const set = stats(w.body, [{ key: "t", label: "Step" }, { key: "loss", label: "Loss" }, { key: "r", label: "η · λ_max" }, { key: "st", label: "Outcome" }]);
+    S.P.svg.addEventListener("click", e => { const p = S.toData(e); if (!S.inside(p)) return; stop(); startPt = p; computeAll(); });
+    S.P.svg.style.cursor = "crosshair";
+    function build() { const S0 = SURF[key]; S.set(S0.f, S0.levels, S0.x, S0.yc != null ? [S0.yc - 1, S0.yc + 1] : [-1, 1]); LP.x = [0, S0.max]; }
+    function reset() { const S0 = SURF[key]; st = { p: startPt.slice(), path: [startPt.slice()], losses: [S0.f(startPt[0], startPt[1])], t: 0, done: "" }; }
+    function stepOnce() {
+      const S0 = SURF[key], eta = 10 ** es.value;
+      if (st.done) return;
+      const g = S0.g(st.p[0], st.p[1]);
+      st.p = [st.p[0] - eta * g[0], st.p[1] - eta * g[1]]; st.t++;
+      const L = S0.f(st.p[0], st.p[1]);
+      st.path.push(st.p.slice()); st.losses.push(L);
+      if (!isFinite(L) || L > 1e8 || Math.abs(st.p[0]) > 1e4 || Math.abs(st.p[1]) > 1e4) st.done = "diverged";
+      else if (L < 1e-8) st.done = "converged";
+      else if (st.t >= S0.max) st.done = "max";
+    }
+    function computeAll() { reset(); while (!st.done) stepOnce(); render(); }
+    function outcome() {
+      const S0 = SURF[key], L = st.losses;
+      if (st.done === "diverged") return ["diverged", "bad", "blew up at step " + st.t];
+      if (st.done === "converged") return ["converged", "good", "loss < 1e-8 at step " + st.t];
+      const tail = L.slice(-60); let ups = 0;
+      for (let i = 1; i < tail.length; i++) if (tail[i] > tail[i - 1]) ups++;
+      if (!st.done) return ["running…", null, ""];
+      if (ups > 20) return ["bouncing", "warn", "loss not settling after " + S0.max + " steps"];
+      return ["still crawling", "warn", "not converged in " + S0.max + " steps"];
+    }
+    function render() {
+      const S0 = SURF[key], eta = 10 ** es.value;
+      S.clear();
+      const pts = st.path.filter(finite);
+      S.over.appendChild(svg("path", { d: pathD(thin(pts, 1500), S.P.sx, S.P.sy), fill: "none", stroke: palette.brick, "stroke-width": 1.4, "stroke-linejoin": "round", opacity: 0.9 }));
+      if (pts.length <= 260) pts.forEach(p => S.dot(p, palette.brick, 2.6));
+      S.cross(S0.min, palette.green);
+      S.ring(st.path[0], palette.ink, 6);
+      S.dot(st.p, palette.ink, 5);
+      const lpts = thin(st.losses.map((L, i) => [i, isFinite(L) ? clamp(L, 1e-12, 1e12) : 1e12]), 1500);
+      LP.draw([{ points: lpts, color: palette.brick, width: 1.8 }, { hline: 1e-8, color: palette.green, dash: "3 3" }]);
+      const r = eta * S0.lmax, rc = r < 1 ? "good" : r < 2 ? "warn" : "bad";
+      const lastL = st.losses[st.losses.length - 1];
+      set("t", String(st.t), null, "of " + S0.max + " max");
+      set("loss", isFinite(lastL) ? (lastL < 1e-3 || lastL > 1e4 ? lastL.toExponential(2) : fmtNum(lastL, 4)) : "∞", null, "start " + fmtNum(st.losses[0], 2));
+      set("r", fmtNum(r, 2), rc, (key === "quad" ? (r < 1 ? "< 1: smooth" : r < 2 ? "1–2: zigzag, converges" : "> 2: diverges") : "using λ_max at the minimum") + " · bound η < " + (2 / S0.lmax).toPrecision(2));
+      const [o, oc, os] = outcome();
+      set("st", o, oc, os);
+    }
+    let finishedRun = false;
+    function loop(ts) {
+      if (!running) return;
+      if (!lastTs) lastTs = ts;
+      acc += Math.min(0.1, (ts - lastTs) / 1000) * SURF[key].sps; lastTs = ts;
+      let n = Math.min(200, Math.floor(acc)); acc -= n;
+      while (n-- > 0 && !st.done) stepOnce();
+      render();
+      if (st.done) { finishedRun = true; stop(); return; }
+      raf = requestAnimationFrame(loop);
+    }
+    function start() { reset(); running = true; lastTs = 0; acc = 0; runBtn.textContent = "Pause"; raf = requestAnimationFrame(loop); }
+    function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = null; runBtn.textContent = "Run"; }
+    build(); computeAll();
+  })();
+
+  /* ============================================================ optimizer race */
+  (function () {
+    const R2 = Math.SQRT1_2;
+    const quadAxis = { f: (x, y) => 0.5 * (x * x + 25 * y * y), g: (x, y) => [x, 25 * y] };
+    const quadRot = {
+      f: (x, y) => { const u = (x + y) * R2, v = (y - x) * R2; return 0.5 * (u * u + 25 * v * v); },
+      g: (x, y) => { const u = (x + y) * R2, v = (y - x) * R2, gu = u, gv = 25 * v; return [R2 * gu - R2 * gv, R2 * gu + R2 * gv]; }
+    };
+    const rosen = { f: (x, y) => (1 - x) ** 2 + 100 * (y - x * x) ** 2, g: (x, y) => [-2 * (1 - x) - 400 * x * (y - x * x), 200 * (y - x * x)] };
+    const SURF = {
+      axis: Object.assign({ x: [-4, 4], yc: 0, start: [-3.5, 1.6], min: [0, 0], levels: [0.05, 0.25, 0.75, 1.5, 3, 6, 12, 24, 40], sgd: Math.log10(0.03), adam: -1, max: 200, sps: 25 }, quadAxis),
+      rot: Object.assign({ x: [-4, 4], yc: 0, start: [-3.2, -1.2], min: [0, 0], levels: [0.05, 0.25, 0.75, 1.5, 3, 6, 12, 24, 48, 96], sgd: Math.log10(0.03), adam: -1, max: 200, sps: 25 }, quadRot),
+      rosen: Object.assign({ x: [-2, 2], yc: 0.5, start: [-1.2, 1], min: [1, 1], levels: [0.05, 0.3, 1.5, 5, 15, 40, 100, 250, 600], sgd: Math.log10(0.0008), adam: Math.log10(0.02), max: 3000, sps: 300 }, rosen)
+    };
+    const OPT = [{ id: "sgd", label: "SGD", color: palette.brick }, { id: "mom", label: "Momentum", color: palette.blue }, { id: "adam", label: "Adam", color: palette.green }];
+    const w = widget("w-opt", { title: "SGD vs momentum vs Adam on the same surface", kicker: "Simulation", note: "All three start at the black ring and use exact gradients. SGD and momentum share the learning rate η; momentum adds μ. Adam has its own η because its steps are measured in parameter units, not gradient units. Compare the axis-aligned bowl with the rotated one: SGD and momentum behave identically on both (they don't care about rotation), Adam doesn't. Click the plot to choose a new start. At the standard μ = 0.9, momentum carries ten times SGD's step along consistent directions, so it overshoots and swings before settling; try μ ≈ 0.6 to see it damped." });
+    let key = "axis", beta2 = 0.999, runs = null, running = false, raf = null, lastTs = 0, acc = 0, t = 0, startPt = SURF.axis.start.slice();
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Surface" })));
+    seg(c1, { options: [{ value: "axis", label: "bowl κ=25, axis-aligned" }, { value: "rot", label: "same bowl, rotated 45°" }, { value: "rosen", label: "Rosenbrock" }], value: "axis", onChange: v => { key = v; startPt = SURF[v].start.slice(); es.value = SURF[v].sgd; ea.value = SURF[v].adam; build(); stop(); computeAll(); } });
+    w.controls.appendChild(c1);
+    const es = slider(w.controls, { label: "SGD / momentum η", min: -4, max: -0.8, step: 0.01, value: SURF.axis.sgd, fmt: etaFmt, onInput: () => { stop(); computeAll(); } });
+    const ms = slider(w.controls, { label: "Momentum μ", min: 0, max: 0.99, step: 0.01, value: 0.9, fmt: v => v.toFixed(2), onInput: () => { stop(); computeAll(); } });
+    const ea = slider(w.controls, { label: "Adam η", min: -3.5, max: 0, step: 0.01, value: SURF.axis.adam, fmt: etaFmt, onInput: () => { stop(); computeAll(); } });
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Adam β₂" })));
+    seg(c2, { options: [{ value: 0.999, label: "0.999" }, { value: 0.95, label: "0.95" }], value: 0.999, onChange: v => { beta2 = v; stop(); computeAll(); } });
+    w.controls.appendChild(c2);
+    const btns = el("div", { class: "btnrow" });
+    const runBtn = el("button", { class: "btn primary", text: "Run", onclick: () => (running ? stop() : start()) });
+    btns.appendChild(runBtn);
+    btns.appendChild(el("button", { class: "btn", text: "Reset", onclick: () => { stop(); reset(); render(); } }));
+    w.controls.appendChild(btns);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const S = surface(wrap, { width: 760, height: 400, equal: true });
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const LP = plot(wrap2, { width: 760, height: 170, x: [0, 200], y: [1e-8, 1e3], logy: true, xlabel: "step", ylabel: "loss", yticks: [1e-8, 1e-5, 1e-2, 10], yfmt: v => "1e" + Math.round(Math.log10(v)) });
+    const set = stats(w.body, OPT.map(o => ({ key: o.id, label: o.label })).concat([{ key: "win", label: "First below 1e-3" }]));
+    S.P.svg.addEventListener("click", e => { const p = S.toData(e); if (!S.inside(p)) return; stop(); startPt = p; computeAll(); });
+    S.P.svg.style.cursor = "crosshair";
+    function build() { const S0 = SURF[key]; S.set(S0.f, S0.levels, S0.x, [S0.yc - 1, S0.yc + 1]); LP.x = [0, S0.max]; }
+    function reset() {
+      const S0 = SURF[key], L0 = S0.f(startPt[0], startPt[1]);
+      t = 0;
+      runs = OPT.map(o => ({ o, p: startPt.slice(), v: [0, 0], m: [0, 0], s: [0, 0], path: [startPt.slice()], losses: [L0], dead: false, hit: -1 }));
+    }
+    function stepAll() {
+      const S0 = SURF[key], eta = 10 ** es.value, mu = ms.value, etaA = 10 ** ea.value, b1 = 0.9, b2 = beta2;
+      t++;
+      runs.forEach(r => {
+        if (r.dead) return;
+        const g = S0.g(r.p[0], r.p[1]);
+        for (let i = 0; i < 2; i++) {
+          if (r.o.id === "sgd") r.p[i] -= eta * g[i];
+          else if (r.o.id === "mom") { r.v[i] = mu * r.v[i] + g[i]; r.p[i] -= eta * r.v[i]; }
+          else {
+            r.m[i] = b1 * r.m[i] + (1 - b1) * g[i];
+            r.s[i] = b2 * r.s[i] + (1 - b2) * g[i] * g[i];
+            const mh = r.m[i] / (1 - b1 ** t), vh = r.s[i] / (1 - b2 ** t);
+            r.p[i] -= etaA * mh / (Math.sqrt(vh) + 1e-8);
+          }
+        }
+        const L = S0.f(r.p[0], r.p[1]);
+        r.path.push(r.p.slice()); r.losses.push(L);
+        if (!isFinite(L) || L > 1e8) r.dead = true;
+        if (r.hit < 0 && L < 1e-3) r.hit = t;
+      });
+    }
+    function computeAll() { reset(); while (t < SURF[key].max) stepAll(); render(); }
+    function render() {
+      const S0 = SURF[key];
+      S.clear();
+      S.cross(S0.min, palette.ink);
+      runs.forEach(r => {
+        S.over.appendChild(svg("path", { d: pathD(thin(r.path, 1500), S.P.sx, S.P.sy), fill: "none", stroke: r.o.color, "stroke-width": 1.6, "stroke-linejoin": "round", opacity: 0.9 }));
+        S.dot(r.p, r.o.color, 5);
+      });
+      S.ring(startPt, palette.ink, 6);
+      OPT.forEach((o, i) => {
+        const x = S.P.sx(S.P.x[1]) - 110, y = 26 + i * 17;
+        S.top.appendChild(svg("line", { x1: x, x2: x + 18, y1: y - 4, y2: y - 4, stroke: o.color, "stroke-width": 2.5 }));
+        txt(S.top, x + 24, y, o.label, { mono: false, size: 12 });
+      });
+      LP.draw(runs.map(r => ({ points: thin(r.losses.map((L, i) => [i, isFinite(L) ? clamp(L, 1e-12, 1e12) : 1e12]), 1200), color: r.o.color, width: 1.8, label: r.o.label })));
+      runs.forEach(r => {
+        const L = r.losses[r.losses.length - 1];
+        const txtL = r.dead ? "diverged" : (L < 1e-3 || L > 1e3 ? L.toExponential(1) : fmtNum(L, 3));
+        set(r.o.id, txtL, r.dead ? "bad" : L < 1e-3 ? "good" : L < 0.1 ? "warn" : "bad", r.hit > 0 ? "below 1e-3 at step " + r.hit : "loss after " + t + " steps");
+      });
+      const hits = runs.filter(r => r.hit > 0).sort((a, b) => a.hit - b.hit);
+      set("win", hits.length ? hits[0].o.label : "none yet", hits.length ? "good" : null, hits.length ? "step " + hits[0].hit : "no optimizer reached 1e-3");
+    }
+    function loop(ts) {
+      if (!running) return;
+      if (!lastTs) lastTs = ts;
+      acc += Math.min(0.1, (ts - lastTs) / 1000) * SURF[key].sps; lastTs = ts;
+      let n = Math.min(200, Math.floor(acc)); acc -= n;
+      while (n-- > 0 && t < SURF[key].max) stepAll();
+      render();
+      if (t >= SURF[key].max) { stop(); return; }
+      raf = requestAnimationFrame(loop);
+    }
+    function start() { reset(); running = true; lastTs = 0; acc = 0; runBtn.textContent = "Pause"; raf = requestAnimationFrame(loop); }
+    function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = null; runBtn.textContent = "Run"; }
+    build(); computeAll();
+  })();
+
+  /* ============================================================ LR schedule */
+  (function () {
+    const TOTAL = 10000;
+    const PEAKS = [1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 3e-4, 6e-4, 1e-3, 3e-3];
+    const w = widget("w-sched", { title: "Warmup + decay, step by step", kicker: "Interactive", note: "A 10,000-step run. The bold curve is the selected decay shape; the faint ones are the alternatives for comparison. WSD (warmup–stable–decay) holds the peak and decays only over the last 20% of steps; it's popular because you can branch a decay off any checkpoint (Hu et al., 2024; Hägele et al., 2024). The shaded band is warmup." });
+    let shape = "cos";
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Decay shape" })));
+    seg(c1, { options: [{ value: "cos", label: "cosine" }, { value: "lin", label: "linear" }, { value: "wsd", label: "WSD" }], value: "cos", onChange: v => { shape = v; draw(); } });
+    w.controls.appendChild(c1);
+    const ws = slider(w.controls, { label: "Warmup steps", min: 0, max: 3000, step: 50, value: 500, fmt: v => v + " (" + (100 * v / TOTAL).toFixed(1) + "%)", onInput: draw });
+    const ps = slider(w.controls, { label: "Peak LR", min: 0, max: PEAKS.length - 1, step: 1, value: 5, fmt: i => PEAKS[i].toExponential(0), onInput: draw });
+    const mn = slider(w.controls, { label: "Min LR (fraction of peak)", min: 0, max: 0.5, step: 0.01, value: 0.1, fmt: v => Math.round(v * 100) + "%", onInput: draw });
+    const is = slider(w.controls, { label: "Inspect step", min: 0, max: TOTAL, step: 50, value: 250, fmt: v => String(v), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 300, x: [0, TOTAL], y: [0, 1], xlabel: "optimizer step", ylabel: "learning rate", xfmt: v => (v === 0 ? "0" : v / 1000 + "k"), yfmt: v => (v === 0 ? "0" : v.toExponential(1).replace("e-", "e−")), margin: { l: 74 } });
+    const set = stats(w.body, [{ key: "lr", label: "LR at inspected step" }, { key: "pct", label: "Fraction of peak" }, { key: "mean", label: "Mean LR over run" }, { key: "hi", label: "Steps above 90% of peak" }]);
+    function lrAt(t, sh, Tw, peak, lo) {
+      if (Tw > 0 && t < Tw) return peak * t / Tw;
+      const p = (t - Tw) / Math.max(1, TOTAL - Tw);
+      if (sh === "cos") return lo + 0.5 * (peak - lo) * (1 + Math.cos(Math.PI * p));
+      if (sh === "lin") return peak - (peak - lo) * p;
+      const d0 = 0.8 * TOTAL;
+      return t < d0 ? peak : peak - (peak - lo) * (t - d0) / (TOTAL - d0);
+    }
+    function draw() {
+      const Tw = ws.value, peak = PEAKS[ps.value], lo = mn.value * peak, ti = is.value;
+      P.y = [0, peak * 1.15];
+      const others = ["cos", "lin", "wsd"].filter(s => s !== shape);
+      const names = { cos: "cosine", lin: "linear", wsd: "WSD" };
+      const layers = [];
+      if (Tw > 0) layers.push({ band: [0, Tw], color: palette.gold, opacity: 0.1 });
+      others.forEach(s => layers.push({ fn: t => lrAt(t, s, Tw, peak, lo), color: palette.faint, width: 1.3, dash: "4 3", samples: 400 }));
+      layers.push({ fn: t => lrAt(t, shape, Tw, peak, lo), color: palette.green, width: 2.4, label: "warmup + " + names[shape], samples: 500 });
+      layers.push({ hline: lo, color: palette.muted, dash: "2 3", label: lo > 0 ? "min " + lo.toExponential(1) : "min 0" });
+      layers.push({ vline: ti, color: palette.ink, dash: "2 3" });
+      const lrI = lrAt(ti, shape, Tw, peak, lo);
+      layers.push({ marker: [ti, lrI], color: palette.ink, label: lrI.toExponential(2) });
+      P.draw(layers);
+      let sum = 0, hi = 0;
+      for (let t = 0; t < TOTAL; t++) { const v = lrAt(t, shape, Tw, peak, lo); sum += v; if (v > 0.9 * peak) hi++; }
+      set("lr", lrI.toExponential(2), null, ti < Tw ? "warming up" : "decaying");
+      set("pct", Math.round(100 * lrI / peak) + "%", null, "of peak " + peak.toExponential(0));
+      set("mean", Math.round(100 * sum / TOTAL / peak) + "% of peak", null, "relates to total distance travelled");
+      set("hi", hi.toLocaleString("en-US"), null, Math.round(100 * hi / TOTAL) + "% of the run");
+    }
+    draw();
+  })();
+
+  /* ============================================================ fig: computational graph */
+  (function () {
+    const s = document.getElementById("fig-graph");
+    const mk = uid("cg"), mkB = uid("cgb");
+    arrowMarker(s, mk, palette.ink); arrowMarker(s, mkB, palette.green);
+    const N = {
+      w: { x: 70, y: 82, inp: "w = 0.5", grad: "∂L/∂w = −0.355", gy: -24 },
+      x: { x: 70, y: 202, inp: "x = 2", grad: "∂L/∂x = −0.089", gy: 34 },
+      mul: { x: 230, y: 150, op: "×", grad: "∂L/∂z₁ = −0.177" },
+      b: { x: 230, y: 272, inp: "b = −0.5", grad: "∂L/∂b = −0.177", gy: 34 },
+      add: { x: 380, y: 150, op: "+", grad: "∂L/∂z = −0.177" },
+      sig: { x: 530, y: 150, op: "σ", grad: "∂L/∂a = −0.755" },
+      y: { x: 530, y: 272, inp: "y = 1", grad: "∂L/∂y = +0.755", gy: 34 },
+      sub: { x: 680, y: 150, op: "−", grad: "∂L/∂e = −0.755" },
+      sq: { x: 820, y: 150, op: "(·)²", grad: "∂L/∂L = 1" }
+    };
+    const R = 24, BW = 92, BH = 30;
+    const edge = (a, b) => {
+      const A = N[a], B = N[b];
+      const dx = B.x - A.x, dy = B.y - A.y, d = Math.hypot(dx, dy), ux = dx / d, uy = dy / d;
+      let sx0, sy0;
+      if (A.inp) { const tx = (BW / 2) / Math.abs(ux || 1e-9), ty = (BH / 2) / Math.abs(uy || 1e-9), tt = Math.min(tx, ty); sx0 = A.x + ux * tt; sy0 = A.y + uy * tt; }
+      else { sx0 = A.x + ux * R; sy0 = A.y + uy * R; }
+      line(s, sx0, sy0, B.x - ux * (R + 3), B.y - uy * (R + 3), palette.ink, { w: 1.3, marker: mk });
+    };
+    [["w", "mul"], ["x", "mul"], ["mul", "add"], ["b", "add"], ["add", "sig"], ["sig", "sub"], ["y", "sub"], ["sub", "sq"]].forEach(([a, b]) => edge(a, b));
+    line(s, N.sq.x + R, 150, 930, 150, palette.ink, { w: 1.3, marker: mk });
+    Object.values(N).forEach(n => {
+      if (n.inp) {
+        s.appendChild(svg("rect", { x: n.x - BW / 2, y: n.y - BH / 2, width: BW, height: BH, rx: 7, fill: "#fbfaf7", stroke: "rgba(28,27,25,.3)" }));
+        txt(s, n.x, n.y + 4, n.inp, { anchor: "middle", size: 12.5 });
+        txt(s, n.x, n.y + n.gy, n.grad, { anchor: "middle", size: 11, color: palette.green });
+      } else {
+        s.appendChild(svg("circle", { cx: n.x, cy: n.y, r: R, fill: "#fff", stroke: palette.ink, "stroke-width": 1.4 }));
+        txt(s, n.x, n.y + 5, n.op, { anchor: "middle", size: n.op.length > 1 ? 12 : 16, mono: n.op.length > 1, bold: true });
+        txt(s, n.x, n.y - 46, n.grad, { anchor: "middle", size: 11, color: palette.green });
+      }
+    });
+    // forward values above horizontal edges
+    [["mul", "add", "z₁ = 1.0"], ["add", "sig", "z = 0.5"], ["sig", "sub", "a = 0.622"], ["sub", "sq", "e = −0.378"]].forEach(([a, b, t]) => txt(s, (N[a].x + N[b].x) / 2, 142, t, { anchor: "middle", size: 11.5 }));
+    txt(s, 888, 142, "L = 0.143", { anchor: "middle", size: 11.5, bold: true });
+    // local derivatives below edges (brick)
+    [["mul", "add", "∂z/∂z₁ = 1"], ["add", "sig", "∂a/∂z = 0.235"], ["sig", "sub", "∂e/∂a = 1"], ["sub", "sq", "∂L/∂e = 2e"]].forEach(([a, b, t]) => txt(s, (N[a].x + N[b].x) / 2, 168, t, { anchor: "middle", size: 11, color: palette.brick }));
+    txt(s, 108, 141, "∂z₁/∂w = x = 2", { anchor: "middle", size: 11, color: palette.brick });
+    txt(s, 112, 168, "∂z₁/∂x = w = 0.5", { anchor: "middle", size: 11, color: palette.brick });
+    txt(s, 318, 222, "∂z/∂b = 1", { size: 11, color: palette.brick });
+    txt(s, 618, 222, "∂e/∂y = −1", { size: 11, color: palette.brick });
+    // pass arrows
+    line(s, 300, 22, 620, 22, palette.ink, { w: 1.2, marker: mk });
+    txt(s, 460, 16, "forward pass: compute values", { anchor: "middle", size: 11, color: palette.muted, mono: false });
+    line(s, 620, 326, 300, 326, palette.green, { w: 1.2, marker: mkB });
+    txt(s, 460, 320, "backward pass: multiply local derivatives, right to left", { anchor: "middle", size: 11, color: palette.green, mono: false });
+  })();
+
+  /* ============================================================ fig: sum over paths */
+  (function () {
+    const s = document.getElementById("fig-paths");
+    const mk = uid("pp"), mk1 = uid("pp1"), mk2 = uid("pp2");
+    arrowMarker(s, mk, palette.ink); arrowMarker(s, mk1, palette.blue); arrowMarker(s, mk2, palette.plum);
+    const node = (x, y, t) => { s.appendChild(svg("circle", { cx: x, cy: y, r: 22, fill: "#fff", stroke: palette.ink, "stroke-width": 1.4 })); txt(s, x, y + 5, t, { anchor: "middle", size: 14, bold: true }); };
+    const X = [70, 110], U = [250, 50], V = [250, 170], F = [430, 110];
+    const conn = (A, B, col, m) => { const dx = B[0] - A[0], dy = B[1] - A[1], d = Math.hypot(dx, dy); line(s, A[0] + dx / d * 22, A[1] + dy / d * 22, B[0] - dx / d * 26, B[1] - dy / d * 26, col, { w: 2, marker: m }); };
+    conn(X, U, palette.blue, mk1); conn(U, F, palette.blue, mk1);
+    conn(X, V, palette.plum, mk2); conn(V, F, palette.plum, mk2);
+    node(X[0], X[1], "x"); node(U[0], U[1], "u"); node(V[0], V[1], "v"); node(F[0], F[1], "f");
+    txt(s, 250, 20, "u = x²", { anchor: "middle", size: 11.5 });
+    txt(s, 250, 210, "v = sin x", { anchor: "middle", size: 11.5 });
+    txt(s, 430, 152, "f = u · v", { anchor: "middle", size: 11.5 });
+    txt(s, 140, 66, "du/dx = 2x", { anchor: "middle", size: 11, color: palette.blue });
+    txt(s, 362, 66, "∂f/∂u = v", { anchor: "middle", size: 11, color: palette.blue });
+    txt(s, 140, 164, "dv/dx = cos x", { anchor: "middle", size: 11, color: palette.plum });
+    txt(s, 362, 164, "∂f/∂v = u", { anchor: "middle", size: 11, color: palette.plum });
+    const tx = 490;
+    txt(s, tx, 70, "df/dx = (∂f/∂u)(du/dx) + (∂f/∂v)(dv/dx)", { size: 12 });
+    txt(s, tx, 96, "path 1:  sin x · 2x", { size: 12, color: palette.blue });
+    txt(s, tx, 118, "path 2:  x² · cos x", { size: 12, color: palette.plum });
+    txt(s, tx, 146, "total:   2x sin x + x² cos x", { size: 12, bold: true });
+  })();
+
+  /* ============================================================ fig: noisy minibatch trajectories */
+  (function () {
+    const host = document.getElementById("fig-noisy");
+    const left = el("div"), right = el("div"); host.appendChild(left); host.appendChild(right);
+    const th = Math.PI / 6, c = Math.cos(th), sn = Math.sin(th);
+    const toUV = (x, y) => [c * x + sn * y, -sn * x + c * y];
+    const f = (x, y) => { const q = toUV(x, y); return 0.5 * (q[0] * q[0] + 8 * q[1] * q[1]); };
+    const g = (x, y) => { const q = toUV(x, y), gu = q[0], gv = 8 * q[1]; return [c * gu - sn * gv, sn * gu + c * gv]; };
+    const S = surface(left, { width: 480, height: 340, equal: true });
+    S.set(f, [0.1, 0.4, 1, 2, 4, 7, 11, 16, 24], [-4, 4], [-1, 1]);
+    const start = [-3.4, 1.4], eta = 0.1, sigma = 5, steps = 60;
+    const runs = [{ B: Infinity, color: palette.ink, label: "full batch" }, { B: 16, color: palette.blue, label: "B = 16" }, { B: 1, color: palette.brick, label: "B = 1" }];
+    runs.forEach((r, k) => {
+      const R = rng(100 + k);
+      let p = start.slice(); const pts = [p.slice()];
+      for (let t = 0; t < steps; t++) {
+        const gg = g(p[0], p[1]), sd = isFinite(r.B) ? sigma / Math.sqrt(r.B) : 0;
+        p = [p[0] - eta * (gg[0] + sd * R.normal()), p[1] - eta * (gg[1] + sd * R.normal())];
+        pts.push(p.slice());
+      }
+      S.over.appendChild(svg("path", { d: pathD(pts, S.P.sx, S.P.sy), fill: "none", stroke: r.color, "stroke-width": 1.5, opacity: 0.9 }));
+      pts.forEach(q => S.dot(q, r.color, 1.9));
+      const lx = S.P.sx(S.P.x[0]) + 12, ly = 26 + k * 17;
+      S.top.appendChild(svg("line", { x1: lx, x2: lx + 18, y1: ly - 4, y2: ly - 4, stroke: r.color, "stroke-width": 2.5 }));
+      txt(S.top, lx + 24, ly, r.label, { mono: false, size: 12 });
+    });
+    S.ring(start, palette.ink, 6);
+    S.cross([0, 0], palette.green);
+    const P = plot(right, { width: 330, height: 340, x: [1, 1024], y: [0.1, 10], logx: true, logy: true, xlabel: "batch size B", ylabel: "gradient noise (std)", xticks: [1, 4, 16, 64, 256, 1024], yticks: [0.1, 1, 10], xfmt: v => String(v), yfmt: v => String(v), margin: { l: 48, r: 14 } });
+    P.draw([
+      { fn: B => sigma / Math.sqrt(B), color: palette.ink, width: 2, samples: 120 },
+      { marker: [1, sigma], color: palette.brick, label: "B=1: 5" },
+      { marker: [16, sigma / 4], color: palette.blue, label: "B=16: 1.25" },
+      { marker: [256, sigma / 16], color: palette.green, label: "B=256: 0.31" }
+    ]);
+  })();
+
+  /* ============================================================ fig: clipping */
+  (function () {
+    const s = document.getElementById("fig-clip");
+    const mB = uid("clb"), mG = uid("clg"), mO = uid("clo");
+    arrowMarker(s, mB, palette.brick); arrowMarker(s, mG, palette.green); arrowMarker(s, mO, palette.gold);
+    const U = 70;
+    // left panel: global norm
+    const L0 = [150, 150];
+    line(s, L0[0] - 110, L0[1], L0[0] + 220, L0[1], palette.line, { w: 1 });
+    line(s, L0[0], L0[1] - 110, L0[0], L0[1] + 100, palette.line, { w: 1 });
+    s.appendChild(svg("circle", { cx: L0[0], cy: L0[1], r: U, fill: "rgba(26,122,82,.06)", stroke: palette.green, "stroke-width": 1.3, "stroke-dasharray": "5 4" }));
+    const g = [2.2, 1.1], n = Math.hypot(g[0], g[1]);
+    line(s, L0[0], L0[1], L0[0] + g[0] * U, L0[1] - g[1] * U, palette.brick, { w: 2, dash: "6 4", marker: mB });
+    line(s, L0[0], L0[1], L0[0] + g[0] / n * U, L0[1] - g[1] / n * U, palette.green, { w: 2.8, marker: mG });
+    txt(s, L0[0] + g[0] * U + 6, L0[1] - g[1] * U - 4, "g  (‖g‖ = 2.46c)", { size: 11.5, color: palette.brick });
+    txt(s, L0[0] + 44, L0[1] - 40, "g · c/‖g‖", { size: 11.5, color: palette.green, anchor: "end" });
+    txt(s, L0[0] - 64, L0[1] + 88, "radius c", { size: 11, color: palette.green });
+    txt(s, 175, 22, "clip_grad_norm_: same direction, length c", { anchor: "middle", size: 12, bold: true, mono: false });
+    // right panel: per-value
+    const R0 = [540, 150];
+    line(s, R0[0] - 110, R0[1], R0[0] + 220, R0[1], palette.line, { w: 1 });
+    line(s, R0[0], R0[1] - 110, R0[0], R0[1] + 100, palette.line, { w: 1 });
+    s.appendChild(svg("rect", { x: R0[0] - U, y: R0[1] - U, width: 2 * U, height: 2 * U, fill: "rgba(154,123,34,.06)", stroke: palette.gold, "stroke-width": 1.3, "stroke-dasharray": "5 4" }));
+    const h = [2.2, 0.5];
+    line(s, R0[0], R0[1], R0[0] + h[0] * U, R0[1] - h[1] * U, palette.brick, { w: 2, dash: "6 4", marker: mB });
+    line(s, R0[0], R0[1], R0[0] + 1 * U, R0[1] - 0.5 * U, palette.gold, { w: 2.8, marker: mO });
+    txt(s, R0[0] + h[0] * U + 4, R0[1] - h[1] * U - 14, "g = (2.2c, 0.5c)", { size: 11.5, color: palette.brick, anchor: "end" });
+    txt(s, R0[0] + 8, R0[1] + 20, "clipped: (c, 0.5c)", { size: 11.5, color: palette.gold });
+    txt(s, R0[0] + U + 6, R0[1] + U - 4, "box [−c, c]²", { size: 11, color: palette.gold });
+    txt(s, 565, 22, "clip_grad_value_: clamp each coordinate", { anchor: "middle", size: 12, bold: true, mono: false });
+    txt(s, R0[0], R0[1] + 112, "direction changes: 13° → 27° from the θ₁ axis", { anchor: "middle", size: 11, color: palette.muted, mono: false });
+  })();
+
+  /* ============================================================ fig: saddle */
+  (function () {
+    const host = document.getElementById("fig-saddle");
+    const left = el("div"), right = el("div"); host.appendChild(left); host.appendChild(right);
+    const f = (x, y) => 0.5 * x * x - 0.5 * y * y + 0.25 * y ** 4;
+    const g = (x, y) => [x, -y + y * y * y];
+    const S = surface(left, { width: 480, height: 330, equal: true });
+    S.set(f, [-0.22, -0.15, -0.05, 0, 0.25, 0.75, 1.5, 2.5, 3.5], [-3, 3], [-1, 1]);
+    let p = [-2.6, 0.002]; const pts = [p.slice()], losses = [[0, f(p[0], p[1]) + 0.25]];
+    for (let t = 1; t <= 140; t++) { const gg = g(p[0], p[1]); p = [p[0] - 0.1 * gg[0], p[1] - 0.1 * gg[1]]; pts.push(p.slice()); losses.push([t, Math.max(1e-12, f(p[0], p[1]) + 0.25)]); }
+    S.over.appendChild(svg("path", { d: pathD(pts, S.P.sx, S.P.sy), fill: "none", stroke: palette.brick, "stroke-width": 1.4 }));
+    pts.forEach((q, i) => { if (i % 2 === 0) S.dot(q, palette.brick, 2.2); });
+    S.ring(pts[0], palette.ink, 6);
+    S.dot([0, 0], palette.gold, 6);
+    txt(S.top, S.P.sx(0) + 10, S.P.sy(0) + 18, "saddle", { color: palette.gold, size: 12, bold: true });
+    S.cross([0, 1], palette.green); S.cross([0, -1], palette.green);
+    txt(S.top, S.P.sx(0) + 10, S.P.sy(1) - 8, "minimum", { color: palette.green, size: 12 });
+    txt(S.top, S.P.sx(0) + 10, S.P.sy(-1) + 18, "minimum", { color: palette.green, size: 12 });
+    const P = plot(right, { width: 330, height: 330, x: [0, 140], y: [1e-12, 10], logy: true, xlabel: "step", ylabel: "loss − min", yticks: [1e-12, 1e-8, 1e-4, 1], yfmt: v => (v === 1 ? "1" : "1e" + Math.round(Math.log10(v))), margin: { l: 64, r: 12 } });
+    P.draw([
+      { band: [22, 58], color: palette.gold, opacity: 0.14 },
+      { points: losses, color: palette.brick, width: 2 },
+      { text: [26, 3], label: "plateau", color: palette.gold },
+      { text: [86, 0.1], label: "escape", color: palette.brick }
+    ]);
+  })();
+})();
+</script>
+</body>
+</html>

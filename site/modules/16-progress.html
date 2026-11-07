@@ -1,0 +1,1250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Why models keep getting better — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .warnline { margin: 10px 0 0; font-size: 13px; }
+  .warnline.bad { color: var(--brick); }
+  .warnline.ok { color: var(--green); }
+</style>
+</head>
+<body data-module="16">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 16 · Beyond text</p>
+<h1 class="title">Why models keep getting <span class="it">better</span></h1>
+<p class="lede">GPT-3 (2020) was trained with about 3×10²³ FLOPs on 300B tokens. Llama 3.1 405B (2024) used about 4×10²⁵ FLOPs on roughly 15T tokens, and Llama 3 8B, a model 20 times smaller than GPT-3, scores about 66% on MMLU against GPT-3's 44%. The gains came from several places at once: more compute, more and cleaner data, better recipes, post-training, and letting models think longer when they answer. This module pulls those levers apart and puts a rough number on each. Where a number is an estimate, it says so.</p>
+<div class="meta"><span class="tag">~3 hours</span><span class="tag n">prereqs: 07, 10, 13</span><span class="tag g">estimates labelled</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Split a capability gain into compute, data, algorithms, post-training, and test-time compute, and turn a growth rate into a doubling time.</li>
+    <li>Read a scaling-law plot, and explain how a smoothly falling loss can still produce a sudden jump on a benchmark.</li>
+    <li>Plan a pretraining data mixture: how much repetition is safe, and what filtering and synthetic data buy and risk.</li>
+    <li>Compute best-of-N and majority-vote accuracy from a per-sample success rate, and say when voting makes things worse.</li>
+    <li>Weigh the open arguments about data limits, cost, and diminishing returns without overclaiming either side.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="levers">Three levers, then two more</h2>
+
+<p>"Models got better because they got bigger" is true but incomplete. Here is a more useful accounting. The first three levers act during pretraining, and they multiply rather than add:</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">Lever 1 · compute</div><h4>More FLOPs</h4><p>More accelerators, faster accelerators, longer runs, and less idle time. The easiest to measure and historically the biggest contributor.</p></div>
+  <div class="card blue"><div class="k">Lever 2 · data</div><h4>More and better tokens</h4><p>Training sets grew from hundreds of billions of tokens to tens of trillions. Filtering and mixing them well matters about as much as the count.</p></div>
+  <div class="card warn"><div class="k">Lever 3 · algorithms</div><h4>More loss per FLOP</h4><p>Architecture, optimizer, schedules, precision, kernels, and the compute-optimal recipe itself. Epoch AI treats these as a <em>multiplier</em> on compute.</p></div>
+</div>
+
+<p>After pretraining come two levers that barely existed as separate fields in 2020. <strong>Post-training</strong> (SFT, preference tuning, RL with verifiable rewards; Module 10) turns a document-completer into an assistant and, more recently, a reasoner. <strong>Test-time compute</strong> spends extra FLOPs per question: longer chains of thought, several samples with a vote, or a verifier that picks the best one.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 305" id="fig-levers"></svg>
+<figcaption>Where the levers act. Compute, data, and algorithms feed pretraining; post-training and test-time compute change what the same weights can deliver. The dashed loop is what makes the whole thing a flywheel: deployed models generate preference data, failure cases, and verified traces that become the next model's training data (section 11).</figcaption></figure>
+
+<p>To compare training runs across years, you need one number that folds in both hardware and recipe quality. That number is <strong>effective compute</strong>.</p>
+
+<div class="formula" data-name="Effective training compute">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{eff}}} = \htmlClass{t2}{F_{\text{peak}}} \times \htmlClass{t3}{n_{\text{GPU}}} \times \htmlClass{t4}{T} \times \htmlClass{t5}{u} \times \htmlClass{t6}{m_{\text{alg}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{eff}}\)</dt><dd>effective compute, in FLOPs of some older <em>reference</em> recipe that would give the same model quality</dd></div>
+    <div data-t="t2"><dt>\(F_{\text{peak}}\)</dt><dd>peak FLOP/s per accelerator (H100 bf16 dense ≈ 989 TFLOP/s)</dd></div>
+    <div data-t="t3"><dt>\(n_{\text{GPU}}\)</dt><dd>number of accelerators in the run</dd></div>
+    <div data-t="t4"><dt>\(T\)</dt><dd>wall-clock training time in seconds</dd></div>
+    <div data-t="t5"><dt>\(u\)</dt><dd>utilization, i.e. model FLOPs utilization (MFU, Module 07), typically 0.3–0.5</dd></div>
+    <div data-t="t6"><dt>\(m_{\text{alg}}\)</dt><dd>algorithmic multiplier: how many reference-recipe FLOPs one of today's FLOPs is worth</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The first four factors give the physical FLOPs you actually burned. The last one credits you for using them better than an older recipe would have.</p>
+  <p class="why"><b>Why it matters</b>A sanity check on Llama 3.1 405B: Meta reports about 30.8M H100-hours at 38–43% MFU. 30.8×10⁶ h × 3600 s × 989×10¹² × 0.38 ≈ 4.2×10²⁵ FLOPs, close to the 6ND estimate of 6 × 405×10⁹ × 15.6×10¹² ≈ 3.8×10²⁵. The algorithmic multiplier is the part nobody can measure directly. It has to be inferred by comparing many models over time.</p>
+</div>
+
+<div id="w-effective"></div>
+
+<div class="flag"><b>The levers aren't independent</b>
+<p>More compute is only useful with more data (Chinchilla's point, Module 07). Better filtering changes how many tokens you need. Post-training and test-time compute work better on stronger base models: RL can only reinforce behaviours the model sometimes produces. So "how much came from data versus compute" has no clean answer. The sections below give each lever's mechanism and the best available estimates, and they say where the estimates are soft.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="compute">Compute: the steepest curve</h2>
+
+<p>Epoch AI keeps a database of notable ML models with estimated training compute. Their analyses find that compute for frontier models has grown by <strong>roughly 4–5× per year since about 2010</strong> (Sevilla et al., 2022; Epoch AI's 2024 update estimates about 4.1× per year across notable models, 90% CI 3.7–4.6×, and closer to 5× per year for frontier language models since 2020). Treat these as estimates. The exact rate depends on which models count as frontier, and many labs don't publish their training compute.</p>
+
+<p>Where does 4–5× per year come from? Roughly, from three multiplying sources. Hardware price-performance improves by about 1.3–1.4× per year. Spending on the largest runs has grown faster: Cottier et al. (2024) estimate the amortized hardware and energy cost of frontier training runs grew about 2.4× per year since 2016. Runs also got longer and clusters bigger. None of these can grow at today's rate forever, which is why the last section of this module is about limits.</p>
+
+<div class="formula" data-name="Exponential growth and doubling time">
+  <div class="tex">$$\htmlClass{t1}{C(t)} = \htmlClass{t2}{C_0}\,\htmlClass{t3}{g}^{\,\htmlClass{t4}{t}}, \qquad \htmlClass{t5}{T_{2}} = \frac{\ln 2}{\ln \htmlClass{t3}{g}}, \qquad \text{orders of magnitude per year} = \log_{10} \htmlClass{t3}{g}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C(t)\)</dt><dd>compute of the largest run at time \(t\)</dd></div>
+    <div data-t="t2"><dt>\(C_0\)</dt><dd>compute today</dd></div>
+    <div data-t="t3"><dt>\(g\)</dt><dd>growth factor per year (Epoch estimate: about 4–5)</dd></div>
+    <div data-t="t4"><dt>\(t\)</dt><dd>years from now</dd></div>
+    <div data-t="t5"><dt>\(T_2\)</dt><dd>doubling time in years</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Multiply by \(g\) every year. At 4× per year the doubling time is \(\ln 2/\ln 4 = 0.5\) years, so six months. At 5× it's 0.43 years, about 5.2 months. Either way you gain 0.6–0.7 orders of magnitude per year, so 6–7 per decade.</p>
+  <p class="why"><b>Why it matters</b>Moore's-law-style hardware gains double every two years or so. Frontier training compute has doubled about four times as often, which means most of the growth came from spending and scale, not from faster chips.</p>
+</div>
+
+<figure class="fig"><div id="fig-compute"></div>
+<figcaption>Training compute for some well-documented LLMs, computed as 6ND from published parameter and token counts. DeepSeek-V3 is a mixture-of-experts model, so its point uses its 37B <em>active</em> parameters. GPT-4's point (gold) is an Epoch AI estimate; OpenAI hasn't published its size. The dashed line is a 4.5×-per-year slope drawn for comparison, not a fit. Not every new model is bigger: Llama 2 70B and DeepSeek-V3 sit well below the frontier.</figcaption></figure>
+
+<div id="w-growth"></div>
+
+<details class="think"><summary>Think first: if physical compute grows 4× per year and algorithms halve the compute needed every 8 months, how fast does effective compute grow?</summary>
+<div>The algorithmic factor per year is \(2^{12/8} = 2^{1.5} \approx 2.8\). Effective compute grows about \(4 \times 2.8 \approx 11\times\) per year, doubling roughly every 3.5 months. That headline is only as good as its inputs, and the algorithmic estimate has a wide confidence interval (section 9). Set the widget to 4× and 8 months to see it.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="scaling">Scaling laws, and why abilities seem to appear suddenly</h2>
+
+<p>Module 07 covered Kaplan et al. (2020) and Chinchilla (Hoffmann et al., 2022) in detail. The short version: pretraining loss falls as a smooth power law in compute, across many orders of magnitude, approaching a floor set by the entropy of text itself. Here we only need the one-variable form.</p>
+
+<div class="formula" data-name="Power-law scaling in compute">
+  <div class="tex">$$\htmlClass{t1}{L(C)} = \htmlClass{t2}{L_\infty} + \htmlClass{t3}{a}\,\htmlClass{t4}{C}^{-\htmlClass{t5}{\alpha}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(L(C)\)</dt><dd>pretraining loss (nats per token) of a compute-optimal model trained with \(C\) FLOPs</dd></div>
+    <div data-t="t2"><dt>\(L_\infty\)</dt><dd>irreducible loss: no model can beat the randomness of the text</dd></div>
+    <div data-t="t3"><dt>\(a\)</dt><dd>scale constant fitted to small runs</dd></div>
+    <div data-t="t4"><dt>\(C\)</dt><dd>training compute in FLOPs</dd></div>
+    <div data-t="t5"><dt>\(\alpha\)</dt><dd>exponent, small: Kaplan et al. found loss ∝ \(C^{-0.05}\) without a floor; fits with a floor give somewhat larger values</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each 10× of compute shrinks the <em>reducible</em> part of the loss by the same fraction, \(10^{-\alpha}\). On a log-log plot of \(L - L_\infty\) against \(C\), that's a straight line.</p>
+  <p class="why"><b>Why it matters</b>The same power law reads as two opposite stories. Optimists see a straight line that keeps going. Pessimists see that with \(\alpha = 0.05\), halving the reducible loss takes \(2^{1/0.05} = 2^{20} \approx 10^6\) times more compute. Both are reading the same curve correctly.</p>
+</div>
+
+<div id="w-scaling"></div>
+
+<h3>Emergence: smooth loss, sharp benchmarks</h3>
+<p>Wei et al. (2022) catalogued "emergent abilities": tasks where small models score near zero and, past some scale, accuracy shoots up, for example multi-digit arithmetic and some BIG-bench tasks. If loss improves smoothly, where do the jumps come from?</p>
+
+<p>Schaeffer, Miranda and Koyejo (2023) argued that many of them come from the <em>metric</em>. Exact-match scoring gives credit only if every token of the answer is right. If the model gets each token right with probability \(p\), roughly independently, the answer is right with probability \(p^k\):</p>
+
+<div class="formula" data-name="All-or-nothing scoring">
+  <div class="tex">$$\htmlClass{t1}{P(\text{exact match})} \approx \htmlClass{t2}{p}^{\,\htmlClass{t3}{k}}, \qquad \htmlClass{t2}{p} = 1 - \htmlClass{t4}{\varepsilon(C)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P(\text{exact match})\)</dt><dd>benchmark score under exact-match grading</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>per-token accuracy on the answer tokens</dd></div>
+    <div data-t="t3"><dt>\(k\)</dt><dd>number of tokens that all have to be right (answer length)</dd></div>
+    <div data-t="t4"><dt>\(\varepsilon(C)\)</dt><dd>per-token error, which falls smoothly (e.g. as a power law) with compute</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A small, steady improvement in each token becomes a big swing in the product. With \(k = 20\), moving \(p\) from 0.80 to 0.95 takes exact match from 1% to 36%.</p>
+  <p class="why"><b>Why it matters</b>Before calling something emergent, re-score it with a continuous metric (per-token accuracy, log-probability of the right answer, edit distance). If that curve is smooth, you can forecast the jump instead of being surprised by it.</p>
+</div>
+
+<div id="w-emergence"></div>
+
+<div class="flag"><b>Both sides of the emergence debate</b>
+<p>Schaeffer et al. showed that switching to continuous metrics made most of the emergent curves they examined smooth, and that small test sets add to the effect: a 1-in-10,000 success rate reads as exactly zero on 100 questions. They did not claim no ability ever appears abruptly. Later work (for example Du et al., 2024) found some tasks where performance stays near chance until pretraining loss drops below a threshold, even under continuous metrics. The practical rule holds either way. Track continuous metrics alongside the headline score, because they give you warning.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="data-quantity">Data quantity, repetition, and the data wall</h2>
+
+<p>Training sets grew even faster than models. A rough history, using each paper's own token counts:</p>
+
+<table class="t">
+  <thead><tr><th>Model</th><th class="num">Year</th><th class="num">Parameters</th><th class="num">Training tokens</th><th class="num">Tokens / param</th></tr></thead>
+  <tbody>
+    <tr><td>GPT-3 (Brown et al.)</td><td class="num">2020</td><td class="num">175B</td><td class="num">300B</td><td class="num">1.7</td></tr>
+    <tr><td>Chinchilla (Hoffmann et al.)</td><td class="num">2022</td><td class="num">70B</td><td class="num">1.4T</td><td class="num">20</td></tr>
+    <tr><td>Llama 2 (Touvron et al.)</td><td class="num">2023</td><td class="num">7B–70B</td><td class="num">2T</td><td class="num">29–286</td></tr>
+    <tr><td>Llama 3 / 3.1 (Meta)</td><td class="num">2024</td><td class="num">8B / 70B / 405B</td><td class="num">~15T</td><td class="num">~1,900 / 214 / 39</td></tr>
+    <tr><td>DeepSeek-V3</td><td class="num">2024</td><td class="num">671B total, 37B active</td><td class="num">14.8T</td><td class="num">22 total / 400 active</td></tr>
+    <tr><td>Qwen3 (Qwen team)</td><td class="num">2025</td><td class="num">0.6B–235B</td><td class="num">~36T</td><td class="num">varies</td></tr>
+  </tbody>
+</table>
+
+<p>Fifty times more tokens in four years. Where does that come from? Mostly Common Crawl, a public web archive with billions of pages per snapshot, heavily filtered (next section), plus code, books, papers, and increasingly synthetic data. A natural question for a data-limited lab: can you just train on the same data twice?</p>
+
+<h3>How much repetition is safe?</h3>
+<p>Muennighoff et al. (2023) trained hundreds of models with a fixed budget of unique tokens repeated for different numbers of epochs. Their headline: <strong>up to about 4 epochs, repeated data was almost as good as fresh data</strong>; beyond that returns fell quickly, and by around 16 epochs extra passes were worth very little. They fit a simple model of how much a repeated token is worth:</p>
+
+<div class="formula" data-name="Effective data under repetition (Muennighoff et al., 2023)">
+  <div class="tex">$$\htmlClass{t1}{D'} = \htmlClass{t2}{U} + \htmlClass{t2}{U}\,\htmlClass{t3}{R^{*}}\left(1 - e^{-\htmlClass{t4}{R}/\htmlClass{t3}{R^{*}}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(D'\)</dt><dd>effective data: the number of <em>fresh</em> tokens that would give the same loss</dd></div>
+    <div data-t="t2"><dt>\(U\)</dt><dd>unique tokens available</dd></div>
+    <div data-t="t4"><dt>\(R\)</dt><dd>number of repeats, i.e. epochs − 1</dd></div>
+    <div data-t="t3"><dt>\(R^*\)</dt><dd>fitted decay constant, about 15.4 in their experiments: after roughly that many repeats, more passes add little</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The first pass is worth full price. Each extra pass is worth a bit less than the last, decaying exponentially. No amount of repetition gets you past about \(U(1+R^*) \approx 16U\).</p>
+  <p class="why"><b>Why it matters</b>Plug in numbers: 4 epochs (\(R = 3\)) gives \(D' \approx 3.7U\), 93% as good as 4U of fresh data. 16 epochs gives about \(10.6U\) (66%). 40 epochs gives about \(15.2U\) (38%). The fit comes from models up to 9B parameters, so treat the constant as indicative, not universal.</p>
+</div>
+
+<h3>The data wall</h3>
+<p>Villalobos et al. (2024, Epoch AI) estimate the stock of quality- and repetition-adjusted <em>public human-generated text</em> at about <strong>300 trillion tokens, with a 90% interval of roughly 100T to 1,000T</strong>. If training sets keep growing at their recent pace, they project that frontier runs will use up that stock somewhere between 2026 and 2032. These numbers are estimates built on many assumptions about how much of the web is usable, but you can see why the arithmetic is uncomfortable:</p>
+
+<div class="formula" data-name="Years until the data stock runs out">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{wall}}} = \frac{\ln\left(\htmlClass{t2}{S} / \htmlClass{t3}{D_0}\right)}{\ln \htmlClass{t4}{g_D}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{wall}}\)</dt><dd>years until the largest training set equals the whole stock</dd></div>
+    <div data-t="t2"><dt>\(S\)</dt><dd>stock of usable text (Epoch estimate: ~300T tokens, 90% CI 100T–1,000T)</dd></div>
+    <div data-t="t3"><dt>\(D_0\)</dt><dd>today's largest training set (15–36T tokens in 2024–25)</dd></div>
+    <div data-t="t4"><dt>\(g_D\)</dt><dd>yearly growth factor of training-set size (an assumption; 2–3× is in the historical range)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>How many times must the dataset multiply to reach the stock, measured in years of growth.</p>
+  <p class="why"><b>Why it matters</b>With \(S/D_0 = 20\) and \(g_D = 2.5\): \(\ln 20 / \ln 2.5 \approx 3.3\) years. Make the stock 1,000T and you get about 4.6 years. Repeating the data 4 times (×3.7 effective) buys only \(\ln 3.7/\ln 2.5 \approx 1.4\) more years. Exponential demand eats any fixed multiplier quickly.</p>
+</div>
+
+<div class="flag"><b>Why the data wall may be softer than it looks</b>
+<p>The estimate covers public human <em>text</em>. It excludes private and licensed data, transcribed audio and video, and synthetic data, and it assumes today's filtering standards. On the other side, the most valuable text (textbooks, high-quality code, careful reasoning) is a small fraction of the stock and gets used first. Which effect dominates is genuinely unsettled.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="data-quality">Data quality and curation</h2>
+
+<p>Raw web text is mostly menus, cookie banners, SEO spam, duplicates, and machine-generated junk. Turning a crawl into a training set is a pipeline of increasingly expensive filters. Each stage throws data away, and that's the point: at a fixed token budget, removing bad tokens means making room for better ones.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 340" id="fig-funnel"></svg>
+<figcaption>From crawl to training set. Bar widths are illustrative; real retention depends on the pipeline. Two published end-to-end numbers: DataComp-LM (Li et al., 2024) went from a 240T-token Common Crawl pool to a DCLM-Baseline set of about 4T tokens, roughly 1.6% kept. FineWeb-Edu (Penedo et al., 2024) kept about 1.3T of FineWeb's 15T tokens, roughly 9%, by keeping documents its classifier scored 3 or higher.</figcaption></figure>
+
+<h3>Heuristics, dedup, decontamination</h3>
+<p>The cheap stages are rules: drop pages under a word count, pages where lines rarely end in punctuation, pages full of symbols or repeated n-grams, pages in the wrong language according to a fastText language-ID model (the C4 and Gopher rule sets are the classic references). <strong>Deduplication</strong> follows: exact hashes for copies, MinHash for near-copies. Lee et al. (2022) showed dedup reduces memorization and improves training efficiency. <strong>Decontamination</strong> removes documents that overlap benchmark test sets, typically by n-gram matching (Module 13). Skipping it inflates your evals without improving the model.</p>
+
+<h3>Model-based quality filters</h3>
+<p>The stage that changed results most in 2024 was using a model to judge quality. <strong>FineWeb-Edu</strong> (Penedo et al., 2024) asked Llama-3-70B-Instruct to rate about 450K web pages for educational value on a 0–5 scale, trained a small regression head on embeddings to imitate those ratings, then ran it over all 15T tokens. Models trained on the filtered 1.3T did clearly better on knowledge and reasoning benchmarks such as MMLU and ARC than models trained on the same number of unfiltered tokens. <strong>DCLM</strong> (Li et al., 2024) compared many filters and found a plain fastText classifier worked best, with positives drawn from instruction data (OpenHermes 2.5) and highly upvoted r/ExplainLikeImFive answers. A 7B model trained on 2.6T tokens of its output reached 64% on MMLU (5-shot).</p>
+
+<div class="pitfall"><b>Pitfall · your filter defines "quality"</b>
+<p>A classifier trained to find "educational" pages will also drop fiction, casual dialogue, dialects, and niche technical forums. Filters tuned to raise MMLU partly select text that resembles MMLU. That's useful, but it's also a quiet form of teaching to the test. Always read samples of what got <em>removed</em>, not only what was kept.</p>
+</div>
+
+<h3>Mixtures and annealing</h3>
+<p>The final dataset is a <strong>mixture</strong> of domains with chosen weights. Meta reports Llama 3's final pretraining mix as roughly 50% general knowledge, 25% math and reasoning, 17% code, and 8% multilingual. Small domains (math, curated code, books) are usually <em>upsampled</em>, which means repeated. That's where the 4-epoch guidance from the previous section bites.</p>
+
+<p>Many recipes also <strong>anneal</strong>: near the end of training, as the learning rate decays to zero, they shift the mix toward the highest-quality sources. The Llama 3 report says annealing on a small amount of high-quality code and math data gave large gains for the 8B model on GSM8K and MATH, but negligible gains for the 405B. They also used short annealing runs as a cheap test of whether a new dataset was worth adding.</p>
+
+<div class="formula" data-name="Epochs per domain in a mixture">
+  <div class="tex">$$\htmlClass{t1}{e_i} = \frac{\htmlClass{t2}{w_i}\,\htmlClass{t3}{D}}{\htmlClass{t4}{U_i}}, \qquad \sum_i \htmlClass{t2}{w_i} = 1$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(e_i\)</dt><dd>how many times domain \(i\)'s unique tokens are seen</dd></div>
+    <div data-t="t2"><dt>\(w_i\)</dt><dd>mixture weight: share of training tokens drawn from domain \(i\)</dd></div>
+    <div data-t="t3"><dt>\(D\)</dt><dd>total training-token budget</dd></div>
+    <div data-t="t4"><dt>\(U_i\)</dt><dd>unique tokens available in domain \(i\) after filtering</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A domain's weight times the total budget, divided by what you actually have. Above 1 means repetition.</p>
+  <p class="why"><b>Why it matters</b>Put 25% math into a 15T-token run with 0.8T unique math tokens and you repeat it about 4.7 times, already past the comfortable range. The widget below shows this tension.</p>
+</div>
+
+<div id="w-mixture"></div>
+
+<!-- ================================================================== -->
+<h2 id="synthetic">Synthetic data and model collapse</h2>
+
+<p>When you run short of good human data, one option is to generate it. "Synthetic data" covers several different things, with very different risk profiles:</p>
+
+<div class="grid2">
+  <div class="card"><div class="k">Distillation</div><h4>A stronger model writes, a weaker one learns</h4><p>Self-Instruct (Wang et al., 2022) bootstrapped instruction data from a model's own outputs; most open instruction sets since then are generated by stronger models. The DeepSeek-R1 small models were trained this way on R1's reasoning traces (Module 10).</p></div>
+  <div class="card"><div class="k">Rejection sampling</div><h4>Generate many, keep what checks out</h4><p>Sample several solutions, keep those whose final answer matches or whose code passes tests, and train on them. STaR (Zelikman et al., 2022) did this for reasoning; Llama 3 used execution feedback to filter synthetic code.</p></div>
+  <div class="card blue"><div class="k">Textbook-quality data</div><h4>Write the data you wish existed</h4><p>Phi-1 (Gunasekar et al., 2023): a 1.3B model trained on about 6B tokens of filtered web code plus about 1B tokens of GPT-3.5-written textbooks and exercises reached 50.6% pass@1 on HumanEval, far above other models its size at the time.</p></div>
+  <div class="card blue"><div class="k">Verified generation</div><h4>Math, code, and proofs with a checker</h4><p>When a program can verify an answer, synthetic data can be unlimited and correct. AlphaGeometry (Trinh et al., 2024) trained on 100 million synthetic geometry theorems and proofs. Rephrasing web text into cleaner styles also helps (Maini et al., 2024).</p></div>
+</div>
+
+<p>The pattern: synthetic data works best when something independent of the generator checks it, whether a unit test, a proof checker, a known answer, or a stronger model. Without a check, you're training a model on its own guesses.</p>
+
+<h3>Model collapse</h3>
+<p>Shumailov et al. (2024, <em>Nature</em>) showed what happens when each generation of a model is trained only on samples from the previous one. The rare events go first, since a finite sample tends to miss them, so the next model assigns them even less probability. Over generations the distribution narrows and drifts, and the tails never come back. The cleanest illustration fits a Gaussian, samples from the fit, and refits:</p>
+
+<div class="formula" data-name="Variance shrinkage under recursive refitting">
+  <div class="tex">$$\mathbb{E}\!\left[\htmlClass{t1}{\hat\sigma^2_{t+1}} \,\middle|\, \htmlClass{t3}{\sigma^2_{t}}\right] = \frac{\htmlClass{t2}{n}-1}{\htmlClass{t2}{n}}\,\htmlClass{t3}{\sigma^2_{t}} \quad\Rightarrow\quad \mathbb{E}\!\left[\htmlClass{t1}{\hat\sigma^2_{\htmlClass{t4}{t}}}\right] = \left(1-\frac{1}{\htmlClass{t2}{n}}\right)^{\htmlClass{t4}{t}} \sigma^2_0$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat\sigma^2_{t+1}\)</dt><dd>variance the next generation learns, using the maximum-likelihood estimate (divide by \(n\))</dd></div>
+    <div data-t="t3"><dt>\(\sigma^2_t\)</dt><dd>variance of the current generation's model</dd></div>
+    <div data-t="t2"><dt>\(n\)</dt><dd>number of samples each generation trains on</dd></div>
+    <div data-t="t4"><dt>\(t\)</dt><dd>generation number</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each refit loses a little spread on average, and the losses compound. Individual runs also wander randomly, and once a run's spread gets small, nothing pushes it back.</p>
+  <p class="why"><b>Why it matters</b>With \(n = 100\), the expected variance after 100 generations is \(0.99^{100} \approx 0.37\) of the original. Real models collapse through the same channel: finite samples underrepresent the tails, plus fitting error.</p>
+</div>
+
+<div id="w-collapse"></div>
+
+<div class="intuition"><b>The fix is boring: keep the real data</b>
+<p>Gerstgrasser et al. (2024) showed that if each generation <em>accumulates</em> synthetic data alongside the original real data, instead of replacing it, the error stays bounded in their experiments. In the widget, set "real data mixed in" to even 10% and watch the chains stop collapsing. Labs use synthetic data as a targeted supplement with filtering, not as a closed loop.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="post-training">Post-training: the same base model, much more useful</h2>
+
+<p>A base model completes documents. Ask it a question and it may continue with three more questions, as if it were writing a quiz. Post-training (Module 10) teaches it to answer, follow formats, use tools, refuse appropriately, and, more recently, to reason at length. The striking thing is how little compute this takes relative to pretraining and how much it changes.</p>
+
+<p>InstructGPT (Ouyang et al., 2022) is the cleanest early evidence. Human labelers preferred outputs from a 1.3B-parameter InstructGPT over the 175B GPT-3 base model, despite a 100× size gap. The paper reports training costs of about 60 petaflop/s-days for the 175B RLHF model, against about 3,640 for GPT-3's pretraining: under 2%.</p>
+
+<p>Three things happen during post-training, and they are easy to conflate:</p>
+<ul>
+  <li><strong>Elicitation.</strong> Most capabilities are already in the base model. SFT on tens of thousands of good examples teaches it which behaviour you want and in what format.</li>
+  <li><strong>Preference shaping.</strong> RLHF and DPO push toward answers people (or AI judges) rate higher: more helpful, better calibrated refusals, more readable. It's also the stage that can introduce sycophancy if the signal rewards agreement.</li>
+  <li><strong>New skills through RL.</strong> RL with verifiable rewards (RLVR, Module 10) on math and code problems, as in DeepSeek-R1 (DeepSeek-AI, 2025), produced long chains of thought with self-checking and backtracking. These behaviours were rare in the base model, and RL made them reliable.</li>
+</ul>
+
+<div class="mle"><b>MLE angle · post-training's share is growing</b>
+<p>In 2022, post-training was a rounding error in the compute budget. Reasoning models changed that: OpenAI's o1 announcement (2024) reported performance rising smoothly with more RL training compute, and labs now describe RL runs as a major line item. Public numbers are scarce, so treat any specific split as a guess. For your own work, the lesson is that the cheapest capability gain is often better post-training data on an existing base, not a bigger base.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="test-time">Test-time compute</h2>
+
+<p>The levers so far all happen before deployment. Test-time compute spends more FLOPs on each question. The simplest form is <strong>chain-of-thought</strong> prompting (Wei et al., 2022): letting the model write out intermediate steps measurably improves arithmetic and multi-step reasoning. Beyond that, you can sample more than once.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 290" id="fig-ttc"></svg>
+<figcaption>Four ways to spend compute at answer time. Self-consistency (Wang et al., 2022) samples several reasoning chains and takes the most common final answer. Best-of-N needs a verifier: a unit test, a checker, or a learned reward model. Reasoning models are trained with RL to spend more tokens on a single chain, checking and revising as they go.</figcaption></figure>
+
+<div class="formula" data-name="Best-of-N with a perfect verifier">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{best-of-}N}} = 1 - \left(1 - \htmlClass{t2}{p}\right)^{\htmlClass{t3}{N}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{best-of-}N}\)</dt><dd>probability at least one of the samples is correct, and the verifier picks it</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>probability a single sample is correct (assumed independent across samples)</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>number of samples</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>You only fail if every sample fails. With \(p = 0.2\) and \(N = 10\): \(1 - 0.8^{10} \approx 0.89\). This is the same quantity as pass@k in Module 13.</p>
+  <p class="why"><b>Why it matters</b>A good verifier turns a mediocre generator into a good system. A bad one doesn't: if the verifier also accepts wrong answers, accuracy plateaus at the rate it picks right ones. Learned reward models can be exploited this way (Gao et al., 2022, on reward-model overoptimization).</p>
+</div>
+
+<div class="formula" data-name="Majority-vote accuracy (binary answers, odd N)">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{maj}}} = \sum_{\htmlClass{t2}{j}=\lceil \htmlClass{t3}{N}/2 \rceil}^{\htmlClass{t3}{N}} \binom{\htmlClass{t3}{N}}{\htmlClass{t2}{j}}\, \htmlClass{t4}{p}^{\,\htmlClass{t2}{j}} (1-\htmlClass{t4}{p})^{\htmlClass{t3}{N}-\htmlClass{t2}{j}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{maj}}\)</dt><dd>probability the majority answer is correct</dd></div>
+    <div data-t="t2"><dt>\(j\)</dt><dd>number of correct samples; we need more than half</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>number of samples (odd, so there are no ties)</dd></div>
+    <div data-t="t4"><dt>\(p\)</dt><dd>per-sample accuracy</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The tail of a binomial: the chance that more than half the votes are right. Condorcet's jury theorem says that as \(N\) grows this goes to 1 if \(p \gt 0.5\) and to 0 if \(p \lt 0.5\).</p>
+  <p class="why"><b>Why it matters</b>Voting amplifies whatever the model usually does. On questions it usually gets wrong, voting makes it <em>reliably</em> wrong. Free-form answers soften this, because wrong answers scatter across many values while right answers agree.</p>
+</div>
+
+<div id="w-vote"></div>
+
+<h3>Reasoning models</h3>
+<p>OpenAI's o1 (2024) and DeepSeek-R1 (DeepSeek-AI, 2025) moved test-time compute into the model itself. Trained with RL on problems with checkable answers, they learn to write long chains of thought, try approaches, notice errors, and backtrack. Both reports show accuracy rising with the number of thinking tokens. The R1 paper also shows response length growing steadily during RL training without being told to.</p>
+
+<p>Snell et al. (2024) asked how to spend a fixed test-time budget. Their answer was "adaptively": easy questions need one sample or a quick revision, hard ones benefit from search against a verifier. A compute-optimal allocation beat best-of-N by more than 4× in efficiency in their setup. On problems where a small model already has some success, extra test-time compute could outperform a model about 14× larger at matched FLOPs. On the hardest problems, more pretraining was still the better buy.</p>
+
+<div class="formula" data-name="Inference compute per query">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{query}}} \approx 2\,\htmlClass{t2}{N_{\text{active}}} \times \htmlClass{t3}{T_{\text{out}}} \times \htmlClass{t4}{S}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{query}}\)</dt><dd>FLOPs to answer one question (ignoring prefill and attention)</dd></div>
+    <div data-t="t2"><dt>\(N_{\text{active}}\)</dt><dd>parameters used per token (all of them for dense models; only the routed experts for MoE)</dd></div>
+    <div data-t="t3"><dt>\(T_{\text{out}}\)</dt><dd>output tokens per sample, including hidden reasoning tokens</dd></div>
+    <div data-t="t4"><dt>\(S\)</dt><dd>number of samples drawn</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Two FLOPs per active parameter per generated token, times every token you generate.</p>
+  <p class="why"><b>Why it matters</b>A 70B dense model writing a 300-token answer: \(2 \times 70\text{B} \times 300 \approx 4\times10^{13}\) FLOPs. The same model thinking for 10,000 tokens: \(1.4\times10^{15}\), 33× more, before you sample 16 times. Test-time compute moves cost from a one-off training bill to every request, which changes serving economics (Module 13).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="algorithms">Algorithmic and architectural progress</h2>
+
+<p>Many improvements don't add FLOPs. They get more out of each one. A non-exhaustive list, with where this course covers each:</p>
+
+<table class="t">
+  <thead><tr><th>Change</th><th>What it bought</th><th>Module</th></tr></thead>
+  <tbody>
+    <tr><td>Transformer (Vaswani et al., 2017)</td><td>Training parallel across the sequence, unlike RNNs; scales on GPUs</td><td>06</td></tr>
+    <tr><td>Adam/AdamW, warmup, cosine schedules</td><td>Stable training at large learning rates and batch sizes</td><td>02, 07</td></tr>
+    <tr><td>Compute-optimal allocation (Chinchilla)</td><td>Same FLOPs, lower loss, just by balancing parameters and tokens</td><td>07</td></tr>
+    <tr><td>RoPE, SwiGLU, RMSNorm, GQA</td><td>Small per-component gains that add up; GQA shrinks the KV cache</td><td>06, 08</td></tr>
+    <tr><td>Mixture-of-experts</td><td>Parameters without proportional FLOPs: DeepSeek-V3 has 671B parameters but uses 37B per token</td><td>06</td></tr>
+    <tr><td>FlashAttention (Dao et al., 2022)</td><td>Exact attention with far less memory traffic; made long context practical</td><td>08</td></tr>
+    <tr><td>bf16, then FP8 training</td><td>About 2× matmul throughput per precision step; DeepSeek-V3 trained largely in FP8</td><td>07, 09</td></tr>
+    <tr><td>Larger tokenizers</td><td>Fewer tokens per text; Meta reported Llama 3's 128K vocabulary gives up to 15% fewer tokens than Llama 2's</td><td>05</td></tr>
+  </tbody>
+</table>
+
+<p>How much does all this add up to? Ho et al. (2024) fit a model to over 200 language-model evaluations (perplexity on WikiText and Penn Treebank) from 2012 to 2023 and asked how fast the compute needed for a fixed performance level fell.</p>
+
+<div class="formula" data-name="Algorithmic progress as a halving time">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{needed}}(t)} = \htmlClass{t2}{C_{\text{needed}}(t_0)} \cdot 2^{-(\htmlClass{t3}{t} - t_0)/\htmlClass{t4}{\tau}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{needed}}(t)\)</dt><dd>compute required to reach a fixed performance level with the best recipe at time \(t\)</dd></div>
+    <div data-t="t2"><dt>\(C_{\text{needed}}(t_0)\)</dt><dd>the same at a reference date</dd></div>
+    <div data-t="t3"><dt>\(t\)</dt><dd>time, in months</dd></div>
+    <div data-t="t4"><dt>\(\tau\)</dt><dd>halving time: Ho et al. estimate about 8 months, 95% CI roughly 5–14 months</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every \(\tau\) months, you need half the compute for the same result.</p>
+  <p class="why"><b>Why it matters</b>Over 4 years the central estimate gives \(2^{48/8} = 64\times\) less compute. The confidence interval runs from about 11× (\(\tau = 14\)) to about 780× (\(\tau = 5\)). Quote this number with its range or not at all.</p>
+</div>
+
+<div class="flag"><b>What the 8-month estimate does and doesn't measure</b>
+<p>It's measured on perplexity, on older benchmarks, mostly for pre-2023 models. It doesn't capture post-training, test-time compute, or data-quality gains on modern evaluations. Some algorithmic gains only appear at scale, and some small-scale tricks vanish at scale, so a single rate is a simplification. Ho et al. also conclude that compute scaling contributed more of the total improvement than algorithms over that period.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="small-models">Why small models got so good</h2>
+
+<p>The gap between frontier and small models narrowed sharply. A few concrete reasons, mostly covered elsewhere in the course:</p>
+
+<figure class="fig"><div id="fig-tpp"></div>
+<figcaption>Tokens per parameter over time, from published counts (log scale). Chinchilla's compute-optimal ratio is about 20 (dashed). Modern small models are trained 10–400× past it because the extra training cost pays off at inference time (Module 07). Llama 3.2 1B's point uses Meta's "up to 9T tokens".</figcaption></figure>
+
+<ul>
+  <li><strong>Overtraining.</strong> Llama 3 8B saw about 15T tokens, nearly 100× the Chinchilla ratio. A smaller model trained longer costs more to train than it "should" but less every time it's used (Sardana et al., 2023).</li>
+  <li><strong>Better data.</strong> Everything in the curation section helps small models disproportionately, because they can't afford to spend capacity on junk. Phi-1's result is an extreme example.</li>
+  <li><strong>Distillation.</strong> Gemma 2's 2B and 9B models were trained with knowledge distillation from a larger teacher (Gemma Team, 2024). Meta used logits from Llama 3.1 8B and 70B as targets when pretraining Llama 3.2 1B and 3B. DeepSeek distilled R1's reasoning into Qwen and Llama models from 1.5B to 70B.</li>
+  <li><strong>Better post-training</strong>, which transfers almost unchanged to small bases.</li>
+</ul>
+
+<p>The result, phrased carefully: <em>on many standard benchmarks</em>, 2024-era models in the 3–9B range match or beat models 20–50× larger from 2020–2022. Microsoft's Phi-3 report (Abdin et al., 2024) claims its 3.8B model rivals GPT-3.5 on benchmarks such as MMLU.</p>
+
+<div class="flag"><b>Where small models still lose</b>
+<p>Benchmark scores on popular tests are where contamination and targeted data have the most effect, so headline comparisons flatter small models. Factual recall still scales with parameters: Allen-Zhu and Li (2024) estimate language models store about 2 bits of knowledge per parameter in their synthetic setups. Long multi-step tasks, rare languages, and obscure facts are where you'll feel the difference. Test on your workload (Module 13).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="evals-loops">Evals steer, feedback loops accelerate</h2>
+
+<h3>Evals as the steering wheel</h3>
+<p>Labs optimize what they measure. A benchmark follows a predictable lifecycle: released as hard, hill-climbed, saturated, partly contaminated, replaced. Module 13 covers contamination and saturation in depth. Here is the pattern as it played out:</p>
+
+<table class="t">
+  <thead><tr><th>Benchmark</th><th>Introduced as</th><th>What happened</th></tr></thead>
+  <tbody>
+    <tr><td>MMLU (Hendrycks et al., 2020)</td><td>57-subject knowledge exam; GPT-3 scored about 44%</td><td>Frontier models above 85% by 2024; label errors now limit it. Successors: MMLU-Pro, GPQA.</td></tr>
+    <tr><td>GSM8K (Cobbe et al., 2021)</td><td>Grade-school math word problems</td><td>Saturated; a fresh look-alike set (GSM1k, Zhang et al., 2024) found some models scored noticeably lower, which points to overfitting.</td></tr>
+    <tr><td>GPQA (Rein et al., 2023)</td><td>Graduate-level science questions written to resist web search</td><td>Climbed quickly with reasoning models.</td></tr>
+    <tr><td>FrontierMath, Humanity's Last Exam (2024–25)</td><td>Research-level problems, mostly unpublished</td><td>Built to last longer by keeping test items private.</td></tr>
+    <tr><td>SWE-bench (Jimenez et al., 2023)</td><td>Real GitHub issues, graded by the repo's tests</td><td>Became a target for agentic coding, with a human-verified subset added to fix bad items.</td></tr>
+  </tbody>
+</table>
+
+<p>Arenas (LMArena, Chiang et al., 2024) measure crowd preferences on prompts users choose, which is closer to real use but is moved by style, length, and formatting. Every eval is a proxy, and Goodhart's law applies: once a proxy is optimized hard, it drifts from what it was meant to measure. The response is a steady supply of harder, private, or time-split evals, plus your own task evals.</p>
+
+<h3>Feedback loops</h3>
+<p>A deployed model generates the raw material for its successor. That's the flywheel, and it's a real driver of progress beyond the three pretraining levers:</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 340" id="fig-flywheel"></svg>
+<figcaption>The improvement flywheel. Usage produces preference signals and failure cases; verifiers and environments turn tasks into training signal; evals decide which changes ship. Each arrow can also carry a flaw forward. Optimizing thumbs-up data can reward flattery, and a hackable verifier can reward cheating.</figcaption></figure>
+
+<ul>
+  <li><strong>User preference data</strong>: thumbs up/down, side-by-side comparisons, and edits in products like ChatGPT become reward-model training data.</li>
+  <li><strong>Agentic environments</strong>: repositories with tests, browsers, terminals. The model attempts a task, the environment scores it, and RL learns from the result. This is RLVR applied to multi-step work.</li>
+  <li><strong>Self-play and search</strong>: AlphaGo Zero (Silver et al., 2017) learned Go only from games against itself. Language has no single win condition, but math and code partly do, so similar loops are possible there.</li>
+  <li><strong>AI feedback</strong>: Constitutional AI (Bai et al., 2022) used a model's own critiques against written principles as the preference signal (RLAIF), reducing the need for human labels.</li>
+</ul>
+
+<div class="pitfall"><b>Pitfall · the loop optimizes the signal, not your intent</b>
+<p>In April 2025 OpenAI rolled back a GPT-4o update that had become sycophantic. Their postmortem said an added reward signal based on users' thumbs-up/down feedback was one of the contributing factors. Any feedback loop needs evals for the behaviours you <em>don't</em> want, run before each release.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="limits">Limits and open questions</h2>
+
+<p>Nobody knows how long the trends in this module continue. Here are the main open questions, each with the strongest argument on both sides. Labs, Epoch AI, and academic critics disagree on all of them, and the evidence is incomplete.</p>
+
+<table class="t">
+  <thead><tr><th>Question</th><th>Case for continued gains</th><th>Case for slowdown</th><th>What would settle it</th></tr></thead>
+  <tbody>
+    <tr><td>Data wall</td><td>Synthetic data with verifiers, RL environments, audio and video, licensed data, and up to ~4 epochs of repetition all extend supply.</td><td>Epoch projects the public-text stock is used up around 2026–2032 (estimate). Verifiers only exist for checkable domains; collapse is a real risk without fresh data.</td><td>Published runs where synthetic-heavy pretraining keeps improving held-out evals.</td></tr>
+    <tr><td>Cost and energy</td><td>Sevilla et al. (2024, Epoch) argue runs around 2×10²⁹ FLOPs are likely feasible by 2030, with power supply the tightest constraint (estimate).</td><td>Training cost growing ~2.4× per year (Cottier et al., 2024) can't persist long: a $1B run becomes roughly $80B five years later. Grid connections take years.</td><td>Whether revenue grows fast enough to justify the next 10× of spend.</td></tr>
+    <tr><td>Diminishing returns</td><td>Power laws have held across many orders of magnitude, and RL and test-time compute are new axes with their own scaling curves.</td><td>A power law means each fixed loss improvement costs a constant <em>multiple</em> of compute. Late-2024 press reports described disappointing pretraining runs at several labs; these are unverified.</td><td>Published scaling curves on fresh, uncontaminated evals.</td></tr>
+    <tr><td>Evaluation gap</td><td>METR estimates the length of software tasks frontier models can complete at 50% reliability has doubled about every 7 months since 2019 (Kwa et al., 2025; estimate with wide uncertainty).</td><td>METR's own 2025 randomized trial found 16 experienced open-source developers were 19% <em>slower</em> with early-2025 AI tools, while believing they were faster. Benchmarks and real productivity can diverge.</td><td>More field studies on real work, not just benchmarks.</td></tr>
+  </tbody>
+</table>
+
+<div class="intuition"><b>A useful habit</b>
+<p>When you read a claim that progress is accelerating or stalling, ask which lever it's about (compute, data, algorithms, post-training, test-time), which metric it uses (loss, benchmark, arena, field study), and whether the number is measured or estimated. Most public arguments get louder by blurring those three things.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Fit a scaling law, then distrust the extrapolation</h3>
+<p>Fit both a pure power law and one with a floor to toy "small runs", then extrapolate 1,000× beyond the data. The bootstrap band only covers noise in the points. It says nothing about whether the functional form holds out there.</p>
+<div class="code" data-lang="python" data-title="fit_scaling.py"><pre><code>
+import numpy as np
+from scipy.optimize import curve_fit
+
+rng = np.random.default_rng(0)
+C = np.logspace(17, 20, 7)                        # 7 small runs, 1e17..1e20 FLOPs
+true = lambda c: 1.8 + 1.94 * (c / 1e17) ** -0.07
+L = true(C) + rng.normal(0, 0.01, C.size)         # toy eval losses with noise
+
+# (1) no floor: log L = log a - alpha * log C, a straight line in log-log space
+slope, icpt = np.polyfit(np.log10(C), np.log10(L), 1)
+print(f"pure power law: L ~ C^{slope:.3f}")
+
+# (2) with an irreducible floor: L = L_inf + A * (C/1e17)^-alpha
+def law(c, L_inf, A, alpha):
+    return L_inf + A * (c / 1e17) ** -alpha
+
+bounds = ([0, 0, 0], [5, 10, 1])
+p, _ = curve_fit(law, C, L, p0=(1.5, 2.0, 0.1), bounds=bounds)
+print("fit: L_inf=%.2f  A=%.2f  alpha=%.3f" % tuple(p))
+
+# (3) extrapolate 1000x past the data with a residual bootstrap
+target = 1e23
+fitted = law(C, *p)
+resid = L - fitted
+preds = []
+for _ in range(500):
+    Lb = fitted + rng.choice(resid, resid.size, replace=True)
+    try:
+        pb, _ = curve_fit(law, C, Lb, p0=p, bounds=bounds, maxfev=20000)
+    except RuntimeError:
+        continue
+    preds.append(law(target, *pb))
+lo, hi = np.percentile(preds, [5, 95])
+print(f"floor fit      L(1e23) = {law(target, *p):.3f}  90% band [{lo:.3f}, {hi:.3f}]")
+print(f"pure power law L(1e23) = {10 ** (icpt + slope * np.log10(target)):.3f}")
+print(f"truth (known only because this is a toy) = {true(target):.3f}")
+</code></pre></div>
+
+<h3>2. A FineWeb-Edu-style quality classifier</h3>
+<p>First use the released classifier, then build your own from LLM-judge labels. The released model is a regression head on an embedding model; scores of 3 and above were kept for FineWeb-Edu.</p>
+<div class="code" data-lang="python" data-title="score_with_fineweb_edu.py"><pre><code>
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+name = "HuggingFaceFW/fineweb-edu-classifier"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForSequenceClassification.from_pretrained(name).eval()
+
+docs = [
+    "Photosynthesis converts light energy into chemical energy stored in glucose. "
+    "It happens in two stages: the light-dependent reactions and the Calvin cycle.",
+    "BEST DEALS!!! cheap watches click here free shipping click here now",
+]
+with torch.no_grad():
+    batch = tok(docs, return_tensors="pt", padding="longest", truncation=True, max_length=512)
+    scores = model(**batch).logits.squeeze(-1).float().tolist()
+for d, s in zip(docs, scores):
+    print(f"{s:5.2f}  keep={s >= 3}  {d[:60]}")
+</code></pre></div>
+
+<div class="code" data-lang="python" data-title="train_quality_filter.py"><pre><code>
+# Your own filter: LLM-judge labels -> sentence embeddings -> logistic regression.
+# labeled.jsonl rows look like {"text": ..., "label": 0 or 1}, labelled by a strong model
+# against a written rubric and spot-checked by a human. A few thousand rows is a start.
+import numpy as np
+from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+ds = load_dataset("json", data_files="labeled.jsonl", split="train")
+enc = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+embed = lambda texts: enc.encode([t[:2000] for t in texts], batch_size=64, normalize_embeddings=True)
+
+X, y = embed(ds["text"]), np.array(ds["label"])
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=0)
+clf = LogisticRegression(max_iter=2000, class_weight="balanced").fit(Xtr, ytr)
+print("held-out AUC:", round(roc_auc_score(yte, clf.predict_proba(Xte)[:, 1]), 3))
+
+# Score a slice of FineWeb and keep the top 10%
+web = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
+docs = [row["text"] for _, row in zip(range(20_000), web)]
+score = clf.predict_proba(embed(docs))[:, 1]
+thresh = np.quantile(score, 0.90)
+kept = [d for d, s in zip(docs, score) if s >= thresh]
+dropped = [d for d, s in zip(docs, score) if s &lt; np.quantile(score, 0.10)]
+print(f"kept {len(kept)} / {len(docs)}  (threshold {thresh:.3f})")
+# Now READ 20 of `kept` and 20 of `dropped`. What did the filter learn besides quality?
+</code></pre></div>
+
+<h3>3. Majority vote and best-of-N on a real model</h3>
+<p>Sample 16 answers per GSM8K problem, then compute maj@k and best-of-k with an oracle verifier (the gold answer). Best-of-k with an oracle is exactly pass@k, so we reuse the unbiased estimator from Module 13.</p>
+<div class="code" data-lang="python" data-title="vote_vs_verify.py"><pre><code>
+import math, random, re
+from collections import Counter
+from datasets import load_dataset
+from vllm import LLM, SamplingParams
+
+N = 16
+ds = load_dataset("openai/gsm8k", "main", split="test").select(range(200))
+gold = [float(ex["answer"].split("####")[-1].strip().replace(",", "")) for ex in ds]
+
+llm = LLM(model="Qwen/Qwen2.5-1.5B-Instruct")
+tok = llm.get_tokenizer()
+prompts = [tok.apply_chat_template(
+    [{"role": "user", "content": ex["question"] + "\nThink step by step, then end with '#### &lt;number&gt;'."}],
+    tokenize=False, add_generation_prompt=True) for ex in ds]
+outs = llm.generate(prompts, SamplingParams(n=N, temperature=0.8, top_p=0.95, max_tokens=512, seed=0))
+
+def extract(text):
+    m = re.findall(r"####\s*\$?(-?[\d,]*\.?\d+)", text) or re.findall(r"-?[\d,]*\.?\d+", text)
+    try:
+        return float(m[-1].replace(",", "")) if m else None
+    except ValueError:
+        return None
+
+answers = [[extract(c.text) for c in o.outputs] for o in outs]
+
+def maj_at_k(ans, g, k, trials=50):
+    hits = 0.0
+    for _ in range(trials):
+        sub = [a for a in random.sample(ans, k) if a is not None]
+        if sub:
+            counts = Counter(sub).most_common()
+            tied = [a for a, c in counts if c == counts[0][1]]
+            hits += random.choice(tied) == g
+    return hits / trials
+
+def pass_at_k(n, c, k):                 # unbiased estimator (Chen et al., 2021)
+    return 1.0 if n - c &lt; k else 1 - math.comb(n - c, k) / math.comb(n, k)
+
+random.seed(0)
+p_hat = [sum(a == g for a in ans) / N for ans, g in zip(answers, gold)]
+for k in (1, 2, 4, 8, 16):
+    maj = sum(maj_at_k(a, g, k) for a, g in zip(answers, gold)) / len(gold)
+    bon = sum(pass_at_k(N, round(p * N), k) for p in p_hat) / len(gold)
+    print(f"k={k:2d}  maj@k={maj:.3f}  best-of-k (oracle)={bon:.3f}")
+
+# Theory check: binary-answer majority vote should HURT problems with p &lt; 0.5
+hard = [i for i, p in enumerate(p_hat) if 0 &lt; p &lt; 0.5]
+maj16 = sum(maj_at_k(answers[i], gold[i], 16, trials=1) for i in hard) / max(1, len(hard))
+mean_p = sum(p_hat[i] for i in hard) / max(1, len(hard))
+print(f"{len(hard)} problems with 0 &lt; p &lt; 0.5: mean p={mean_p:.3f}, maj@16={maj16:.3f}")
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have: (1) a table of maj@k and best-of-k for k = 1, 2, 4, 8, 16 on 200 GSM8K problems, with a sentence explaining why best-of-k grows faster and what it would take to get it in production (a verifier); (2) the "hard problems" line, and an explanation of why maj@16 on them is <em>above</em> the binary-vote prediction (wrong answers scatter across different numbers, so the correct one can still win a plurality); (3) the scaling fit printout, plus how much the extrapolated loss moves when you drop the largest run; (4) three failure modes of your quality filter, each backed by a document you actually read.</p>
+</div>
+
+<h3>Further reading</h3>
+<ul>
+  <li>Sevilla et al., 2022, <a href="https://arxiv.org/abs/2202.05924">Compute Trends Across Three Eras of Machine Learning</a>; Epoch AI, <a href="https://epoch.ai/blog/training-compute-of-frontier-ai-models-grows-by-4-5x-per-year">Training compute of frontier AI models grows by 4–5x per year</a>; Cottier et al., 2024, <a href="https://arxiv.org/abs/2405.21015">The rising costs of training frontier AI models</a>.</li>
+  <li>Ho et al., 2024, <a href="https://arxiv.org/abs/2403.05812">Algorithmic progress in language models</a>.</li>
+  <li>Muennighoff et al., 2023, <a href="https://arxiv.org/abs/2305.16264">Scaling Data-Constrained Language Models</a>; Villalobos et al., 2024, <a href="https://arxiv.org/abs/2211.04325">Will we run out of data?</a></li>
+  <li>Penedo et al., 2024, <a href="https://arxiv.org/abs/2406.17557">The FineWeb Datasets</a>; Li et al., 2024, <a href="https://arxiv.org/abs/2406.11794">DataComp-LM</a>; Gunasekar et al., 2023, <a href="https://arxiv.org/abs/2306.11644">Textbooks Are All You Need</a>.</li>
+  <li>Shumailov et al., 2024, <a href="https://www.nature.com/articles/s41586-024-07566-y">AI models collapse when trained on recursively generated data</a>; Gerstgrasser et al., 2024, <a href="https://arxiv.org/abs/2404.01413">Is Model Collapse Inevitable?</a></li>
+  <li>Wei et al., 2022, <a href="https://arxiv.org/abs/2206.07682">Emergent Abilities of Large Language Models</a>; Schaeffer et al., 2023, <a href="https://arxiv.org/abs/2304.15004">Are Emergent Abilities of Large Language Models a Mirage?</a></li>
+  <li>Wang et al., 2022, <a href="https://arxiv.org/abs/2203.11171">Self-Consistency Improves Chain of Thought Reasoning</a>; Snell et al., 2024, <a href="https://arxiv.org/abs/2408.03314">Scaling LLM Test-Time Compute Optimally</a>; DeepSeek-AI, 2025, <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1</a>.</li>
+  <li>Ouyang et al., 2022, <a href="https://arxiv.org/abs/2203.02155">Training language models to follow instructions with human feedback</a> (InstructGPT).</li>
+  <li>Kwa et al., 2025, <a href="https://arxiv.org/abs/2503.14499">Measuring AI Ability to Complete Long Tasks</a>; METR, 2025, <a href="https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/">Measuring the impact of early-2025 AI on experienced open-source developer productivity</a>.</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="16-main" data-title="Check yourself · Why models keep getting better">
+  <div class="q" data-answer="2"><p>Epoch AI estimates frontier training compute grows about 4× per year. What doubling time is that?</p>
+    <ol><li>About 3 months</li><li>About 4 months</li><li>About 6 months</li><li>About 12 months</li></ol>
+    <div class="explain">\(T_2 = \ln 2/\ln 4 = 0.693/1.386 = 0.5\) years. At 5× per year it's \(0.693/1.609 \approx 0.43\) years, about 5.2 months. "4× per year" is two doublings per year, not four.</div></div>
+  <div class="q" data-answer="3"><p>A model solves a problem on 20% of independent samples. You draw 10 samples and have a perfect verifier. What's the chance you end up with a correct answer?</p>
+    <ol><li>20%</li><li>50%</li><li>74%</li><li>89%</li></ol>
+    <div class="explain">\(1 - 0.8^{10} = 1 - 0.107 \approx 0.89\). You fail only if all ten fail. 74% would be six samples (\(1 - 0.8^6\)).</div></div>
+  <div class="q" data-answer="0"><p>On a yes/no question, a model is right on 40% of independent samples. What happens to majority-vote accuracy as you go from 1 to 101 samples?</p>
+    <ol><li>It falls toward 0%</li><li>It stays at about 40%</li><li>It rises toward 100%</li><li>It converges to 50%</li></ol>
+    <div class="explain">With binary answers and \(p \lt 0.5\), the wrong answer is the expected majority, and the binomial tail \(P(\text{more than half right})\) shrinks toward 0 as \(N\) grows. Voting amplifies whatever the model usually does. With free-form answers the picture differs, because wrong answers can split their votes.</div></div>
+  <div class="q" data-answer="1"><p>Across model sizes, per-token accuracy on answer tokens rises smoothly from 0.80 to 0.95. Exact match on 20-token answers goes from about 1% to about 36%, which looks like a sudden new ability. What's the most likely explanation?</p>
+    <ol><li>The larger models acquired a new circuit at a threshold</li><li>The all-or-nothing metric turns a smooth per-token gain into a sharp-looking jump, since \(p^{20}\) moves from 0.012 to 0.36</li><li>The benchmark must be contaminated</li><li>The pretraining loss curve must have a kink at that scale</li></ol>
+    <div class="explain">This is Schaeffer et al.'s (2023) argument. \(0.8^{20} \approx 0.012\) and \(0.95^{20} \approx 0.36\). Re-scoring with a continuous metric would show steady improvement. That doesn't prove no ability ever emerges, but you should rule out this effect first.</div></div>
+  <div class="q" data-answer="2"><p>You have 400B unique tokens of good code and want code to be 20% of a 15T-token pretraining run. What's the honest assessment?</p>
+    <ol><li>0.75 epochs, no repetition at all</li><li>About 2 epochs, comfortably safe</li><li>About 7.5 epochs, past the ~4-epoch range where repetition is nearly free, so expect diminishing returns: lower the weight or find more code</li><li>About 37 epochs, the model will memorize everything</li></ol>
+    <div class="explain">\(e = 0.2 \times 15\text{T} / 0.4\text{T} = 7.5\). Using Muennighoff et al.'s fit, \(R = 6.5\) gives \(D' \approx 0.4\text{T} \times (1 + 15.4(1 - e^{-6.5/15.4})) \approx 2.5\text{T}\) effective, about 84% of the nominal 3T. It's not a disaster, but it's worse than spending those tokens on fresh data.</div></div>
+  <div class="q" data-answer="3"><p>Why does training each generation only on the previous generation's samples lose the tails of the distribution first?</p>
+    <ol><li>Synthetic text has more grammatical errors than human text</li><li>Models refuse to generate rare content</li><li>Floating-point precision errors accumulate across generations</li><li>Rare events are often missing from a finite sample, so each refit assigns them less probability, and once they're gone nothing brings them back</li></ol>
+    <div class="explain">This is the statistical-approximation error in Shumailov et al. (2024). With a Gaussian, the MLE variance shrinks by \((n-1)/n\) in expectation each generation; with a long-tailed categorical, any category with zero count drops to zero probability for good. Keeping real data in every generation's mix anchors the distribution.</div></div>
+  <div class="q" data-answer="1"><p>Ho et al. (2024) estimate that the compute needed to reach a fixed language-model performance halves about every 8 months. Over 4 years, roughly how much less compute does the central estimate imply?</p>
+    <ol><li>About 6×</li><li>About 64×</li><li>About 16×</li><li>About 4,096×</li></ol>
+    <div class="explain">48 months / 8 = 6 halvings, so \(2^6 = 64\times\). The 95% interval (about 5–14 months) gives roughly 11× to 780×, which is why the estimate should always be quoted with its range.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, widget, fmtNum, fmtSI, rng, palette, clamp } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const SUP = { "-": "⁻", "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹" };
+  const sup = s => String(s).split("").map(ch => SUP[ch] || ch).join("");
+  function sci(x, d) {
+    if (d == null) d = 1;
+    if (!isFinite(x) || x <= 0) return "—";
+    let e = Math.floor(Math.log10(x)), m = x / 10 ** e;
+    if (+m.toFixed(d) >= 10) { m /= 10; e += 1; }
+    return e === 0 ? m.toFixed(d) : m.toFixed(d) + "×10" + sup(e);
+  }
+  const mult = x => (x < 1e4 ? fmtNum(x, x < 10 ? 1 : 0) : sci(x)) + "×";
+  const pow10 = v => "10" + sup(Math.round(Math.log10(v)));
+  const pct = (v, d) => (v * 100).toFixed(d == null ? 0 : d) + "%";
+  const lf = [0]; for (let i = 1; i <= 400; i++) lf[i] = lf[i - 1] + Math.log(i);
+  function pmf(n, k, p) {
+    if (k < 0 || k > n) return 0;
+    if (p <= 0) return k === 0 ? 1 : 0;
+    if (p >= 1) return k === n ? 1 : 0;
+    return Math.exp(lf[n] - lf[k] - lf[n - k] + k * Math.log(p) + (n - k) * Math.log(1 - p));
+  }
+  function erf(x) { // Abramowitz & Stegun 7.1.26
+    const sg = Math.sign(x); x = Math.abs(x);
+    const t = 1 / (1 + 0.3275911 * x);
+    const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+    return sg * y;
+  }
+  const Phi = z => 0.5 * (1 + erf(z / Math.SQRT2));
+  function arrowDefs(s, id, color) {
+    const d = svg("defs");
+    d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color })));
+    s.appendChild(d);
+  }
+  const FILL = { in: "#fff", q: "#fbfaf7", a: "rgba(26,122,82,.08)", b: "rgba(47,93,138,.08)", g: "rgba(154,123,34,.10)", r: "rgba(176,67,46,.08)" };
+  const STROKE = { in: "rgba(28,27,25,.25)", q: "rgba(28,27,25,.25)", a: "rgba(26,122,82,.55)", b: "rgba(47,93,138,.5)", g: "rgba(154,123,34,.55)", r: "rgba(176,67,46,.5)" };
+  function box(s, x, y, w, h, title, sub, kind) {
+    kind = kind || "in";
+    s.appendChild(svg("rect", { x, y, width: w, height: h, rx: 10, fill: FILL[kind], stroke: STROKE[kind], "stroke-width": 1.2 }));
+    const lines = sub ? sub.split("|") : [];
+    const y0 = y + h / 2 - (lines.length * 13) / 2 + 4;
+    s.appendChild(svg("text", { x: x + w / 2, y: lines.length ? y0 : y + h / 2 + 4, "text-anchor": "middle", "font-size": 13, "font-weight": 600, fill: palette.ink, text: title }));
+    lines.forEach((t, i) => s.appendChild(svg("text", { x: x + w / 2, y: y0 + 15 + i * 13, "text-anchor": "middle", "font-size": 11, fill: palette.muted, text: t })));
+  }
+  function arrow(s, x1, y1, x2, y2, id, opt) {
+    opt = opt || {};
+    s.appendChild(svg("path", { d: opt.d || `M${x1},${y1} L${x2},${y2}`, fill: "none", stroke: opt.color || palette.muted, "stroke-width": opt.width || 1.3, "stroke-dasharray": opt.dash || null, "marker-end": `url(#${id})` }));
+  }
+  function debounce(fn, ms) { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; }
+
+  /* ---------------------------------------------------------- Fig: the levers */
+  (function () {
+    const s = document.getElementById("fig-levers");
+    arrowDefs(s, "arrLv", palette.muted);
+    arrowDefs(s, "arrLvG", palette.green);
+    box(s, 20, 24, 180, 58, "Compute", "chips × time × utilization", "b");
+    box(s, 20, 104, 180, 58, "Data", "more tokens, better tokens", "b");
+    box(s, 20, 184, 180, 58, "Algorithms", "architecture, optimizers", "b");
+    box(s, 250, 88, 130, 90, "Pretraining", "next-token loss|trillions of tokens", "q");
+    box(s, 415, 103, 110, 60, "Base model", "completes text", "in");
+    box(s, 560, 88, 135, 90, "Post-training", "SFT · preferences|RL with verifiers", "q");
+    box(s, 730, 88, 135, 90, "Test-time compute", "longer reasoning|voting · verifiers", "a");
+    arrow(s, 200, 53, 248, 112, "arrLv");
+    arrow(s, 200, 133, 248, 133, "arrLv");
+    arrow(s, 200, 213, 248, 154, "arrLv");
+    arrow(s, 380, 133, 413, 133, "arrLv");
+    arrow(s, 525, 133, 558, 133, "arrLv");
+    arrow(s, 695, 133, 728, 133, "arrLv");
+    s.appendChild(svg("text", { x: 110, y: 14, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.blue, text: "pretraining levers" }));
+    s.appendChild(svg("text", { x: 712, y: 72, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.green, text: "levers 4 and 5: same weights, more capability" }));
+    arrow(s, 0, 0, 0, 0, "arrLvG", { d: "M797,178 L797,272 L110,272 L110,246", dash: "5 4", color: palette.green });
+    s.appendChild(svg("text", { x: 450, y: 292, "text-anchor": "middle", "font-size": 11.5, fill: palette.green, text: "usage → preferences, failure cases, verified traces → new data and RL environments" }));
+  })();
+
+  /* ---------------------------------------------------------- Fig: compute of documented models */
+  (function () {
+    const host = document.getElementById("fig-compute");
+    const P = plot(host, { width: 760, height: 330, x: [2019.8, 2025.6], y: [1e23, 1e26], logy: true, xticks: [2020, 2021, 2022, 2023, 2024, 2025], xfmt: v => String(v), yfmt: pow10, xlabel: "release year", ylabel: "training compute (FLOPs)", margin: { l: 58 } });
+    // [label, year, FLOPs, dx, y-factor, anchor, isEstimate]
+    const pts = [
+      ["GPT-3 175B", 2020.4, 3.1e23, 0.09, 0.9, "start"],
+      ["Chinchilla 70B", 2022.25, 5.9e23, -0.09, 0.9, "end"],
+      ["PaLM 540B", 2022.3, 2.5e24, 0.09, 0.9, "start"],
+      ["GPT-4 (Epoch estimate)", 2023.2, 2.1e25, -0.09, 0.9, "end", true],
+      ["Llama 2 70B", 2023.55, 8.4e23, 0.09, 0.9, "start"],
+      ["Llama 3 70B", 2024.3, 6.3e24, -0.09, 0.9, "end"],
+      ["Llama 3.1 405B", 2024.55, 3.8e25, 0.09, 0.9, "start"],
+      ["DeepSeek-V3 (37B active)", 2024.98, 3.3e24, 0, 0.55, "middle"]
+    ];
+    const L = [{ fn: x => 3.8e25 * 4.5 ** (x - 2024.55), color: palette.faint, dash: "5 4", width: 1.5, label: "4.5× per year slope (reference, not a fit)" }];
+    pts.forEach(([n, x, y, dx, fy, anc, est]) => {
+      L.push({ marker: [x, y], color: est ? palette.gold : palette.green, r: 5.5 });
+      L.push({ text: [x + dx, y * fy], label: n, color: est ? palette.gold : palette.ink, anchor: anc, size: 11 });
+    });
+    P.draw(L);
+  })();
+
+  /* ---------------------------------------------------------- Widget: effective compute calculator */
+  (function () {
+    const w = widget("w-effective", { title: "Effective compute calculator", kicker: "Calculator", note: "Physical FLOPs = peak × GPUs × seconds × MFU. The defaults land near Llama 3.1 405B's reported ~3.8×10²⁵. The algorithmic multiplier uses Ho et al.'s (2024) central estimate of an 8-month halving time; the range uses their 95% interval (about 5–14 months). It's a historical average measured on perplexity, not a law." });
+    const chips = [
+      { v: "a100", l: "A100 · 312 TFLOP/s bf16", f: 312e12 },
+      { v: "h100", l: "H100 SXM · 989 TFLOP/s bf16", f: 989e12 },
+      { v: "b200", l: "B200 · ~2,250 TFLOP/s bf16 dense", f: 2.25e15 }
+    ];
+    let chip = chips[1];
+    select(w.controls, { label: "Accelerator", options: chips.map(c => ({ value: c.v, label: c.l })), value: "h100", onChange: v => { chip = chips.find(c => c.v === v); draw(); } });
+    const gS = slider(w.controls, { label: "GPUs", min: 3, max: 17, step: 1, value: 14, fmt: v => (2 ** v).toLocaleString("en-US"), onInput: draw });
+    const dS = slider(w.controls, { label: "Training days", min: 1, max: 180, step: 1, value: 70, fmt: v => v + " d", onInput: draw });
+    const uS = slider(w.controls, { label: "Utilization (MFU)", min: 0.15, max: 0.6, step: 0.01, value: 0.38, fmt: v => pct(v), onInput: draw });
+    const yS = slider(w.controls, { label: "Recipe newer than the reference by", min: 0, max: 6, step: 0.5, value: 0, fmt: v => v + " yr", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 200, horizontal: true, labelWidth: 180 });
+    const set = stats(w.body, [{ key: "phys", label: "Physical FLOPs" }, { key: "gpuh", label: "GPU-hours" }, { key: "eff", label: "Effective FLOPs" }, { key: "x3", label: "vs GPT-3" }]);
+    function draw() {
+      const n = 2 ** gS.value, sec = dS.value * 86400;
+      const phys = chip.f * n * sec * uS.value;
+      const yr = yS.value;
+      const m = 2 ** (12 * yr / 8), mlo = 2 ** (12 * yr / 14), mhi = 2 ** (12 * yr / 5);
+      const eff = phys * m;
+      const ref = [["GPT-3 175B (2020)", 3.1e23], ["Llama 3 70B (2024)", 6.3e24], ["Llama 3.1 405B (2024)", 3.8e25]];
+      const lo = 21, hi = 29;
+      const labels = ref.map(r => r[0]).concat(["your run · physical", "your run · effective"]);
+      const vals = ref.map(r => r[1]).concat([phys, eff]);
+      B.draw(labels, vals.map(v => Math.max(0.02, Math.log10(v) - lo)), { max: hi - lo, colors: [palette.faint, palette.faint, palette.faint, palette.blue, palette.green], fmt: v => sci(10 ** (v + lo)) });
+      set("phys", sci(phys), null, "FLOPs actually executed");
+      set("gpuh", fmtSI(n * dS.value * 24, 1), null, n.toLocaleString("en-US") + " GPUs × " + dS.value + " days");
+      set("eff", sci(eff), "good", yr ? "× " + fmtNum(m, 1) + " (range " + fmtNum(mlo, 1) + "–" + fmtNum(mhi, 0) + "×)" : "same recipe as reference");
+      set("x3", mult(eff / 3.1e23), null, "effective ÷ 3.1×10²³");
+    }
+    draw();
+    w.body.insertBefore(el("p", { class: "small muted", style: { margin: "4px 0 6px" }, text: "Bar length is log₁₀(FLOPs): each step to the right is 10× more compute." }), wrap);
+  })();
+
+  /* ---------------------------------------------------------- Widget: compute growth projection */
+  (function () {
+    const w = widget("w-growth", { title: "How fast orders of magnitude pile up", kicker: "Interactive", note: "This is arithmetic, not a forecast. Physical growth combines hardware, spending, and run length; spending can't compound at 2–3× per year for long. Effective compute also multiplies in the algorithmic halving time, whose 95% interval is wide (about 5–14 months)." });
+    const gS = slider(w.controls, { label: "Physical compute growth per year", min: 1.2, max: 10, step: 0.1, value: 4.5, fmt: v => v.toFixed(1) + "×", onInput: draw });
+    const hS = slider(w.controls, { label: "Years ahead", min: 1, max: 15, step: 1, value: 10, fmt: v => v + " yr", onInput: draw });
+    const aS = slider(w.controls, { label: "Algorithmic halving time", min: 4, max: 24, step: 1, value: 8, fmt: v => v + " months", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "dbl", label: "Doubling time" }, { key: "oom", label: "Orders of magnitude / yr" }, { key: "phys", label: "Physical after N yrs" }, { key: "eff", label: "Effective after N yrs" }]);
+    function draw() {
+      const g = gS.value, H = hS.value, tau = aS.value / 12;
+      const ga = 2 ** (1 / tau), ge = g * ga;
+      const top = Math.max(1, Math.ceil(H * Math.log10(ge)) + 1);
+      const step = Math.max(1, Math.ceil(top / 8));
+      const yt = []; for (let e = 0; e <= top; e += step) yt.push(10 ** e);
+      wrap.innerHTML = "";
+      const P = plot(wrap, { width: 760, height: 300, x: [0, H], y: [1, 10 ** top], logy: true, yticks: yt, yfmt: pow10, xfmt: v => "+" + v, xlabel: "years from today", ylabel: "multiple of today", margin: { l: 58 } });
+      const layers = [
+        { fn: t => ge ** t, color: palette.green, label: "effective (physical × algorithms)" },
+        { fn: t => g ** t, color: palette.blue, label: "physical compute" },
+        { fn: t => ga ** t, color: palette.gold, dash: "5 4", label: "algorithms alone" }
+      ];
+      layers.push({ marker: [H, g ** H], color: palette.blue, label: mult(g ** H) });
+      layers.push({ marker: [H, ge ** H], color: palette.green });
+      P.draw(layers);
+      set("dbl", fmtNum(12 * Math.LN2 / Math.log(g), 1) + " months", null, "ln 2 / ln " + g.toFixed(1) + " years");
+      set("oom", fmtNum(Math.log10(g), 2), null, fmtNum(10 * Math.log10(g), 1) + " per decade");
+      set("phys", mult(g ** H), null, "after " + H + " years");
+      set("eff", mult(ge ** H), "good", "doubles every " + fmtNum(12 * Math.LN2 / Math.log(ge), 1) + " months");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: scaling law */
+  (function () {
+    const w = widget("w-scaling", { title: "Power-law scaling: steady in log space, shrinking in absolute terms", kicker: "Interactive", note: "Illustrative constants, normalized so the reducible loss is 2.0 nats at 10¹⁸ FLOPs. Real fits vary with data, tokenizer, and architecture, so compare shapes, not values. Switch to the log view: the reducible loss is a straight line whose slope is −α." });
+    let mode = "total";
+    const aS = slider(w.controls, { label: "Exponent α", min: 0.02, max: 0.3, step: 0.005, value: 0.07, fmt: v => v.toFixed(3), onInput: draw });
+    const fS = slider(w.controls, { label: "Irreducible loss L∞", min: 0.5, max: 2.5, step: 0.05, value: 1.7, fmt: v => v.toFixed(2), onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "View" })));
+    seg(c1, { options: [{ value: "total", label: "total loss" }, { value: "log", label: "reducible loss, log-log" }], value: "total", onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "cut", label: "Each 10× compute cuts" }, { key: "half", label: "To halve reducible loss" }, { key: "early", label: "Gain 10²⁰ → 10²¹" }, { key: "late", label: "Gain 10²⁵ → 10²⁶" }]);
+    const R0 = 2.0;
+    const xt = [1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27];
+    function draw() {
+      const a = aS.value, Lf = fS.value;
+      const red = c => R0 * (c / 1e18) ** -a;
+      const L = c => Lf + red(c);
+      wrap.innerHTML = "";
+      if (mode === "total") {
+        const P = plot(wrap, { width: 760, height: 300, x: [1e18, 1e27], y: [Lf - 0.2, Lf + R0 + 0.2], logx: true, xticks: xt, xfmt: pow10, yfmt: v => v.toFixed(1), xlabel: "training compute (FLOPs, log scale)", ylabel: "loss (nats/token)" });
+        P.draw([
+          { fn: L, color: palette.green, label: "L(C) = L∞ + a·C^−α" },
+          { hline: Lf, color: palette.brick, label: "L∞ floor" },
+          { marker: [1e20, L(1e20)], color: palette.blue, label: L(1e20).toFixed(3) },
+          { marker: [1e25, L(1e25)], color: palette.blue, label: L(1e25).toFixed(3) }
+        ]);
+      } else {
+        const ymin = red(1e27) / 1.5, ymax = R0 * 1.5;
+        const nice = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5].filter(v => v >= ymin && v <= ymax);
+        const P = plot(wrap, { width: 760, height: 300, x: [1e18, 1e27], y: [ymin, ymax], logx: true, logy: true, xticks: xt, yticks: nice, xfmt: pow10, yfmt: v => String(v), xlabel: "training compute (FLOPs, log scale)", ylabel: "reducible loss L − L∞ (log)" });
+        P.draw([
+          { fn: red, color: palette.green, label: "a·C^−α: slope −α in log-log" },
+          { marker: [1e20, red(1e20)], color: palette.blue, label: red(1e20).toFixed(3) },
+          { marker: [1e25, red(1e25)], color: palette.blue, label: red(1e25).toFixed(3) }
+        ]);
+      }
+      set("cut", pct(1 - 10 ** -a, 1), null, "of the reducible loss, at any scale");
+      const ooms = Math.log10(2) / a;
+      set("half", fmtNum(ooms, 1) + " OOM", ooms > 6 ? "bad" : ooms > 3 ? "warn" : "good", "i.e. " + mult(2 ** (1 / a)) + " more compute");
+      set("early", "−" + (L(1e20) - L(1e21)).toFixed(3), null, "nats");
+      set("late", "−" + (L(1e25) - L(1e26)).toFixed(3), null, "nats: same 10×, smaller gain");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: emergence as a metric artifact */
+  (function () {
+    const w = widget("w-emergence", { title: "Smooth per-token gains, sharp-looking exact match", kicker: "Interactive", note: "Per-token error falls as a smooth power law, ε = 0.5·(C/10¹⁸)^−γ, the setup Schaeffer et al. (2023) analyse. Exact match = p^k. The exact-match curve isn't narrower in log-compute than a smooth curve. It sits at zero for longer and then climbs, and with a few model sizes and a 100-item test set (where anything under 0.5% rounds to 0) that reads as a jump." });
+    let samp = "dense";
+    const kS = slider(w.controls, { label: "Answer length k (all tokens must be right)", min: 1, max: 64, step: 1, value: 20, fmt: v => v + " tokens", onInput: draw });
+    const gS = slider(w.controls, { label: "Per-token error exponent γ", min: 0.15, max: 0.5, step: 0.01, value: 0.3, fmt: v => v.toFixed(2), onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Evaluation" })));
+    seg(c1, { options: [{ value: "dense", label: "every scale, exact" }, { value: "sparse", label: "6 models, 100-item test" }], value: "dense", onChange: v => { samp = v; draw(); } });
+    w.controls.appendChild(c1);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 300, x: [1e18, 1e26], y: [0, 1], logx: true, xfmt: pow10, yfmt: v => pct(v), xlabel: "training compute (FLOPs, log scale)", ylabel: "accuracy" });
+    const set = stats(w.body, [{ key: "c10", label: "Exact match hits 10%" }, { key: "c90", label: "Exact match hits 90%" }, { key: "span", label: "10% → 90% span" }, { key: "ptok", label: "Per-token acc. at 50% exact" }]);
+    function draw() {
+      const k = kS.value, g = gS.value;
+      const eps = c => Math.min(0.95, 0.5 * (c / 1e18) ** -g);
+      const ptok = c => 1 - eps(c);
+      const exact = c => ptok(c) ** k;
+      const cAt = q => { const e = 1 - q ** (1 / k); return e >= 0.5 ? 1e18 : 1e18 * (0.5 / e) ** (1 / g); };
+      const c10 = cAt(0.1), c90 = cAt(0.9);
+      const layers = [{ band: [Math.max(1e18, c10), Math.min(1e26, c90)], color: palette.brick, opacity: 0.06 }];
+      if (samp === "dense") {
+        layers.push({ fn: ptok, color: palette.green, label: "per-token accuracy p (continuous metric)" });
+        layers.push({ fn: exact, color: palette.brick, label: "exact match p^k (all-or-nothing)" });
+      } else {
+        const cs = [18.5, 20, 21.5, 23, 24.5, 26].map(e => 10 ** e);
+        layers.push({ points: cs.map(c => [c, ptok(c)]), color: palette.green, dots: true, r: 4, label: "per-token accuracy (6 models)" });
+        layers.push({ points: cs.map(c => [c, Math.round(exact(c) * 100) / 100]), color: palette.brick, dots: true, r: 4, label: "exact match, 100 items (6 models)" });
+      }
+      P.draw(layers);
+      const fmtC = c => c <= 1e18 ? "≤ 10¹⁸" : c >= 1e26 ? "> 10²⁶" : sci(c);
+      set("c10", fmtC(c10), null, "FLOPs");
+      set("c90", fmtC(c90), null, "FLOPs");
+      set("span", fmtNum(Math.log10(c90 / c10), 1) + " OOM", null, "the band shaded on the plot");
+      set("ptok", pct(0.5 ** (1 / k), 1), null, "needed for half the answers to be fully right");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Fig: curation funnel */
+  (function () {
+    const s = document.getElementById("fig-funnel");
+    const stages = [
+      ["Raw crawl", 1.0, "WARC files: billions of pages per Common Crawl snapshot"],
+      ["Text extraction + language ID", 0.8, "strip HTML and boilerplate; fastText language ID"],
+      ["Heuristic filters", 0.56, "length, punctuation, symbol ratios, repeated n-grams"],
+      ["Deduplication", 0.38, "exact hashes, then MinHash near-duplicates"],
+      ["Model-based quality filter", 0.16, "FineWeb-Edu score ≥ 3, or DCLM fastText top ~10%"],
+      ["Decontamination + PII", 0.15, "drop benchmark n-gram overlaps; mask emails, keys"],
+      ["Training set", 0.14, "then mixed by domain and upsampled (next widget)"]
+    ];
+    const cx = 215, maxW = 400, h = 34, gap = 10, y0 = 14;
+    stages.forEach(([name, f, note], i) => {
+      const wd = maxW * f, y = y0 + i * (h + gap);
+      const last = i === stages.length - 1;
+      const t = i / (stages.length - 1);
+      s.appendChild(svg("rect", { x: cx - wd / 2, y, width: wd, height: h, rx: 6, fill: last ? "rgba(26,122,82,.28)" : `rgba(47,93,138,${(0.08 + 0.14 * t).toFixed(3)})`, stroke: last ? "rgba(26,122,82,.6)" : "rgba(47,93,138,.35)" }));
+      s.appendChild(svg("text", { x: cx, y: y + h / 2 + 4, "text-anchor": "middle", "font-size": 12, "font-weight": 600, fill: palette.ink, text: name }));
+      s.appendChild(svg("line", { x1: cx + Math.max(wd / 2, 90) + 6, x2: 438, y1: y + h / 2, y2: y + h / 2, stroke: palette.line, "stroke-dasharray": "2 3" }));
+      s.appendChild(svg("text", { x: 444, y: y + h / 2 + 4, "font-size": 11.5, fill: palette.muted, text: note }));
+    });
+    s.appendChild(svg("text", { x: cx, y: 332, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.faint, text: "bar widths illustrative · DCLM kept ~1.6% of a 240T pool" }));
+  })();
+
+  /* ---------------------------------------------------------- Widget: data mixture allocator */
+  (function () {
+    const w = widget("w-mixture", { title: "Data-mixture allocator", kicker: "Interactive", note: "Unique-token stocks are illustrative orders of magnitude for an open-data team after filtering, not measurements. Effective tokens apply Muennighoff et al.'s (2023) repetition fit (R* = 15.4) to each domain separately. That's an extrapolation, because their experiments repeated a single dataset." });
+    const DOM = [
+      { n: "Web · quality-filtered", u: 8e12, w: 30 },
+      { n: "Web · broad", u: 20e12, w: 15 },
+      { n: "Code", u: 1.0e12, w: 17 },
+      { n: "Math & reasoning", u: 0.8e12, w: 25 },
+      { n: "Multilingual", u: 6e12, w: 8 },
+      { n: "Books & papers", u: 0.4e12, w: 5 }
+    ];
+    const PRESET = { open: [1, 1, 1, 1, 1, 1], rich: [1.5, 1, 3, 3, 1.5, 3] };
+    let preset = "open";
+    const fmtT = x => x >= 1e12 ? (x / 1e12).toFixed(x < 1e13 ? 2 : 1) + "T" : (x / 1e9).toFixed(0) + "B";
+    select(w.controls, { label: "Unique data available", options: [{ value: "open", label: "Open-data team (illustrative)" }, { value: "rich", label: "Lab with licensed + synthetic data (illustrative)" }], value: "open", onChange: v => { preset = v; draw(); } });
+    const bS = slider(w.controls, { label: "Training-token budget", min: 11.7, max: 13.6, step: 0.02, value: Math.log10(15e12), fmt: v => fmtT(10 ** v), onInput: draw });
+    const wS = DOM.map(d => slider(w.controls, { label: "Weight · " + d.n, min: 0, max: 60, step: 1, value: d.w, fmt: v => String(v), onInput: draw }));
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 230, horizontal: true, labelWidth: 170 });
+    const msg = el("p", { class: "warnline" }); w.body.appendChild(msg);
+    const set = stats(w.body, [{ key: "nom", label: "Nominal tokens" }, { key: "eff", label: "Effective tokens" }, { key: "worst", label: "Most repeated" }, { key: "uniq", label: "Unique tokens used" }]);
+    const Rs = 15.4;
+    const effTok = (D, U) => { if (D <= U) return D; const R = D / U - 1; return U * (1 + Rs * (1 - Math.exp(-R / Rs))); };
+    function draw() {
+      const Btot = 10 ** bS.value;
+      const ws = wS.map(s => s.value), sw = ws.reduce((a, b) => a + b, 0) || 1;
+      const rows = DOM.map((d, i) => {
+        const U = d.u * PRESET[preset][i], D = Btot * ws[i] / sw;
+        return { n: d.n, U, D, e: D / U, eff: effTok(D, U), share: ws[i] / sw };
+      });
+      const maxE = Math.max(5, ...rows.map(r => r.e));
+      B.draw(rows.map(r => r.n), rows.map(r => r.e), {
+        max: maxE,
+        colors: rows.map(r => r.e <= 1 ? palette.green : r.e <= 4 ? palette.gold : palette.brick),
+        fmt: v => fmtNum(v, v < 10 ? 2 : 1) + " epochs"
+      });
+      const effSum = rows.reduce((a, r) => a + r.eff, 0);
+      const uniq = rows.reduce((a, r) => a + Math.min(r.D, r.U), 0);
+      const worst = rows.reduce((a, r) => r.e > a.e ? r : a, rows[0]);
+      set("nom", fmtT(Btot), null, rows.map(r => Math.round(r.share * 100)).join(" / ") + " %");
+      set("eff", fmtT(effSum), effSum / Btot > 0.95 ? "good" : effSum / Btot > 0.85 ? "warn" : "bad", pct(effSum / Btot) + " of nominal");
+      set("worst", fmtNum(worst.e, 1) + " ep", worst.e > 4 ? "bad" : worst.e > 1 ? "warn" : "good", worst.n);
+      set("uniq", fmtT(uniq), null, "distinct tokens actually seen");
+      const over = rows.filter(r => r.e > 4);
+      if (over.length) {
+        msg.className = "warnline bad";
+        msg.textContent = over.map(r => `${r.n} is repeated ${fmtNum(r.e, 1)}×`).join("; ") + ". Past about 4 epochs, Muennighoff et al. found repeated tokens lose value quickly, and past about 16 they add little. Lower the weight, find more unique data, or accept the loss knowingly.";
+      } else {
+        msg.className = "warnline ok";
+        msg.textContent = "Every domain is at or under ~4 epochs, where repetition cost little in Muennighoff et al.'s experiments.";
+      }
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: model collapse */
+  (function () {
+    const w = widget("w-collapse", { title: "Model collapse: train each generation on the last one's samples", kicker: "Simulation", note: "Each generation draws n samples (a fraction from the real distribution, the rest from the previous model) and refits by maximum likelihood. Eight independent chains are shown. Gaussian mode tracks the fitted σ; long-tail mode uses a 100-category Zipf distribution and counts categories that still have nonzero probability. A category that gets zero samples is gone for good unless real data brings it back." });
+    let mode = "gauss", seedBase = 1;
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Distribution" })));
+    seg(c1, { options: [{ value: "gauss", label: "Gaussian" }, { value: "cat", label: "long-tail categorical" }], value: "gauss", onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    const sched = debounce(() => draw(), 30);
+    const nS = slider(w.controls, { label: "Samples per generation n", min: 4, max: 10, step: 1, value: 7, fmt: v => String(2 ** v), onInput: sched });
+    const tS = slider(w.controls, { label: "Generations", min: 10, max: 200, step: 10, value: 100, fmt: v => String(v), onInput: sched });
+    const lS = slider(w.controls, { label: "Real data mixed in each generation", min: 0, max: 0.5, step: 0.01, value: 0, fmt: v => pct(v), onInput: sched });
+    const br = el("div", { class: "btnrow" }); w.controls.appendChild(br);
+    br.appendChild(el("button", { class: "btn", text: "New random seeds", onclick: () => { seedBase += 17; draw(); } }));
+    const wrap1 = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap1);
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const set = stats(w.body, [{ key: "a", label: "" }, { key: "b", label: "" }, { key: "c", label: "" }, { key: "d", label: "" }]);
+    const labels = Array.from(w.body.querySelectorAll(".readout .stat .k"));
+    const setLabels = arr => arr.forEach((t, i) => { labels[i].textContent = t; });
+    const CH = 8;
+    const chainCol = i => [palette.blue, palette.teal, palette.plum, palette.gold, palette.brick, palette.green, palette.muted, palette.ink][i % 8];
+    // Zipf truth
+    const K = 100;
+    const zipf = (() => { const a = Array.from({ length: K }, (_, i) => 1 / (i + 1) ** 1.1); const s = a.reduce((x, y) => x + y, 0); return a.map(v => v / s); })();
+    const cum = p => { const c = new Float64Array(p.length); let s = 0; p.forEach((v, i) => { s += v; c[i] = s; }); c[p.length - 1] = 1; return c; };
+    const zipfCum = cum(zipf);
+    const draw01 = (c, u) => { let lo = 0, hi = c.length - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (c[m] < u) lo = m + 1; else hi = m; } return lo; };
+    const tailTrue = zipf.slice(50).reduce((a, b) => a + b, 0);
+    const median = a => { const b = a.slice().sort((x, y) => x - y); const m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
+
+    function simGauss(n, T, lam, seed) {
+      const r = rng(seed); let mu = 0, sd = 1; const path = [[0, 1]];
+      const nReal = Math.round(lam * n);
+      for (let t = 1; t <= T; t++) {
+        let s1 = 0, s2 = 0;
+        for (let i = 0; i < n; i++) { const x = i < nReal ? r.normal() : mu + sd * r.normal(); s1 += x; s2 += x * x; }
+        mu = s1 / n; sd = Math.sqrt(Math.max(1e-12, s2 / n - mu * mu));
+        path.push([t, sd]);
+      }
+      return { path, mu, sd };
+    }
+    function simCat(n, T, lam, seed) {
+      const r = rng(seed); let q = zipf.slice(); const path = [[0, K]];
+      const nReal = Math.round(lam * n); let firstLoss = null;
+      const counts = new Float64Array(K);
+      for (let t = 1; t <= T; t++) {
+        counts.fill(0);
+        const cq = cum(q);
+        for (let i = 0; i < n; i++) counts[draw01(i < nReal ? zipfCum : cq, r())]++;
+        q = Array.from(counts, c => c / n);
+        const alive = q.filter(v => v > 0).length;
+        if (firstLoss == null && alive < K) firstLoss = t;
+        path.push([t, alive]);
+      }
+      return { path, q, firstLoss };
+    }
+    function draw() {
+      const n = 2 ** nS.value, T = tS.value, lam = lS.value;
+      wrap1.innerHTML = ""; wrap2.innerHTML = "";
+      if (mode === "gauss") {
+        const runs = Array.from({ length: CH }, (_, i) => simGauss(n, T, lam, seedBase * 1000 + i));
+        const peak = Math.max(...runs.map(r => Math.max(...r.path.map(p => p[1]))));
+        const ymax = Math.min(2.5, Math.max(1.5, peak * 1.05));
+        const P = plot(wrap1, { width: 760, height: 260, x: [0, T], y: [0, ymax], xlabel: "generation", ylabel: "fitted σ", yfmt: v => v.toFixed(1) });
+        const L = runs.map((r, i) => ({ points: r.path, color: chainCol(i), width: 1.3 }));
+        L.push({ hline: 1, color: palette.ink, label: "true σ = 1" });
+        if (lam === 0) L.push({ fn: t => Math.sqrt((1 - 1 / n) ** t), color: palette.ink, dash: "2 3", width: 1.5, label: "√E[σ²] = (1 − 1/n)^(t/2)" });
+        P.draw(L);
+        const P2 = plot(wrap2, { width: 760, height: 200, x: [-4, 4], y: [0, 1.2], xlabel: "x", ylabel: "density", yticks: [], xticks: [-4, -3, -2, -1, 0, 1, 2, 3, 4], margin: { l: 24 } });
+        const pdf = (x, m, s) => Math.exp(-((x - m) ** 2) / (2 * s * s)) / (s * Math.sqrt(2 * Math.PI));
+        const L2 = [{ fn: x => pdf(x, 0, 1), color: palette.ink, width: 2, area: true, areaOpacity: 0.08, label: "real data N(0, 1)" }];
+        runs.slice(0, 3).forEach((r, i) => L2.push({ fn: x => pdf(x, r.mu, r.sd), color: chainCol(i), width: 1.5, label: i === 0 ? "final generation, 3 chains" : null }));
+        L2.push({ band: [-4, -3], color: palette.brick, opacity: 0.06 }, { band: [3, 4], color: palette.brick, opacity: 0.06 });
+        P2.draw(L2);
+        const sds = runs.map(r => r.sd);
+        const tail = runs.map(r => Phi((-3 - r.mu) / r.sd) + 1 - Phi((3 - r.mu) / r.sd));
+        const medSd = median(sds);
+        setLabels(["Median final σ", "Chains with σ < 0.5", "Mass beyond |x| > 3", "Median |drift of μ|"]);
+        set("a", medSd.toFixed(2), medSd > 0.85 ? "good" : medSd > 0.5 ? "warn" : "bad", "true σ = 1");
+        const nc = sds.filter(v => v < 0.5).length;
+        set("b", nc + " of " + CH, nc ? "bad" : "good", "collapsed chains");
+        const tm = tail.reduce((a, b) => a + b, 0) / CH;
+        set("c", pct(tm, 2), tm > 0.0018 ? "good" : tm > 0.0005 ? "warn" : "bad", "real data: 0.27%");
+        set("d", median(runs.map(r => Math.abs(r.mu))).toFixed(2), null, "mean wanders too");
+      } else {
+        const runs = Array.from({ length: CH }, (_, i) => simCat(n, T, lam, seedBase * 1000 + i));
+        const P = plot(wrap1, { width: 760, height: 260, x: [0, T], y: [0, K], xlabel: "generation", ylabel: "categories still alive", yfmt: v => String(v) });
+        const L = runs.map((r, i) => ({ points: r.path, color: chainCol(i), width: 1.3 }));
+        L.push({ hline: K, color: palette.ink, label: "all 100 categories" });
+        P.draw(L);
+        const P2 = plot(wrap2, { width: 760, height: 200, x: [1, 100], y: [1e-5, 0.3], logx: true, logy: true, xticks: [1, 10, 100], yticks: [1e-5, 1e-4, 1e-3, 1e-2, 1e-1], xfmt: v => String(v), yfmt: v => pow10(v), xlabel: "category rank in the real distribution", ylabel: "probability", margin: { l: 52 } });
+        const q0 = runs[0].q;
+        P2.draw([
+          { points: zipf.map((v, i) => [i + 1, v]), color: palette.ink, dash: "4 3", width: 1.5, label: "real (Zipf)" },
+          { points: q0.map((v, i) => [i + 1, v]).filter(p => p[1] > 0), color: palette.brick, dots: true, dotsOnly: true, r: 3, label: "chain 1, final generation (missing dots = extinct)" }
+        ]);
+        const alive = runs.map(r => r.path[r.path.length - 1][1]);
+        const tails = runs.map(r => r.q.slice(50).reduce((a, b) => a + b, 0));
+        const fl = runs.map(r => r.firstLoss).filter(v => v != null);
+        setLabels(["Median categories alive", "Tail mass (ranks 51–100)", "First category lost", "Top-10 share, chain 1"]);
+        const ma = median(alive);
+        set("a", String(Math.round(ma)) + " / " + K, ma > 95 ? "good" : ma > 70 ? "warn" : "bad", "after " + T + " generations");
+        const mt = tails.reduce((a, b) => a + b, 0) / CH;
+        set("b", pct(mt, 1), mt > tailTrue * 0.8 ? "good" : mt > tailTrue * 0.4 ? "warn" : "bad", "real: " + pct(tailTrue, 1));
+        set("c", fl.length ? "gen " + median(fl) : "never", fl.length ? "warn" : "good", fl.length ? "median over chains that lost one" : "no category lost");
+        set("d", pct(q0.slice(0, 10).reduce((a, b) => a + b, 0), 1), null, "real: " + pct(zipf.slice(0, 10).reduce((a, b) => a + b, 0), 1));
+      }
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Fig: test-time compute strategies */
+  (function () {
+    const s = document.getElementById("fig-ttc");
+    arrowDefs(s, "arrT", palette.muted);
+    const titles = [["Chain of thought", "one sample, written-out steps"], ["Self-consistency", "N samples, majority vote"], ["Best-of-N + verifier", "N samples, a checker picks"], ["Reasoning model", "RL-trained long chain"]];
+    const step = (x, y, c) => s.appendChild(svg("rect", { x: x - 6, y, width: 12, height: 9, rx: 2, fill: c || "rgba(47,93,138,.35)" }));
+    titles.forEach(([t, sub], i) => {
+      const x0 = 12 + i * 218, cx = x0 + 100;
+      s.appendChild(svg("rect", { x: x0, y: 4, width: 205, height: 282, rx: 10, fill: i === 3 ? "rgba(26,122,82,.04)" : "#fbfaf7", stroke: palette.line }));
+      s.appendChild(svg("text", { x: cx, y: 24, "text-anchor": "middle", "font-size": 13, "font-weight": 600, fill: palette.ink, text: t }));
+      s.appendChild(svg("text", { x: cx, y: 39, "text-anchor": "middle", "font-size": 11, fill: palette.muted, text: sub }));
+      box(s, cx - 42, 50, 84, 24, "prompt", null, "in");
+      if (i === 0) {
+        arrow(s, cx, 74, cx, 86, "arrT");
+        for (let k = 0; k < 8; k++) step(cx, 90 + k * 14);
+        arrow(s, cx, 204, cx, 218, "arrT");
+        box(s, cx - 42, 222, 84, 26, "answer", null, "a");
+        s.appendChild(svg("text", { x: cx, y: 276, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.muted, text: "cost: 1 chain" }));
+      } else if (i === 1 || i === 2) {
+        const xs = [-72, -36, 0, 36, 72], ans = ["42", "42", "17", "42", "9"], ok = [true, true, false, true, false];
+        xs.forEach((dx, j) => {
+          arrow(s, cx, 74, cx + dx, 88, "arrT");
+          for (let k = 0; k < 5; k++) step(cx + dx, 92 + k * 14);
+          if (i === 1) s.appendChild(svg("text", { x: cx + dx, y: 178, "text-anchor": "middle", "font-size": 12, class: "mono", fill: ans[j] === "42" ? palette.green : palette.brick, text: ans[j] }));
+          else s.appendChild(svg("text", { x: cx + dx, y: 178, "text-anchor": "middle", "font-size": 13, fill: ok[j] ? palette.green : palette.brick, text: ok[j] ? "✓" : "✗" }));
+          arrow(s, cx + dx, 184, cx + dx * 0.3, 218, "arrT");
+        });
+        if (i === 1) box(s, cx - 60, 222, 120, 26, "vote → 42", null, "a");
+        else box(s, cx - 80, 222, 160, 26, "verifier picks a ✓", null, "a");
+        s.appendChild(svg("text", { x: cx, y: 276, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.muted, text: i === 1 ? "cost: N chains" : "cost: N chains + checks" }));
+      } else {
+        const lx = cx - 40;
+        arrow(s, cx, 74, lx, 86, "arrT");
+        for (let k = 0; k < 14; k++) step(lx, 90 + k * 8.5, k === 6 || k === 7 ? "rgba(176,67,46,.45)" : "rgba(26,122,82,.4)");
+        s.appendChild(svg("path", { d: `M${lx + 8},145 C ${lx + 52},142 ${lx + 52},112 ${lx + 8},110`, fill: "none", stroke: palette.brick, "stroke-width": 1.3, "marker-end": "url(#arrT)" }));
+        s.appendChild(svg("text", { x: cx + 18, y: 122, "font-size": 11, fill: palette.brick, text: "\"wait, that's" }));
+        s.appendChild(svg("text", { x: cx + 18, y: 135, "font-size": 11, fill: palette.brick, text: "wrong…\"" }));
+        s.appendChild(svg("text", { x: cx + 18, y: 180, "font-size": 11, fill: palette.muted, text: "self-checks" }));
+        arrow(s, lx, 210, lx, 218, "arrT");
+        box(s, lx - 42, 222, 84, 26, "answer", null, "a");
+        s.appendChild(svg("text", { x: cx, y: 276, "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.muted, text: "cost: many more tokens" }));
+      }
+    });
+  })();
+
+  /* ---------------------------------------------------------- Widget: majority vote vs best-of-N */
+  (function () {
+    const w = widget("w-vote", { title: "Majority vote vs best-of-N", kicker: "Interactive", note: "Samples are assumed independent with the same accuracy p, which real samples aren't quite. Binary mode is exact. Free-form mode is a seeded simulation (2,000 trials per N) where wrong answers are spread uniformly over m distinct values. The imperfect verifier always accepts correct answers, accepts each wrong one with the false-positive rate, and picks uniformly among the accepted." });
+    let mode = "binary";
+    const pS = slider(w.controls, { label: "Per-sample accuracy p", min: 0.05, max: 0.95, step: 0.01, value: 0.4, fmt: v => pct(v), onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Answer type" })));
+    seg(c1, { options: [{ value: "binary", label: "binary (yes / no)" }, { value: "free", label: "free-form (many wrong values)" }], value: "binary", onChange: v => { mode = v; draw(); } });
+    w.controls.appendChild(c1);
+    const mS = slider(w.controls, { label: "Distinct wrong answers m", min: 2, max: 20, step: 1, value: 5, fmt: v => String(v), onInput: draw });
+    const fS = slider(w.controls, { label: "Verifier false-positive rate", min: 0, max: 0.5, step: 0.01, value: 0.1, fmt: v => pct(v), onInput: draw });
+    const NL = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64];
+    const nS = slider(w.controls, { label: "Read out at N", min: 0, max: NL.length - 1, step: 1, value: 9, fmt: i => String(NL[i]), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 300, x: [1, 64], y: [0, 1], logx: true, xticks: [1, 2, 4, 8, 16, 32, 64], xfmt: v => String(v), yfmt: v => pct(v), xlabel: "number of samples N (log scale)", ylabel: "accuracy" });
+    const set = stats(w.body, [{ key: "one", label: "One sample" }, { key: "maj", label: "Majority vote" }, { key: "bon", label: "Best-of-N, perfect verifier" }, { key: "bonf", label: "Best-of-N, leaky verifier" }]);
+    function majBin(N, p) {
+      let s = 0;
+      for (let k = Math.floor(N / 2) + 1; k <= N; k++) s += pmf(N, k, p);
+      if (N % 2 === 0) s += 0.5 * pmf(N, N / 2, p);
+      return s;
+    }
+    function majFree(N, p, m, r, trials) {
+      let win = 0; const cnt = new Int32Array(m);
+      for (let t = 0; t < trials; t++) {
+        cnt.fill(0); let c = 0;
+        for (let i = 0; i < N; i++) { if (r() < p) c++; else cnt[Math.floor(r() * m)]++; }
+        let mx = 0, nt = 0;
+        for (let j = 0; j < m; j++) { if (cnt[j] > mx) { mx = cnt[j]; nt = 1; } else if (cnt[j] === mx && mx > 0) nt++; }
+        if (c > mx) win++; else if (c === mx && c > 0) win += 1 / (nt + 1);
+      }
+      return win / trials;
+    }
+    function bonLeaky(N, p, f) {
+      let s = 0;
+      for (let c = 1; c <= N; c++) {
+        const pc = pmf(N, c, p); if (pc < 1e-14) continue;
+        let e = 0; for (let wv = 0; wv <= N - c; wv++) e += pmf(N - c, wv, f) * c / (c + wv);
+        s += pc * e;
+      }
+      return s;
+    }
+    function draw() {
+      const p = pS.value, m = mS.value, f = fS.value, Nsel = NL[nS.value];
+      mS.wrap.style.opacity = mode === "free" ? 1 : 0.4;
+      const r = rng(99);
+      const majPts = NL.map(N => [N, mode === "binary" ? majBin(N, p) : majFree(N, p, m, r, 2000)]);
+      const leakPts = NL.map(N => [N, bonLeaky(N, p, f)]);
+      P.draw([
+        { hline: p, color: palette.muted, label: "single sample" },
+        { fn: N => 1 - (1 - p) ** N, color: palette.green, label: "best-of-N, perfect verifier: 1 − (1 − p)^N" },
+        { points: leakPts, color: palette.gold, dots: true, r: 2.5, label: "best-of-N, verifier passes " + pct(f) + " of wrong answers" },
+        { points: majPts, color: palette.brick, dots: true, r: 2.5, label: mode === "binary" ? "majority vote (binary)" : "plurality vote (" + m + " wrong values)" },
+        { vline: Nsel, color: palette.ink, label: "N = " + Nsel }
+      ]);
+      const mj = majPts[nS.value][1], bn = 1 - (1 - p) ** Nsel, bl = leakPts[nS.value][1];
+      set("one", pct(p), null, "baseline");
+      set("maj", pct(mj, 1), mj < p - 0.005 ? "bad" : mj > p + 0.005 ? "good" : null, mj < p - 0.005 ? "voting hurts here" : "at N = " + Nsel);
+      set("bon", pct(bn, 1), "good", "at N = " + Nsel);
+      const ceil = f > 0 ? p / (p + (1 - p) * f) : 1;
+      set("bonf", pct(bl, 1), bl > p ? "good" : "bad", "ceiling as N → ∞: " + pct(ceil, 1));
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Fig: tokens per parameter */
+  (function () {
+    const host = document.getElementById("fig-tpp");
+    const P = plot(host, { width: 760, height: 300, x: [2019.8, 2025.2], y: [0.5, 2e4], logy: true, xticks: [2020, 2021, 2022, 2023, 2024, 2025], yticks: [1, 10, 100, 1000, 10000], xfmt: v => String(v), yfmt: v => fmtNum(v, 0), xlabel: "release year", ylabel: "training tokens per parameter", margin: { l: 58 } });
+    const pts = [
+      ["GPT-3 175B · 1.7", 2020.4, 1.7, 0.09, "start"],
+      ["Chinchilla 70B · 20", 2022.25, 20, -0.09, "end"],
+      ["Llama 2 7B · 286", 2023.55, 286, -0.09, "end"],
+      ["Llama 3 8B · ~1,900", 2024.3, 1875, -0.09, "end"],
+      ["Llama 3.2 1B · ~7,300", 2024.73, 7300, -0.09, "end"]
+    ];
+    const L = [{ hline: 20, color: palette.brick, label: "Chinchilla-optimal ≈ 20" }];
+    pts.forEach(([n, x, y, dx, anc]) => { L.push({ marker: [x, y], color: palette.green, r: 5.5 }); L.push({ text: [x + dx, y * 0.85], label: n, anchor: anc, color: palette.ink, size: 11 }); });
+    P.draw(L);
+  })();
+
+  /* ---------------------------------------------------------- Fig: flywheel */
+  (function () {
+    const s = document.getElementById("fig-flywheel");
+    arrowDefs(s, "arrFw", palette.green);
+    const cx = 440, cy = 170, rx = 300, ry = 118;
+    const nodes = [
+      ["Model", "pretrained + post-trained", "a"],
+      ["Product and usage", "chat, API, agents", "in"],
+      ["Signals", "preferences, edits, failures|long-tail prompts", "b"],
+      ["Data and environments", "verifiers, RL tasks,|synthetic data, traces", "b"],
+      ["Training", "pretraining mix, SFT,|preference tuning, RL", "in"]
+    ];
+    const pos = nodes.map((_, i) => { const a = -Math.PI / 2 + i * 2 * Math.PI / nodes.length; return [cx + rx * Math.cos(a), cy + ry * Math.sin(a)]; });
+    const W = 178, H = 54;
+    const exitT = (dx, dy) => Math.min(dx ? (W / 2) / Math.abs(dx) : Infinity, dy ? (H / 2) / Math.abs(dy) : Infinity);
+    for (let i = 0; i < nodes.length; i++) {
+      const [x1, y1] = pos[i], [x2, y2] = pos[(i + 1) % nodes.length];
+      const dx = x2 - x1, dy = y2 - y1, pad = 10 / Math.hypot(dx, dy);
+      const t0 = exitT(dx, dy) + pad, t1 = 1 - exitT(dx, dy) - pad;
+      const sx = x1 + dx * t0, sy = y1 + dy * t0, ex = x1 + dx * t1, ey = y1 + dy * t1;
+      const mx = (sx + ex) / 2, my = (sy + ey) / 2;
+      const ox = (mx - cx) * 0.18, oy = (my - cy) * 0.18;
+      s.appendChild(svg("path", { d: `M${sx},${sy} Q ${mx + ox},${my + oy} ${ex},${ey}`, fill: "none", stroke: palette.green, "stroke-width": 1.6, "marker-end": "url(#arrFw)" }));
+    }
+    nodes.forEach(([t, sub, k], i) => box(s, pos[i][0] - W / 2, pos[i][1] - H / 2, W, H, t, sub, k));
+    box(s, cx - 120, cy - 30, 240, 60, "Evals", "decide which changes ship:|the steering wheel", "g");
+    s.appendChild(svg("text", { x: cx, y: 332, "text-anchor": "middle", "font-size": 11.5, fill: palette.brick, text: "Failure modes that ride the same loop: reward hacking, sycophancy, collapse from unfiltered self-generated data." }));
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Neural networks &amp; backprop — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+.nn-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:12px;align-items:start}
+@media (max-width:760px){.nn-split{grid-template-columns:1fr}}
+.bp-msg{font-size:14.5px;min-height:4.6em;margin:10px 2px 0;color:var(--ink-soft)}
+.bp-msg .lead{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:4px}
+.bp-msg .ln{display:block;margin:2px 0}
+.act-toggle .btn.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+</style>
+</head>
+<body data-module="04">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 04 · How models work</p>
+<h1 class="title">Neural networks, and how they <span class="it">learn</span></h1>
+<p class="lede">Strip away the attention plumbing and a transformer is matrix multiplies with a cheap nonlinearity between them. It learns through one algorithm, backpropagation, which finds the gradient for every one of its billions of weights for about twice the cost of running it forward. This module builds both from a single neuron, and ends with a network you train inside this page.</p>
+<div class="meta"><span class="tag">~3 hours</span><span class="tag n">prereqs: 01, 02, 03</span><span class="tag g">hands-on: micrograd, PyTorch</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Compute a neuron and an MLP layer by hand, and give the shape of every matrix involved.</li>
+    <li>Choose between ReLU, GELU, SiLU, sigmoid and tanh, and say what each derivative does to the gradient.</li>
+    <li>Run backpropagation by hand on a computational graph, then write the same thing in matrix form for a whole layer.</li>
+    <li>Explain why deep plain networks lose their gradients, and how initialization, normalization and residual connections fix that.</li>
+    <li>Write a 50-line autograd engine and train the equivalent MLP in PyTorch.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="neuron">The artificial neuron</h2>
+
+<p>A neuron takes a list of numbers, multiplies each by a weight, adds them up with a bias, and passes the total through a fixed function. That's all. The weights say how much each input counts and in which direction. The bias shifts the threshold. The function, called the <strong>activation</strong>, bends the result so that stacking neurons gives you something more than a bigger linear formula.</p>
+
+<div class="formula" data-name="One neuron">
+  <div class="tex">$$\htmlClass{t1}{y} = \htmlClass{t2}{\varphi}\big(\htmlClass{t3}{\mathbf{w}}\cdot\htmlClass{t4}{\mathbf{x}} + \htmlClass{t5}{b}\big) = \htmlClass{t2}{\varphi}\Big(\sum_{i=1}^{n} \htmlClass{t3}{w_i}\,\htmlClass{t4}{x_i} + \htmlClass{t5}{b}\Big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(y\)</dt><dd>the neuron's output, a single number</dd></div>
+    <div data-t="t2"><dt>\(\varphi\)</dt><dd>activation function, applied to one number (ReLU, GELU, tanh…)</dd></div>
+    <div data-t="t3"><dt>\(\mathbf{w}\)</dt><dd>weights, one per input. Learned</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{x}\)</dt><dd>inputs: pixels, features, or the outputs of the previous layer</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bias: a learned offset that moves the firing threshold</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Take a dot product of the input with the weight vector, add a constant, squash. The dot product is large when the input points in the same direction as \(\mathbf{w}\) (Module 01), so a neuron is a detector for one direction in input space.</p>
+  <p class="why"><b>Why it matters</b>The set of inputs where \(\mathbf{w}\cdot\mathbf{x} + b = 0\) is a hyperplane. A single neuron can only split space with one flat cut. With \(\varphi = \sigma\) it is exactly logistic regression.</p>
+</div>
+
+<figure class="fig"><svg viewBox="0 0 760 270" id="fig-neuron"></svg>
+<figcaption>A neuron with three inputs, computed with real numbers. Line thickness is proportional to \(|w_i|\); green weights are positive, brick ones negative. The negative weight on a negative input contributes <em>positively</em> (\(-0.3 \times -2.0 = +0.6\)).</figcaption></figure>
+
+<p>Work the figure by hand once: \(0.8\cdot1.0 + (-0.3)(-2.0) + 1.2\cdot0.5 = 2.0\), plus the bias \(-0.5\) gives \(z = 1.5\), and ReLU leaves it at \(1.5\). If the bias were \(-2.5\), \(z\) would be \(-0.5\) and ReLU would output \(0\): the neuron stays silent for this input.</p>
+
+<details class="think"><summary>Think first: can one neuron learn XOR?</summary>
+<div>No. XOR labels the points (0,0) and (1,1) as one class and (0,1), (1,0) as the other. No single straight line separates those two pairs, and with any monotonic activation (step, sigmoid, tanh, ReLU) a single neuron's decision boundary is a straight line, because \(\varphi\) only rescales the signed distance from that line. Minsky and Papert made this point in 1969, and it stalled the field for years. Two hidden neurons solve it. You can watch a small network do so in the training widget at the end of this module (pick the XOR dataset).</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="activations">Activation functions</h2>
+
+<p>Why have \(\varphi\) at all? Because without it, depth buys nothing. Two linear layers compose into one: \(W_2(W_1\mathbf{x}) = (W_2W_1)\mathbf{x}\). A hundred stacked linear layers are still one matrix. The activation is what lets each layer bend the space before the next layer cuts it.</p>
+
+<p>Which bend? Early networks used smooth S-curves. Modern ones mostly use functions that look like "zero on the left, identity on the right", because those pass gradients through without shrinking them.</p>
+
+<div class="formula" data-name="ReLU and its smooth descendants">
+  <div class="tex">$$\htmlClass{t1}{\text{ReLU}}(x)=\max(0,x) \qquad \htmlClass{t2}{\text{GELU}}(x) = x\,\htmlClass{t4}{\Phi}(x) \qquad \htmlClass{t3}{\text{SiLU}}(x) = x\,\htmlClass{t5}{\sigma}(x)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>ReLU</dt><dd>rectified linear unit. Derivative is exactly 1 for \(x \gt 0\), 0 for \(x \lt 0\). Popularized by AlexNet (Krizhevsky et al., 2012)</dd></div>
+    <div data-t="t2"><dt>GELU</dt><dd>Gaussian error linear unit (Hendrycks &amp; Gimpel, 2016). Used in BERT and GPT-2</dd></div>
+    <div data-t="t3"><dt>SiLU</dt><dd>sigmoid linear unit, also called Swish (Ramachandran et al., 2017). The gate inside Llama's SwiGLU MLP (Module 06)</dd></div>
+    <div data-t="t4"><dt>\(\Phi\)</dt><dd>standard normal CDF: the probability that a \(\mathcal{N}(0,1)\) draw is below \(x\)</dd></div>
+    <div data-t="t5"><dt>\(\sigma\)</dt><dd>logistic sigmoid \(1/(1+e^{-x})\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>All three behave like the identity for large positive inputs and like zero for large negative ones. They differ only near zero: ReLU has a hard corner, while GELU and SiLU round it off and dip slightly below zero (SiLU's minimum is about \(-0.28\), GELU's about \(-0.17\)).</p>
+  <p class="why"><b>Why it matters</b>A derivative of exactly 1 on the active side means gradients pass through a ReLU layer without shrinking. The smooth versions train slightly better in large models and are now the default. GPT-2 actually computes GELU with a tanh approximation, \(0.5x\,(1+\tanh(\sqrt{2/\pi}\,(x+0.044715x^3)))\), which you will still see in configs as <code>gelu_new</code> or <code>gelu_pytorch_tanh</code>.</p>
+</div>
+
+<div class="formula" data-name="Sigmoid and tanh">
+  <div class="tex">$$\htmlClass{t1}{\sigma}(x) = \frac{1}{1+e^{-x}}, \quad \htmlClass{t2}{\sigma'}(x) = \sigma(x)\big(1-\sigma(x)\big) \le \tfrac14 \qquad\quad \htmlClass{t3}{\tanh}(x) = 2\sigma(2x)-1, \quad \htmlClass{t4}{\tanh'}(x) = 1-\tanh^2(x) \le 1$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\sigma\)</dt><dd>sigmoid: squashes any number into (0, 1). Reads as a probability</dd></div>
+    <div data-t="t2"><dt>\(\sigma'\)</dt><dd>its derivative, which peaks at only 0.25 (at \(x = 0\))</dd></div>
+    <div data-t="t3"><dt>\(\tanh\)</dt><dd>hyperbolic tangent: a sigmoid stretched to (−1, 1), centred on zero</dd></div>
+    <div data-t="t4"><dt>\(\tanh'\)</dt><dd>its derivative, peaking at 1, falling to ~0 once \(|x| \gt 3\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Both are S-curves that flatten out ("saturate") at the ends. Where the curve is flat, the derivative is near zero, and so is any gradient that has to pass through.</p>
+  <p class="why"><b>Why it matters</b>A sigmoid layer multiplies the backward signal by at most 0.25. Ten of them shrink it by at least \(4^{10} \approx 10^6\). That's why hidden layers moved to ReLU. Sigmoid survives where you want a value in (0, 1): output probabilities, and gates such as those in LSTMs.</p>
+</div>
+
+<div id="w-act"></div>
+
+<div class="pitfall"><b>Pitfall · dead ReLUs</b>
+<p>If a ReLU unit's pre-activation is negative for every input in the data, its output and its gradient are both zero everywhere, so gradient descent can never revive it. A large learning-rate step that pushes the bias far negative is the usual cause. Symptom: a growing fraction of hidden units that output exactly 0 on every batch. Leaky ReLU, GELU and SiLU all have a nonzero slope on the left, which is one reason they replaced plain ReLU.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="mlp">Multi-layer perceptrons</h2>
+
+<p>Put many neurons side by side and they form a <strong>layer</strong>. Each neuron has its own weight vector, so stacking those vectors as rows gives a weight matrix, and the whole layer becomes one matrix-vector product followed by an elementwise activation. Stack layers and you have a multi-layer perceptron (MLP), also called a feed-forward network.</p>
+
+<div class="formula" data-name="An MLP layer, stacked">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{h}^{l}} = \htmlClass{t2}{\varphi}\big(\htmlClass{t3}{W^{l}}\,\htmlClass{t1}{\mathbf{h}^{l-1}} + \htmlClass{t4}{\mathbf{b}^{l}}\big), \qquad \htmlClass{t1}{\mathbf{h}^{0}} = \htmlClass{t5}{\mathbf{x}}, \qquad \hat{\mathbf{y}} = \htmlClass{t3}{W^{L}}\htmlClass{t1}{\mathbf{h}^{L-1}} + \htmlClass{t4}{\mathbf{b}^{L}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{h}^{l}\)</dt><dd>hidden activations after layer \(l\), a vector of length \(d_l\)</dd></div>
+    <div data-t="t2"><dt>\(\varphi\)</dt><dd>activation, applied to each entry separately</dd></div>
+    <div data-t="t3"><dt>\(W^{l}\)</dt><dd>weight matrix of shape \(d_l \times d_{l-1}\): row \(j\) is neuron \(j\)'s weight vector</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{b}^{l}\)</dt><dd>bias vector, length \(d_l\)</dd></div>
+    <div data-t="t5"><dt>\(\mathbf{x}\)</dt><dd>the input, length \(d_0\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each layer computes a whole row of neurons at once with one matmul, bends every entry, and hands the result to the next layer. The last layer usually skips \(\varphi\) so it can output any real number (a logit or a regression value).</p>
+  <p class="why"><b>Why it matters</b>With a batch, the input becomes a matrix \(X\) of shape \([B, d_{l-1}]\) and the layer is \(\varphi(XW^{\top} + \mathbf{b})\). That is exactly what PyTorch's <code>nn.Linear</code> computes, which is why its <code>weight</code> has shape <code>[out_features, in_features]</code>.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 800 330" id="fig-mlp"></svg>
+<figcaption>A 3 → 4 → 4 → 2 MLP. Every line is one weight. Each layer's parameter count is \(d_l d_{l-1} + d_l\). The same picture scales to an LLM: each transformer layer in Llama-3-8B contains an MLP going 4096 → 14336 → 4096, with three such matrices (SwiGLU, Module 06) totalling about 176M weights per layer, and 32 layers of them.</figcaption></figure>
+
+<p>Shapes are where most bugs live, so read them off the figure once: \(W^1\) maps 3 numbers to 4, so it is \(4\times3\). \(W^2\) is \(4\times4\). \(W^3\) is \(2\times4\). The input dimension is always the <em>second</em> index, because the matrix multiplies a column vector from the left.</p>
+
+<details class="think"><summary>Think first: how many parameters are in <code>nn.Linear(4096, 14336)</code>?</summary>
+<div>\(4096 \times 14336 = 58{,}720{,}256\) weights plus \(14{,}336\) biases \(= 58{,}734{,}592\). Llama-family models build these layers with <code>bias=False</code>, so in Llama it's exactly \(58{,}720{,}256\), about 117 MB in bf16. One layer's three MLP matrices are three times that.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="represent">What MLPs can represent</h2>
+
+<p>A network with one hidden layer of enough units can approximate any continuous function on a bounded region as closely as you like. This is the <strong>universal approximation theorem</strong> (Cybenko, 1989 for sigmoids; Hornik, 1991 more generally; Leshno et al., 1993 showed any non-polynomial activation works). For ReLU you can see why with a pencil: each unit contributes one bend.</p>
+
+<div class="formula" data-name="A sum of ReLUs is a piecewise-linear curve">
+  <div class="tex">$$\htmlClass{t1}{\hat f}(x) = \htmlClass{t2}{c_0} + \sum_{i=1}^{\htmlClass{t5}{N}} \htmlClass{t3}{c_i}\,\mathrm{ReLU}(x - \htmlClass{t4}{k_i})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat f\)</dt><dd>the network's output: a 1 → N → 1 ReLU MLP</dd></div>
+    <div data-t="t2"><dt>\(c_0\)</dt><dd>output bias</dd></div>
+    <div data-t="t3"><dt>\(c_i\)</dt><dd>output weight of hidden unit \(i\): how much the slope changes at its kink</dd></div>
+    <div data-t="t4"><dt>\(k_i\)</dt><dd>kink location of unit \(i\), set by its input weight and bias (\(k_i = -b_i/w_i\))</dd></div>
+    <div data-t="t5"><dt>\(N\)</dt><dd>number of hidden units</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each ReLU is flat until its kink, then rises in a straight line. Add up N of them with different weights and you get a curve made of straight segments with up to N bends. With enough bends you can trace any continuous curve.</p>
+  <p class="why"><b>Why it matters</b>It turns "neural networks are universal" from a mystery into bookkeeping. For a smooth target, piecewise-linear interpolation error falls roughly as \(1/N^2\). For a jump it falls much more slowly, because no straight segment can be vertical.</p>
+</div>
+
+<div id="w-fit"></div>
+
+<div class="flag"><b>What the theorem does not promise</b>
+<p>It says a good set of weights <em>exists</em>. It says nothing about whether gradient descent will find them, how many units you need (it can be exponential in the input dimension), or whether the function will generalize beyond the training points. Depth matters in practice because some functions need exponentially fewer units when built from several layers than from one (Telgarsky, 2016). The theorem is an existence proof, not a recipe.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="loss">Loss functions</h2>
+
+<p>To learn, the network needs one number that says how wrong it is. That number is the <strong>loss</strong>, and everything in training is about pushing it down. Two losses cover most of what you'll see.</p>
+
+<div class="formula" data-name="Mean squared error (regression)">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}}_{\text{MSE}} = \frac{1}{\htmlClass{t4}{n}}\sum_{i=1}^{\htmlClass{t4}{n}} \big(\htmlClass{t2}{\hat y_i} - \htmlClass{t3}{y_i}\big)^2, \qquad \frac{\partial \htmlClass{t1}{\mathcal{L}}}{\partial \htmlClass{t2}{\hat y_i}} = \frac{2}{\htmlClass{t4}{n}}\big(\htmlClass{t2}{\hat y_i} - \htmlClass{t3}{y_i}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}\)</dt><dd>the loss, one number for the whole batch</dd></div>
+    <div data-t="t2"><dt>\(\hat y_i\)</dt><dd>the network's prediction for example \(i\)</dd></div>
+    <div data-t="t3"><dt>\(y_i\)</dt><dd>the target value</dd></div>
+    <div data-t="t4"><dt>\(n\)</dt><dd>batch size</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Average the squared misses. Big misses count disproportionately: an error of 3 costs nine times an error of 1. The gradient is simply "how far off, times two".</p>
+</div>
+
+<div class="formula" data-name="Softmax cross-entropy (classification, and every LLM)">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}}_{\text{CE}} = -\log \htmlClass{t2}{p_{y}}, \qquad \htmlClass{t2}{p_k} = \frac{e^{\htmlClass{t3}{z_k}}}{\sum_j e^{\htmlClass{t3}{z_j}}}, \qquad \frac{\partial \htmlClass{t1}{\mathcal{L}}}{\partial \htmlClass{t3}{z_k}} = \htmlClass{t2}{p_k} - \htmlClass{t4}{\mathbb{1}[k=y]}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}\)</dt><dd>negative log-probability of the right answer, in nats (Module 03)</dd></div>
+    <div data-t="t2"><dt>\(p_k\)</dt><dd>softmax probability of class \(k\); \(p_y\) is the one for the true class</dd></div>
+    <div data-t="t3"><dt>\(z_k\)</dt><dd>logits: the raw, unnormalized scores from the last layer</dd></div>
+    <div data-t="t4"><dt>\(\mathbb{1}[k=y]\)</dt><dd>1 for the true class, 0 for all others (the one-hot target)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Turn logits into probabilities and charge the model the surprise of the right answer. The gradient on the logits is "predicted probability minus truth": push the true class up by \(1-p_y\), push every other class down by its own probability.</p>
+  <p class="why"><b>Why it matters</b>This is exactly the LLM pretraining loss, averaged over every token position, with a vocabulary of 100K+ classes. Giving the right token probability 0.01 costs \(\ln 100 \approx 4.6\) nats. The gradient never exceeds 1 in size, so it doesn't saturate the way MSE on a sigmoid output does.</p>
+</div>
+
+<div class="pitfall"><b>Pitfall · softmax then log</b>
+<p>Computing <code>torch.log(torch.softmax(z, -1))</code> underflows: a probability of \(10^{-50}\) rounds to 0 in fp32 and its log is \(-\infty\). Pass raw logits to <code>F.cross_entropy</code> (or <code>binary_cross_entropy_with_logits</code> for two classes), which uses the log-sum-exp trick internally. Never apply softmax yourself before those functions; they already do it.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="backprop">Backpropagation</h2>
+
+<p>Training needs \(\partial\mathcal{L}/\partial w\) for every weight \(w\). Computing them one at a time (nudge one weight, rerun the network) would cost one forward pass per parameter: \(8\times10^9\) passes for an 8B model, per step. Backpropagation gets all of them in one backward sweep. It is the chain rule from Module 02, applied in a particular order: start at the loss and work backwards, reusing each intermediate result once. Reverse-mode differentiation is older than deep learning; Rumelhart, Hinton &amp; Williams (1986) made it the standard way to train neural networks.</p>
+
+<div class="def"><b>Definition · computational graph</b>
+<p>Write the computation as a graph: leaves are inputs and parameters, interior nodes are simple operations (\(+\), \(\times\), tanh, matmul…), and the root is the loss. Each node stores its forward <b>value</b> and, after the backward pass, its <b>grad</b>: \(\partial\mathcal{L}/\partial(\text{node})\). Every operation only needs to know its own local derivative.</p>
+</div>
+
+<h3>On a graph, by hand</h3>
+<p>Here is one neuron with a squared-error loss, \(\mathcal{L} = (\tanh(wx+b) - y)^2\), broken into its primitive steps. Forward values flow left to right. Then the loss's grad is set to 1, and each node passes grad to its inputs, multiplied by its local derivative.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 960 352" id="fig-graph"></svg>
+<figcaption>Forward values (green) and gradients (brick) for \(\mathcal{L} = (\tanh(wx+b)-y)^2\) with \(x=1.5,\ w=0.8,\ b=-0.2,\ y=1\). Labels under each operation give its local derivative. To get any gradient, multiply the local derivatives along the path back from \(\mathcal{L}\): \(\partial\mathcal{L}/\partial w = 2r \cdot 1 \cdot (1-a^2)\cdot 1 \cdot x\).</figcaption></figure>
+
+<p>Three local rules cover almost everything:</p>
+<ul>
+  <li><strong>Add</strong> copies the incoming grad to both inputs unchanged (its derivative is 1 in each direction).</li>
+  <li><strong>Multiply</strong> sends each input the grad times the <em>other</em> input. For \(u = wx\), \(\partial u/\partial w = x\).</li>
+  <li><strong>Fan-out</strong>: if a value feeds several nodes, its grad is the <em>sum</em> of what comes back along each path. That is why autograd code writes <code>grad +=</code>, never <code>grad =</code>.</li>
+</ul>
+
+<div id="w-backprop"></div>
+
+<details class="think"><summary>Think first: for \(L = a\cdot b + a\), what is \(\partial L/\partial a\)?</summary>
+<div>\(b + 1\). The value \(a\) reaches \(L\) along two paths: through the multiply (contributing \(b\)) and directly through the add (contributing 1). Pick the "fan-out" preset in the widget above and watch \(a\)'s grad get written twice. An engine that overwrote instead of accumulating would report only one of the two terms. That exact bug shows up in hand-written backward passes, and in PyTorch when people forget that <code>.grad</code> accumulates across <code>backward()</code> calls unless you zero it.</div>
+</details>
+
+<h3>In matrix form, for a whole layer</h3>
+<p>For an MLP, the graph's nodes are whole vectors and the chain rule becomes matrix products. Split each layer into its two halves: \(\mathbf{z}^{l} = W^{l}\mathbf{a}^{l-1} + \mathbf{b}^{l}\) (the pre-activation) and \(\mathbf{a}^{l} = \varphi(\mathbf{z}^{l})\) (the activation, the \(\mathbf{h}^l\) from before). Define the error signal \(\boldsymbol\delta^{l} = \partial\mathcal{L}/\partial\mathbf{z}^{l}\). Then:</p>
+
+<div class="formula" data-name="Backpropagation through an MLP">
+  <div class="tex">$$\htmlClass{t1}{\boldsymbol\delta^{l}} = \Big(\big(\htmlClass{t2}{W^{l+1}}\big)^{\!\top}\htmlClass{t1}{\boldsymbol\delta^{l+1}}\Big) \odot \htmlClass{t3}{\varphi'(\mathbf{z}^{l})}, \qquad \frac{\partial \mathcal{L}}{\partial \htmlClass{t2}{W^{l}}} = \htmlClass{t1}{\boldsymbol\delta^{l}}\,\big(\htmlClass{t4}{\mathbf{a}^{l-1}}\big)^{\!\top}, \qquad \frac{\partial \mathcal{L}}{\partial \htmlClass{t5}{\mathbf{b}^{l}}} = \htmlClass{t1}{\boldsymbol\delta^{l}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\boldsymbol\delta^{l}\)</dt><dd>gradient of the loss with respect to layer \(l\)'s pre-activations, length \(d_l\)</dd></div>
+    <div data-t="t2"><dt>\(W\)</dt><dd>weight matrices. Going backwards uses the <b>transpose</b>, which maps \(d_{l+1}\) numbers back to \(d_l\)</dd></div>
+    <div data-t="t3"><dt>\(\varphi'(\mathbf{z}^{l})\)</dt><dd>activation derivative, elementwise; \(\odot\) multiplies entry by entry</dd></div>
+    <div data-t="t4"><dt>\(\mathbf{a}^{l-1}\)</dt><dd>the layer's input, saved from the forward pass</dd></div>
+    <div data-t="t5"><dt>\(\mathbf{b}^{l}\)</dt><dd>bias: its gradient is just the error signal</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The error at a layer is the error from the layer above, sent back through the transposed weights, then gated by how strongly each unit was responding. A weight's gradient is (error at its output) × (value at its input), an outer product, which has exactly the shape of \(W^l\): \(d_l \times d_{l-1}\).</p>
+  <p class="why"><b>Why it matters</b>Each layer's backward pass is two matmuls the size of its forward matmul: one for \(\boldsymbol\delta\), one for \(\partial\mathcal{L}/\partial W\). So backward costs about 2× forward, and a training step about 3×. That is where the \(6ND\) training-FLOPs rule in Module 07 comes from (2 FLOPs per parameter per token forward, 4 backward).</p>
+</div>
+
+<p>With a batch, \(\boldsymbol\delta\) becomes a matrix \(\Delta^l\) of shape \([B, d_l]\) and the weight gradient is \((\Delta^l)^{\top}A^{l-1}\), which sums the per-example outer products over the batch. Nothing else changes.</p>
+
+<div class="mle"><b>MLE angle · why training eats memory</b>
+<p>The formula needs \(\mathbf{a}^{l-1}\) and \(\mathbf{z}^{l}\) from the forward pass, so every layer's activations must be kept until the backward pass reaches it. For an LLM that is batch × sequence × hidden × layers × several tensors per layer, which is often more than the weights themselves. <strong>Activation checkpointing</strong> (<code>torch.utils.checkpoint</code>) throws most of them away and recomputes them during the backward pass: roughly a third more compute in exchange for a large cut in memory. Inference never runs a backward pass, so it never stores any of this (Module 07).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="vanishing">Vanishing and exploding gradients</h2>
+
+<p>Look at the recursion again: each step backwards multiplies by \((W^{l+1})^{\top}\) and by \(\varphi'\). Unroll it from the loss to the first layer and the gradient reaching the input is a <em>product</em> of one factor per layer. Products of many numbers either shrink towards zero or blow up, unless each factor sits very close to 1.</p>
+
+<div class="formula" data-name="Gradient through L layers">
+  <div class="tex">$$\frac{\partial \mathcal{L}}{\partial \htmlClass{t1}{\mathbf{a}^{0}}} = \Big(\prod_{l=1}^{\htmlClass{t4}{L}} \big(\htmlClass{t2}{W^{l}}\big)^{\!\top} \mathrm{diag}\big(\htmlClass{t3}{\varphi'(\mathbf{z}^{l})}\big)\Big)\,\frac{\partial \mathcal{L}}{\partial \mathbf{a}^{L}} \qquad\Rightarrow\qquad \Big\lVert \frac{\partial \mathcal{L}}{\partial \htmlClass{t1}{\mathbf{a}^{0}}}\Big\rVert \approx \htmlClass{t5}{\gamma}^{\htmlClass{t4}{L}}\,\Big\lVert\frac{\partial \mathcal{L}}{\partial \mathbf{a}^{L}}\Big\rVert$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{a}^{0}\)</dt><dd>the input end of the network (the first layers are the ones that starve)</dd></div>
+    <div data-t="t2"><dt>\(W^{l}\)</dt><dd>weights of layer \(l\); their scale sets how much each matmul stretches the signal</dd></div>
+    <div data-t="t3"><dt>\(\varphi'(\mathbf{z}^{l})\)</dt><dd>activation slopes at layer \(l\): at most 0.25 for sigmoid, 0 or 1 for ReLU</dd></div>
+    <div data-t="t4"><dt>\(L\)</dt><dd>depth: the number of factors in the product (taken in order \(l = 1 \ldots L\))</dd></div>
+    <div data-t="t5"><dt>\(\gamma\)</dt><dd>typical per-layer gain: how much one layer scales the gradient's size</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The gradient reaching layer 1 is the top gradient times one stretch factor per layer. At 50 layers, \(\gamma = 0.9\) leaves you \(0.9^{50} \approx 0.005\) of the signal; \(\gamma = 1.1\) multiplies it by \(1.1^{50} \approx 117\).</p>
+  <p class="why"><b>Why it matters</b>Vanishing means the early layers stop learning while the late ones train. Exploding means a single step can throw the weights to garbage (loss suddenly spikes to NaN). Hochreiter (1991) and Bengio et al. (1994) identified this in recurrent networks, which are deep in time.</p>
+</div>
+
+<div id="w-vanish"></div>
+
+<p>The widget runs a real 64-wide network: random weights with standard deviation \(g/\sqrt{64}\), a forward pass, then a backward pass from a random top gradient. Things to try: sigmoid at any gain (it dies, its slope is too small); tanh at \(g=1\) (slow decay); ReLU at \(g=1\) (loses about half the signal power per layer) against ReLU at \(g=\sqrt{2}\approx1.41\) (flat). The next two sections explain why \(\sqrt 2\) is the magic number, and the residual switch previews the fix that made 100-layer networks trainable.</p>
+
+<div class="mle"><b>MLE angle · gradient clipping</b>
+<p>Even well-initialized LLMs hit occasional bad batches that produce a huge gradient. Nearly every LLM training recipe rescales the whole gradient vector when its norm exceeds a threshold, typically 1.0: <code>torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)</code>, called between <code>backward()</code> and <code>step()</code>. Log the pre-clip norm. A gradient norm that trends upward over a run is an early warning of instability.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="init">Initialization</h2>
+
+<p>If the per-layer gain \(\gamma\) must stay near 1, the starting weights are not a detail. Too small and the signal fades layer by layer; too large and it explodes. The fix is to pick the weight variance so that each layer passes on its input's variance unchanged, in both the forward and the backward direction.</p>
+
+<div class="formula" data-name="Variance through one layer">
+  <div class="tex">$$\mathrm{Var}(\htmlClass{t1}{z_j}) = \htmlClass{t2}{n_{\text{in}}}\;\mathrm{Var}(\htmlClass{t3}{w})\;\mathbb{E}\big[\htmlClass{t4}{a_i}^{2}\big]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(z_j\)</dt><dd>one pre-activation: \(z_j = \sum_i w_{ji} a_i\)</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{in}}\)</dt><dd>fan-in: how many inputs each neuron sums</dd></div>
+    <div data-t="t3"><dt>\(w\)</dt><dd>weights, drawn independently with mean 0</dd></div>
+    <div data-t="t4"><dt>\(a_i\)</dt><dd>the layer's inputs (the previous layer's activations)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Summing \(n_{\text{in}}\) independent zero-mean terms adds their variances. So each layer multiplies the signal's size by \(n_{\text{in}}\mathrm{Var}(w)\), adjusted for what the activation does. Make that product 1 and the signal neither grows nor shrinks.</p>
+  <p class="why"><b>Why it matters</b>The backward pass obeys the same rule with fan-out \(n_{\text{out}}\) in place of fan-in. Both initialization schemes below are this one equation solved for \(\mathrm{Var}(w)\).</p>
+</div>
+
+<div class="formula" data-name="Xavier / Glorot initialization">
+  <div class="tex">$$\mathrm{Var}(\htmlClass{t1}{W}) = \frac{2}{\htmlClass{t2}{n_{\text{in}}} + \htmlClass{t3}{n_{\text{out}}}}, \qquad \htmlClass{t1}{W} \sim \mathcal{U}\!\left(-\sqrt{\tfrac{6}{\htmlClass{t2}{n_{\text{in}}}+\htmlClass{t3}{n_{\text{out}}}}},\ \sqrt{\tfrac{6}{\htmlClass{t2}{n_{\text{in}}}+\htmlClass{t3}{n_{\text{out}}}}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(W\)</dt><dd>the layer's weights, drawn independently (normal or uniform with this variance)</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{in}}\)</dt><dd>fan-in: keeps the forward signal steady</dd></div>
+    <div data-t="t3"><dt>\(n_{\text{out}}\)</dt><dd>fan-out: keeps the backward gradient steady</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The forward pass wants \(\mathrm{Var}(W) = 1/n_{\text{in}}\), the backward pass wants \(1/n_{\text{out}}\). Glorot and Bengio (2010) split the difference with the harmonic mean. It assumes an activation that acts like the identity near zero, such as tanh.</p>
+</div>
+
+<div class="formula" data-name="He / Kaiming initialization">
+  <div class="tex">$$\mathrm{Var}(\htmlClass{t1}{W}) = \frac{\htmlClass{t3}{2}}{\htmlClass{t2}{n_{\text{in}}}}, \qquad \htmlClass{t4}{\sigma_W} = \sqrt{\frac{\htmlClass{t3}{2}}{\htmlClass{t2}{n_{\text{in}}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(W\)</dt><dd>weights of a layer followed by ReLU</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{in}}\)</dt><dd>fan-in</dd></div>
+    <div data-t="t3"><dt>2</dt><dd>compensates for ReLU zeroing half its inputs: \(\mathbb{E}[\mathrm{ReLU}(z)^2] = \tfrac12\mathrm{Var}(z)\) for symmetric \(z\)</dd></div>
+    <div data-t="t4"><dt>\(\sigma_W\)</dt><dd>the standard deviation you actually pass to the random generator</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>ReLU throws away half the signal power, so start the weights \(\sqrt 2\) larger to put it back (He et al., 2015). For a 4096-wide layer: \(\sigma_W = \sqrt{2/4096} \approx 0.0221\).</p>
+  <p class="why"><b>Why it matters</b>This is the \(g = \sqrt 2\) setting in the widget above, where the ReLU curve goes flat across 100 layers. PyTorch's <code>torch.nn.init.calculate_gain</code> returns these factors: \(\sqrt 2\) for ReLU, \(5/3\) for tanh.</p>
+</div>
+
+<details class="think"><summary>Think first: what goes wrong if you initialize every weight to zero?</summary>
+<div>With tanh, every hidden activation is \(\tanh(0) = 0\), so every weight gradient \(\boldsymbol\delta\,\mathbf{a}^{\top}\) into the next layer is 0, and every \(\boldsymbol\delta\) sent backwards through the zero weights is also 0. Only the output bias learns. Initializing to any <em>equal</em> nonzero constant is a subtler version of the same failure: every unit in a layer computes the same thing and receives the same gradient, so they stay clones forever. Random initialization exists to break that symmetry, and the variance rules above tell you how big "random" should be.</div>
+</details>
+
+<table class="t">
+  <thead><tr><th>Where</th><th>Default weight init</th><th class="num">Std for fan-in 4096</th></tr></thead>
+  <tbody>
+    <tr><td>PyTorch <code>nn.Linear</code></td><td>\(\mathcal{U}(-1/\sqrt{n_{\text{in}}},\ 1/\sqrt{n_{\text{in}}})\), i.e. variance \(1/(3n_{\text{in}})\)</td><td class="num">0.0090</td></tr>
+    <tr><td>Xavier normal (\(n_{\text{out}} = n_{\text{in}}\))</td><td>\(\mathcal{N}(0,\ 1/n_{\text{in}})\)</td><td class="num">0.0156</td></tr>
+    <tr><td>He normal</td><td>\(\mathcal{N}(0,\ 2/n_{\text{in}})\)</td><td class="num">0.0221</td></tr>
+    <tr><td>GPT-2 / nanoGPT</td><td>\(\mathcal{N}(0,\ 0.02^2)\); residual output projections scaled by \(1/\sqrt{2N_{\text{layers}}}\)</td><td class="num">0.0200</td></tr>
+  </tbody>
+</table>
+
+<p>The PyTorch default is smaller than He, and deep plain ReLU stacks built with bare <code>nn.Linear</code> do lose signal. Transformers get away with simple fixed-std schemes because the next two ideas, normalization and residual connections, keep the signal in range regardless.</p>
+
+<!-- ================================================================== -->
+<h2 id="norm">Normalization</h2>
+
+<p>Good initialization sets the scale at step 0, but the weights move during training and the activations drift with them. Normalization layers re-standardize the activations on every forward pass: subtract a mean, divide by a standard deviation, then let two learned vectors put back whatever scale and offset the network actually wants. The two main variants differ only in <em>which numbers</em> they average over.</p>
+
+<div class="formula" data-name="BatchNorm">
+  <div class="tex">$$\htmlClass{t1}{\hat x_{b,t,j}} = \frac{x_{b,t,j} - \htmlClass{t2}{\mu_j}}{\sqrt{\htmlClass{t3}{\sigma_j^2} + \epsilon}}, \qquad \htmlClass{t2}{\mu_j} = \frac{1}{BT}\sum_{b,t} x_{b,t,j}, \qquad y_{b,t,j} = \htmlClass{t4}{\gamma_j}\,\htmlClass{t1}{\hat x_{b,t,j}} + \htmlClass{t5}{\beta_j}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat x_{b,t,j}\)</dt><dd>normalized activation of feature \(j\) at sequence \(b\), position \(t\)</dd></div>
+    <div data-t="t2"><dt>\(\mu_j\)</dt><dd>mean of feature \(j\) across every example and position in the batch</dd></div>
+    <div data-t="t3"><dt>\(\sigma_j^2\)</dt><dd>variance of feature \(j\) across the same set</dd></div>
+    <div data-t="t4"><dt>\(\gamma_j\)</dt><dd>learned per-feature scale</dd></div>
+    <div data-t="t5"><dt>\(\beta_j\)</dt><dd>learned per-feature shift</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>For each feature, standardize it using statistics from the whole batch (Ioffe &amp; Szegedy, 2015). At inference there may be no batch, so BatchNorm switches to running averages collected during training.</p>
+</div>
+
+<div class="formula" data-name="LayerNorm and RMSNorm">
+  <div class="tex">$$\htmlClass{t1}{\hat x_{j}} = \frac{x_{j} - \htmlClass{t2}{\mu}}{\sqrt{\htmlClass{t3}{\sigma^2} + \epsilon}}, \quad \htmlClass{t2}{\mu} = \frac{1}{d}\sum_{k=1}^{d} x_{k}, \quad y_j = \htmlClass{t4}{\gamma_j}\,\htmlClass{t1}{\hat x_j} + \htmlClass{t5}{\beta_j} \qquad\quad \htmlClass{t6}{\mathrm{RMSNorm}}(\mathbf{x})_j = \frac{x_j}{\sqrt{\frac{1}{d}\sum_k x_k^2 + \epsilon}}\;\htmlClass{t4}{\gamma_j}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\hat x_j\)</dt><dd>normalized feature \(j\) of <em>one token's</em> vector</dd></div>
+    <div data-t="t2"><dt>\(\mu\)</dt><dd>mean over that token's \(d\) features</dd></div>
+    <div data-t="t3"><dt>\(\sigma^2\)</dt><dd>variance over that token's \(d\) features</dd></div>
+    <div data-t="t4"><dt>\(\gamma_j\)</dt><dd>learned per-feature scale</dd></div>
+    <div data-t="t5"><dt>\(\beta_j\)</dt><dd>learned per-feature shift (RMSNorm drops it)</dd></div>
+    <div data-t="t6"><dt>RMSNorm</dt><dd>skips the mean subtraction and only divides by the root-mean-square (Zhang &amp; Sennrich, 2019). Used by Llama, Qwen, Mistral</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>LayerNorm standardizes each token's vector using only that vector's own numbers (Ba et al., 2016). Nothing depends on the rest of the batch, so training and inference behave identically, even at batch size 1.</p>
+  <p class="why"><b>Why it matters</b>Language models decode one token at a time with arbitrary batch sizes and padded sequences of different lengths. Statistics that mix sequences would make one user's output depend on another's prompt. Per-token normalization avoids that, and RMSNorm is a little cheaper with no measurable loss in practice.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 820 300" id="fig-norm"></svg>
+<figcaption>Which numbers are averaged together, for an activation tensor of shape \([B, T, d] = [3, 4, 6]\). BatchNorm (left) computes one mean and variance per feature from all \(B\cdot T\) positions, shaded green for feature \(j=2\). LayerNorm and RMSNorm (right) compute one mean and variance per token from its \(d\) features, shaded blue for one token.</figcaption></figure>
+
+<!-- ================================================================== -->
+<h2 id="residual">Residual connections</h2>
+
+<p>Here's the trick that made very deep networks routine. Instead of each block <em>replacing</em> its input, let it <em>add</em> a correction to it. He et al. (2016) used this to train 152-layer ResNets, and every transformer is built this way: each attention and MLP block writes into a shared "residual stream" (Module 06).</p>
+
+<div class="formula" data-name="Residual block">
+  <div class="tex">$$\htmlClass{t1}{\mathbf{x}_{l+1}} = \htmlClass{t2}{\mathbf{x}_{l}} + \htmlClass{t3}{F_l}(\htmlClass{t2}{\mathbf{x}_{l}}), \qquad \frac{\partial \htmlClass{t1}{\mathbf{x}_{l+1}}}{\partial \htmlClass{t2}{\mathbf{x}_{l}}} = \htmlClass{t4}{I} + \frac{\partial \htmlClass{t3}{F_l}}{\partial \htmlClass{t2}{\mathbf{x}_l}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbf{x}_{l+1}\)</dt><dd>output of block \(l\)</dd></div>
+    <div data-t="t2"><dt>\(\mathbf{x}_{l}\)</dt><dd>input of block \(l\), carried through unchanged by the skip connection</dd></div>
+    <div data-t="t3"><dt>\(F_l\)</dt><dd>the block's learned transformation: an MLP, or norm + attention in a transformer</dd></div>
+    <div data-t="t4"><dt>\(I\)</dt><dd>identity matrix: the derivative of the skip path, exactly 1 in every direction</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The block only has to learn what to change, and if it learns nothing, the input passes straight through. On the way back, the gradient gets the identity term for free, so it can't be multiplied away to nothing by a long chain of small factors.</p>
+  <p class="why"><b>Why it matters</b>Unrolled, \(\mathbf{x}_L = \mathbf{x}_0 + \sum_l F_l(\mathbf{x}_l)\). The gradient at \(\mathbf{x}_0\) contains \(\partial\mathcal{L}/\partial\mathbf{x}_L\) directly, plus correction terms. Flip the residual switch in the vanishing-gradient widget and the 100-layer sigmoid network trains its first layer again.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 820 250" id="fig-residual"></svg>
+<figcaption>The gradient highway. The forward pass (ink) branches through each block \(F_l\) and adds the result back. The backward pass (brick, dashed) can travel along the straight top line from the loss to \(\mathbf{x}_0\) without passing through any block's Jacobian. Modern transformers put the norm inside the branch (pre-norm: \(\mathbf{x} + F(\mathrm{Norm}(\mathbf{x}))\)) so the highway itself stays untouched.</figcaption></figure>
+
+<div class="intuition"><b>Intuition</b>
+<p>A plain deep network is a game of telephone: each layer must faithfully relay the message, and errors compound. A residual network is a shared document where each layer adds a margin note. Even if one layer writes nonsense, the original text is still there for the next layer to read, and the feedback (the gradient) reaches every author directly.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="regularization">Regularization</h2>
+
+<p>A network with enough parameters can memorize its training set, noise included, and then do badly on new data. That's overfitting: training loss keeps falling while held-out loss turns upward. Regularization is anything that makes memorization harder than learning the general pattern. Two techniques show up in almost every codebase.</p>
+
+<div class="def"><b>Definition · dropout</b>
+<p>During training, zero each activation independently with probability \(p\), and scale the survivors by \(1/(1-p)\): \(\tilde{\mathbf{h}} = \mathbf{m}\odot\mathbf{h}/(1-p)\), with \(m_i \sim \mathrm{Bernoulli}(1-p)\) (Srivastava et al., 2014). The scaling keeps the expected value unchanged, so at evaluation time dropout is simply switched off with no rescaling. This is "inverted dropout" and is what <code>nn.Dropout</code> does. It stops units from relying on specific partners, a bit like training an ensemble of thinned networks that share weights. It's also the reason <code>model.eval()</code> matters: forget it and inference stays random.</p>
+</div>
+
+<div class="def"><b>Definition · weight decay</b>
+<p>Shrink every weight a little at every step: \(\mathbf{w} \leftarrow \mathbf{w} - \eta\,(\nabla_{\mathbf{w}}\mathcal{L} + \lambda\mathbf{w})\). For plain SGD this is the same as adding an L2 penalty \(\tfrac{\lambda}{2}\lVert\mathbf{w}\rVert^2\) to the loss. For Adam it isn't, because Adam rescales the penalty's gradient along with everything else. AdamW (Loshchilov &amp; Hutter, 2019) fixes this by applying the \(\lambda\mathbf{w}\) shrink outside the adaptive scaling. PyTorch's <code>torch.optim.AdamW</code> multiplies the weights by \((1 - \eta\lambda)\) before each Adam update.</p>
+</div>
+
+<div class="mle"><b>MLE angle · what LLMs actually use</b>
+<p>Large-scale pretraining usually sees each token roughly once, so classic overfitting is rare. Many recent recipes set dropout to 0 and rely on AdamW with weight decay around 0.1 (the value reported for GPT-3 and Llama 2), typically skipping decay on biases and norm gains. Dropout returns in fine-tuning, where the dataset is small: LoRA configs commonly carry <code>lora_dropout=0.05</code> (Module 10). Held-out loss and early stopping remain the most important regularizers for small datasets.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="train">Train a network in your browser</h2>
+
+<p>Everything above, running live. The widget below is a 2 → H → H → 1 MLP trained on 240 points with full-batch gradient descent and a binary cross-entropy loss. The forward pass, the backward pass (the matrix formula from the backprop section, written out as loops), and Adam or SGD-with-momentum are all about 60 lines of plain JavaScript in this page's source. Nothing is precomputed.</p>
+
+<div id="w-train"></div>
+
+<p>Things to try (numbers are from test runs of this widget and vary with the random initialization):</p>
+<ul>
+  <li><b>Two moons</b> with the defaults reaches 100% training accuracy within about 300 steps.</li>
+  <li><b>Spiral</b> (1.75 turns per arm) is where width shows. With H = 4 it usually stalls around 80–85%, because two layers of four tanh units can't wrap the boundary that many times; the occasional lucky initialization gets further. H = 8 gets there in a couple of thousand steps, H = 16 usually in a few hundred.</li>
+  <li>Raise Adam's learning rate to about 0.3 on spiral and the loss curve starts spiking; at 3 it barely leaves the coin-flip line at \(\ln 2\).</li>
+  <li>Pick <b>ReLU</b> with <b>SGD</b> at learning rate 3 and press Reset a few times. Often the loss freezes at exactly 0.6931 and the background goes uniform: one oversized step pushed every hidden unit negative, and dead ReLUs get no gradient to recover (the pitfall from the activations section).</li>
+  <li>At a sane learning rate, ReLU's boundary is visibly polygonal. A ReLU network computes a piecewise-linear function of its input, the 2D version of the sum-of-ReLUs widget.</li>
+</ul>
+
+<h3>1. A scalar autograd engine (micrograd-style)</h3>
+<p>This is Karpathy's micrograd idea in under 50 lines. Each <code>Value</code> records its parents and a closure that knows its local derivative; <code>backward()</code> sorts the graph topologically and calls those closures in reverse. The final line reproduces the default graph in the step-through widget.</p>
+<div class="code" data-lang="python" data-title="value.py"><pre><code>
+import math
+
+class Value:
+    """A scalar that remembers how it was computed, so it can backprop."""
+    def __init__(self, data, _children=(), _op=""):
+        self.data = data
+        self.grad = 0.0
+        self._backward = lambda: None
+        self._prev = set(_children)
+        self._op = _op
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, (self, other), "+")
+        def _backward():
+            self.grad += out.grad                  # d(x+y)/dx = 1
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other), "*")
+        def _backward():
+            self.grad += other.data * out.grad     # d(xy)/dx = y
+            other.grad += self.data * out.grad
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        t = math.tanh(self.data)
+        out = Value(t, (self,), "tanh")
+        def _backward():
+            self.grad += (1 - t * t) * out.grad    # d tanh(x)/dx = 1 - tanh^2
+        out._backward = _backward
+        return out
+
+    __radd__ = __add__
+    __rmul__ = __mul__
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-other)
+
+    def backward(self):
+        topo, seen = [], set()
+        def build(v):
+            if v not in seen:
+                seen.add(v)
+                for child in v._prev:
+                    build(child)
+                topo.append(v)                     # children before parents
+        build(self)
+        self.grad = 1.0
+        for v in reversed(topo):
+            v._backward()
+
+a, b, c, f = Value(2.0), Value(-3.0), Value(10.0), Value(-2.0)
+L = (a * b + c) * f
+L.backward()
+print(L.data, a.grad, b.grad, c.grad, f.grad)      # -8.0 6.0 -4.0 -2.0 4.0
+</code></pre></div>
+
+<p>Check it against PyTorch's autograd, which does the same thing on tensors:</p>
+<div class="code" data-lang="python" data-title="check against torch"><pre><code>
+import torch
+
+a, b, c, f = (torch.tensor(v, dtype=torch.float64, requires_grad=True) for v in (2.0, -3.0, 10.0, -2.0))
+L = (a * b + c) * f
+L.backward()
+print(L.item(), a.grad.item(), b.grad.item(), c.grad.item(), f.grad.item())   # -8.0 6.0 -4.0 -2.0 4.0
+
+# finite-difference check of a whole function in float64
+fn = lambda a, b, c, f: ((a * b + c) * f).tanh()
+inputs = tuple(torch.randn(1, dtype=torch.float64, requires_grad=True) for _ in range(4))
+print(torch.autograd.gradcheck(fn, inputs))        # True
+</code></pre></div>
+
+<h3>2. The same MLP in PyTorch</h3>
+<p>The widget's network, as an <code>nn.Module</code> with the standard training loop. <code>loss.backward()</code> runs exactly the backward pass you stepped through above, on every weight at once.</p>
+<div class="code" data-lang="python" data-title="mlp_moons.py"><pre><code>
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def two_moons(n=400, noise=0.1, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    t = torch.rand(n // 2, generator=g) * math.pi
+    outer = torch.stack([torch.cos(t), torch.sin(t)], dim=1)
+    inner = torch.stack([1 - torch.cos(t), 0.5 - torch.sin(t)], dim=1)
+    X = torch.cat([outer, inner]) + noise * torch.randn(n, 2, generator=g)
+    y = torch.cat([torch.zeros(n // 2), torch.ones(n // 2)])
+    return X, y
+
+class MLP(nn.Module):
+    def __init__(self, d_in=2, hidden=16, d_out=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, d_out),              # no activation: output is a logit
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)   # Glorot, suits tanh
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)             # [B, 1] -> [B]
+
+torch.manual_seed(0)
+X, y = two_moons()
+X_test, y_test = two_moons(seed=1)
+model = MLP()
+opt = torch.optim.AdamW(model.parameters(), lr=2e-2, weight_decay=1e-4)
+
+for step in range(2001):
+    model.train()
+    logits = model(X)                              # forward: full batch
+    loss = F.binary_cross_entropy_with_logits(logits, y)
+    opt.zero_grad(set_to_none=True)                # grads accumulate otherwise
+    loss.backward()                                # backprop: fills p.grad for every parameter
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()                                     # AdamW update
+    if step % 250 == 0:
+        model.eval()
+        with torch.no_grad():
+            acc = ((model(X_test) &gt; 0).float() == y_test).float().mean().item()
+        print(f"step {step:4d}  train loss {loss.item():.4f}  test acc {acc:.3f}")
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when: (1) your <code>Value</code> class prints <code>-8.0 6.0 -4.0 -2.0 4.0</code> for the graph above and its gradients for the tanh-neuron graph match <code>torch.autograd</code> to 1e-9; (2) you've added <code>__pow__</code> and <code>relu</code> to it and built a 2 → 16 → 16 → 1 MLP from <code>Value</code>s that reaches at least 97% training accuracy on two moons; (3) the PyTorch script reaches test accuracy above 0.97, and you can explain what happens to its loss curve if you delete the <code>opt.zero_grad</code> line.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="04-main" data-title="Check yourself · Neural networks &amp; backprop">
+  <div class="q" data-answer="1"><p>You stack ten <code>nn.Linear</code> layers with no activation functions between them. Which functions can this network represent?</p>
+    <ol><li>Any continuous function, given enough width</li><li>Only affine functions \(A\mathbf{x} + \mathbf{b}\), exactly what a single layer can represent</li><li>Piecewise-linear functions with up to ten kinks</li><li>Polynomials up to degree ten</li></ol>
+    <div class="explain">A composition of affine maps is affine: \(W_2(W_1\mathbf{x}+\mathbf{b}_1)+\mathbf{b}_2 = (W_2W_1)\mathbf{x} + (W_2\mathbf{b}_1+\mathbf{b}_2)\). Depth adds parameters but no expressive power until a nonlinearity sits between the layers.</div></div>
+  <div class="q" data-answer="2"><p>\(L = (a\cdot b + c)\cdot f\) with \(a = 1,\ b = 4,\ c = -2,\ f = 3\). What is \(\partial L/\partial a\)?</p>
+    <ol><li>3</li><li>4</li><li>12</li><li>6</li></ol>
+    <div class="explain">Backwards: \(\partial L/\partial d = f = 3\) where \(d = ab + c\). The add passes 3 to \(e = ab\) unchanged. The multiply sends \(a\) the grad times the other input: \(3 \times b = 12\). Check with a nudge: \(a = 1.01\) gives \(L = (4.04 - 2)\cdot 3 = 6.12\), up \(0.12 = 12 \times 0.01\).</div></div>
+  <div class="q" data-answer="0"><p>A 20-layer MLP uses sigmoid activations everywhere, and its weights are scaled so each matrix alone preserves the gradient's size. In the <em>best</em> case, how does the gradient at layer 1 compare with the gradient at the top?</p>
+    <ol><li>Roughly \(10^{12}\) times smaller</li><li>About 20 times smaller</li><li>About 5 times smaller</li><li>The same, because the sigmoid's slope is 1 at the origin</li></ol>
+    <div class="explain">\(\sigma'\) is at most 0.25, reached at \(z = 0\). Twenty factors of at most 0.25 give \(0.25^{20} \approx 9\times10^{-13}\). The slope of 1 at the origin belongs to tanh, not sigmoid. This is why sigmoid disappeared from hidden layers.</div></div>
+  <div class="q" data-answer="1"><p>You He-initialize a ReLU layer with fan-in 4096. What standard deviation do you pass to the random normal generator?</p>
+    <ol><li>0.0156</li><li>0.0221</li><li>0.000488</li><li>0.0313</li></ol>
+    <div class="explain">\(\sigma = \sqrt{2/n_{\text{in}}} = \sqrt{2/4096} \approx 0.0221\). 0.0156 is \(\sqrt{1/4096}\) (the Xavier value for a square layer), and 0.000488 is the <em>variance</em> \(2/4096\), a common slip when an API wants a std.</div></div>
+  <div class="q" data-answer="3"><p>Why do transformers use LayerNorm or RMSNorm instead of BatchNorm?</p>
+    <ol><li>LayerNorm has fewer learned parameters</li><li>Gradients can't flow through BatchNorm</li><li>LayerNorm averages over the batch, which is more stable for long sequences</li><li>Each token is normalized using only its own features, so behaviour doesn't depend on batch size or on other sequences in the batch</li></ol>
+    <div class="explain">BatchNorm's statistics come from the whole batch, so outputs depend on which other sequences happen to be batched together, and inference has to fall back to running averages. LayerNorm's statistics are per token, identical at training and at batch-1 decode. Both have the same \(\gamma, \beta\) parameter count, and both are differentiable.</div></div>
+  <div class="q" data-answer="0"><p>A 3-class classifier outputs softmax probabilities \(p = [0.7,\ 0.2,\ 0.1]\). The true class is index 1. What is the gradient of the cross-entropy loss with respect to the logits?</p>
+    <ol><li>\([0.7,\ -0.8,\ 0.1]\)</li><li>\([-0.7,\ 0.8,\ -0.1]\)</li><li>\([0,\ -5,\ 0]\)</li><li>\([0.7,\ 0.2,\ 0.1]\)</li></ol>
+    <div class="explain">\(\partial\mathcal{L}/\partial z_k = p_k - \mathbb{1}[k=y]\), so subtract 1 from the true class only: \([0.7, 0.2-1, 0.1]\). Gradient descent moves <em>against</em> this, raising the true logit and lowering the others. \([0, -5, 0]\) is the gradient with respect to the probabilities (\(-1/p_y\)), not the logits.</div></div>
+  <div class="q" data-answer="2"><p>A layer uses <code>nn.Dropout(p=0.1)</code>. During training, a unit whose value is 2.0 survives the dropout mask. What does the next layer see in training, and at evaluation time?</p>
+    <ol><li>2.0 in training; 1.8 at eval</li><li>1.8 in training; 2.0 at eval</li><li>About 2.22 in training; 2.0 at eval, with dropout off</li><li>2.0 in training; about 2.22 at eval</li></ol>
+    <div class="explain">Inverted dropout scales survivors by \(1/(1-p) = 1/0.9\) during training, so the expected value stays at 2.0 (\(0.9 \times 2.22 + 0.1 \times 0\)). At eval the layer is the identity and nothing is rescaled. That only happens if you call <code>model.eval()</code>.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, widget, fmtNum, rng, palette, clamp, katex } = C;
+
+  /* ---------------------------------------------------------- shared math + drawing helpers */
+  const sig = x => 1 / (1 + Math.exp(-x));
+  function erf(x) { // Abramowitz & Stegun 7.1.26, |error| < 1.5e-7
+    const s = x < 0 ? -1 : 1; x = Math.abs(x);
+    const t = 1 / (1 + 0.3275911 * x);
+    const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+    return s * y;
+  }
+  const Phi = x => 0.5 * (1 + erf(x / Math.SQRT2));
+  const phiN = x => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+  const r4 = v => { const s = String(+(+v).toFixed(4)); return s === "-0" ? "0" : s; };
+  const r3 = v => { const s = (Math.abs(v) < 5e-4 ? 0 : v).toFixed(3); return s; };
+  const sci = v => !isFinite(v) ? "∞" : v === 0 ? "0" : (v >= 0.01 && v < 1000) ? v.toPrecision(3) : v.toExponential(1);
+  function arrowDef(s, id, color) {
+    const defs = svg("defs");
+    defs.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color })));
+    s.appendChild(defs);
+  }
+  const T = (s, x, y, text, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12.5, fill: palette.ink, "text-anchor": "middle" }, o || {}, { text })));
+  const LN = (s, x1, y1, x2, y2, o) => s.appendChild(svg("line", Object.assign({ x1, y1, x2, y2, stroke: palette.ink, "stroke-width": 1.2 }, o || {})));
+  const GREEN_T = "rgba(26,122,82,.14)", BLUE_T = "rgba(47,93,138,.16)", BRICK_T = "rgba(176,67,46,.14)";
+
+  /* ---------------------------------------------------------- fig: one neuron */
+  (function () {
+    const s = document.getElementById("fig-neuron");
+    arrowDef(s, "ar-neuron", palette.ink);
+    const xs = [1.0, -2.0, 0.5], ws = [0.8, -0.3, 1.2], b = -0.5;
+    const z = xs.reduce((a, v, i) => a + v * ws[i], 0) + b;
+    const ys = [55, 130, 205], cx = 380, cy = 130, sub = ["₁", "₂", "₃"];
+    xs.forEach((v, i) => {
+      const ex = cx - 36, ey = cy + (ys[i] - cy) * 0.22;
+      LN(s, 104, ys[i], ex, ey, { stroke: ws[i] < 0 ? palette.brick : palette.green, "stroke-width": 1 + Math.abs(ws[i]) * 2.2, opacity: 0.75, "marker-end": "url(#ar-neuron)" });
+      s.appendChild(svg("circle", { cx: 82, cy: ys[i], r: 22, fill: palette.paper2, stroke: palette.ink, "stroke-width": 1.2 }));
+      T(s, 82, ys[i] + 5, "x" + sub[i], { "font-size": 14 });
+      T(s, 38, ys[i] + 4, r4(v), { class: "mono", fill: palette.blue, "font-size": 12.5 });
+      const t = 0.42, mx = 104 + (ex - 104) * t, my = ys[i] + (ey - ys[i]) * t;
+      T(s, mx, my - 9, "w" + sub[i] + " = " + r4(ws[i]), { class: "mono", "font-size": 12, fill: ws[i] < 0 ? palette.brick : palette.green });
+    });
+    // bias
+    s.appendChild(svg("circle", { cx, cy: 30, r: 14, fill: palette.paper2, stroke: palette.ink, "stroke-width": 1 }));
+    T(s, cx, 35, "b", { "font-size": 13 });
+    T(s, cx + 22, 35, "= " + r4(b), { class: "mono", "font-size": 12, fill: palette.brick, "text-anchor": "start" });
+    LN(s, cx, 44, cx, cy - 38, { "marker-end": "url(#ar-neuron)" });
+    // sum
+    s.appendChild(svg("circle", { cx, cy, r: 34, fill: "#fff", stroke: palette.ink, "stroke-width": 1.5 }));
+    T(s, cx, cy + 9, "Σ", { "font-size": 26 });
+    // z arrow, phi box, output
+    LN(s, cx + 34, cy, 478, cy, { "marker-end": "url(#ar-neuron)" });
+    T(s, 447, cy - 10, "z = " + r4(z), { class: "mono", "font-size": 12 });
+    s.appendChild(svg("rect", { x: 482, y: cy - 26, width: 92, height: 52, rx: 8, fill: GREEN_T, stroke: palette.green, "stroke-width": 1.2 }));
+    T(s, 528, cy - 3, "φ", { "font-size": 18 });
+    T(s, 528, cy + 15, "ReLU", { class: "mono", "font-size": 11, fill: palette.muted });
+    LN(s, 574, cy, 636, cy, { "marker-end": "url(#ar-neuron)" });
+    s.appendChild(svg("circle", { cx: 662, cy, r: 22, fill: "#fff", stroke: palette.ink, "stroke-width": 1.5 }));
+    T(s, 662, cy + 5, "y", { "font-size": 14 });
+    T(s, 694, cy + 4, "= " + r4(Math.max(0, z)), { class: "mono", "font-size": 12.5, fill: palette.green, "text-anchor": "start" });
+    T(s, 380, 250, `z = 0.8·1.0 + (−0.3)·(−2.0) + 1.2·0.5 + (−0.5) = ${r4(z)}      y = ReLU(${r4(z)}) = ${r4(Math.max(0, z))}`, { class: "mono", "font-size": 12, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: MLP with shapes */
+  (function () {
+    const s = document.getElementById("fig-mlp");
+    const sizes = [3, 4, 4, 2], xs = [110, 300, 490, 680], cy = 160, gap = 46;
+    const pos = sizes.map((n, l) => Array.from({ length: n }, (_, i) => [xs[l], cy + (i - (n - 1) / 2) * gap]));
+    for (let l = 0; l < 3; l++) pos[l].forEach(a => pos[l + 1].forEach(b => LN(s, a[0] + 14, a[1], b[0] - 14, b[1], { stroke: "rgba(28,27,25,.28)", "stroke-width": 1 })));
+    pos.forEach((col, l) => col.forEach(([x, y]) => s.appendChild(svg("circle", { cx: x, cy: y, r: 14, fill: l === 0 ? palette.paper2 : l === 3 ? GREEN_T : "#fff", stroke: palette.ink, "stroke-width": 1.3 }))));
+    const top = 40;
+    [["W¹ : 4×3", "b¹ : 4"], ["W² : 4×4", "b² : 4"], ["W³ : 2×4", "b³ : 2"]].forEach(([a, b], l) => {
+      const mx = (xs[l] + xs[l + 1]) / 2;
+      T(s, mx, top, a, { class: "mono", "font-size": 13, fill: palette.blue });
+      T(s, mx, top + 16, b, { class: "mono", "font-size": 11.5, fill: palette.muted });
+    });
+    const lab = [["x", "[3]", "input"], ["h¹", "[4]", "φ(W¹x + b¹)"], ["h²", "[4]", "φ(W²h¹ + b²)"], ["ŷ", "[2]", "W³h² + b³ (no φ)"]];
+    lab.forEach(([n, d, f], l) => {
+      T(s, xs[l], 268, n + " " + d, { class: "mono", "font-size": 13 });
+      T(s, xs[l], 286, f, { class: "mono", "font-size": 11.5, fill: palette.muted });
+    });
+    T(s, 400, 318, "parameters: (4·3 + 4) + (4·4 + 4) + (2·4 + 2) = 16 + 20 + 10 = 46", { class: "mono", "font-size": 12, fill: palette.ink });
+  })();
+
+  /* ---------------------------------------------------------- fig: computational graph with values + grads */
+  (function () {
+    const s = document.getElementById("fig-graph");
+    arrowDef(s, "ar-graph", palette.ink);
+    arrowDef(s, "ar-graph-b", palette.brick);
+    const x = 1.5, w = 0.8, b = -0.2, y = 1.0;
+    const u = w * x, z = u + b, a = Math.tanh(z), r = a - y, L = r * r;
+    const gL = 1, gr = 2 * r * gL, ga = gr, gy = -gr, gz = (1 - a * a) * ga, gu = gz, gb = gz, gw = x * gu, gx = w * gu;
+    const SY = 160;
+    const V = {
+      x: [60, 85, "x", x, gx], w: [60, 235, "w", w, gw],
+      u: [235, SY, "u = w·x", u, gu], b: [320, 280, "b", b, gb],
+      z: [405, SY, "z = u + b", z, gz], a: [575, SY, "a = tanh z", a, ga],
+      y: [660, 280, "y", y, gy], r: [745, SY, "r = a − y", r, gr], L: [905, SY, "L = r²", L, gL]
+    };
+    const OPS = [[150, SY, "×", "∂u/∂w = x", ["x", "w"], "u"], [320, SY, "+", "local: 1, 1", ["u", "b"], "z"], [490, SY, "tanh", "1 − a² = " + r3(1 - a * a), ["z"], "a"], [660, SY, "−", "local: 1, −1", ["a", "y"], "r"], [830, SY, "²", "2r = " + r3(2 * r), ["r"], "L"]];
+    const bw = 76, bh = 58;
+    OPS.forEach(([ox, oy, sym, loc, ins, out]) => {
+      ins.forEach(id => {
+        const [vx, vy] = V[id];
+        const fromX = vy === SY || id === "x" || id === "w" ? vx + bw / 2 : vx, fromY = vy === SY || id === "x" || id === "w" ? vy : vy - bh / 2;
+        const rr = sym === "tanh" ? 20 : 16;
+        const dx = ox - fromX, dy = oy - fromY, dl = Math.hypot(dx, dy);
+        LN(s, fromX, fromY, ox - dx / dl * (rr + 3), oy - dy / dl * (rr + 3), { "marker-end": "url(#ar-graph)" });
+      });
+      const [vx] = V[out];
+      LN(s, ox + (sym === "tanh" ? 20 : 16), oy, vx - bw / 2 - 3, oy, { "marker-end": "url(#ar-graph)" });
+    });
+    OPS.forEach(([ox, oy, sym, loc]) => {
+      const rr = sym === "tanh" ? 20 : 16;
+      s.appendChild(svg("circle", { cx: ox, cy: oy, r: rr, fill: palette.paper2, stroke: palette.ink, "stroke-width": 1.2 }));
+      T(s, ox, oy + (sym === "tanh" ? 4 : 5), sym, { "font-size": sym === "tanh" ? 11.5 : 15, class: sym === "tanh" ? "mono" : null });
+      T(s, ox, oy - 30, loc, { class: "mono", "font-size": 10.5, fill: palette.muted });
+    });
+    Object.values(V).forEach(([vx, vy, name, val, g]) => {
+      const leaf = name.length === 1;
+      s.appendChild(svg("rect", { x: vx - bw / 2, y: vy - bh / 2, width: bw, height: bh, rx: 8, fill: leaf ? palette.paper2 : "#fff", stroke: name === "L = r²" ? palette.ink : "rgba(28,27,25,.35)", "stroke-width": name === "L = r²" ? 1.8 : 1.1 }));
+      T(s, vx, vy - 11, name, { "font-size": 12, "font-weight": 600 });
+      T(s, vx, vy + 6, r3(val), { class: "mono", "font-size": 12, fill: palette.green });
+      T(s, vx, vy + 22, "∇ " + r3(g), { class: "mono", "font-size": 12, fill: palette.brick });
+    });
+    LN(s, 60, 18, 900, 18, { "marker-end": "url(#ar-graph)", stroke: palette.green, "stroke-width": 1.4 });
+    T(s, 480, 12, "forward: values, left → right", { "font-size": 11.5, fill: palette.green, class: "mono" });
+    LN(s, 900, 344, 60, 344, { "marker-end": "url(#ar-graph-b)", stroke: palette.brick, "stroke-width": 1.4, "stroke-dasharray": "5 4" });
+    T(s, 480, 336, "backward: ∇ = ∂L/∂(node), right → left, local derivative × incoming ∇", { "font-size": 11.5, fill: palette.brick, class: "mono" });
+  })();
+
+  /* ---------------------------------------------------------- fig: normalization axes */
+  (function () {
+    const s = document.getElementById("fig-norm");
+    const cell = 15, Tn = 4, D = 6;
+    function panel(ox, title, sub, hl, foot) {
+      T(s, ox + 193, 24, title, { "font-size": 14, "font-weight": 600 });
+      T(s, ox + 193, 43, sub, { "font-size": 11.5, fill: palette.muted });
+      for (let b = 0; b < 3; b++) {
+        const mx = ox + 36 + b * 112, my = 84;
+        T(s, mx + D * cell / 2, my - 10, "b = " + (b + 1), { class: "mono", "font-size": 11, fill: palette.muted });
+        for (let t = 0; t < Tn; t++) for (let j = 0; j < D; j++) {
+          const on = hl(b, t, j);
+          s.appendChild(svg("rect", { x: mx + j * cell, y: my + t * cell, width: cell - 2, height: cell - 2, rx: 2, fill: on || "#fff", stroke: on ? "none" : "rgba(28,27,25,.22)", "stroke-width": 0.8 }));
+        }
+        if (b === 0) {
+          T(s, mx - 10, my + Tn * cell / 2 + 4, "T", { class: "mono", "font-size": 11, fill: palette.muted, "text-anchor": "end" });
+          T(s, mx + D * cell / 2, my + Tn * cell + 16, "d →", { class: "mono", "font-size": 11, fill: palette.muted });
+        }
+      }
+      foot.forEach((line, i) => T(s, ox + 193, 196 + i * 18, line, { "font-size": 12, fill: i === 0 ? palette.ink : palette.muted }));
+    }
+    panel(10, "BatchNorm", "normalize over B and T, separately for each feature",
+      (b, t, j) => j === 2 ? "rgba(26,122,82,.6)" : null,
+      ["d means and variances, each over B·T = 12 numbers", "depends on the other examples in the batch", "inference needs running averages from training"]);
+    LN(s, 410, 20, 410, 270, { stroke: palette.line });
+    panel(420, "LayerNorm / RMSNorm", "normalize over d, separately for each token",
+      (b, t, j) => b === 1 && t === 2 ? "rgba(47,93,138,.65)" : null,
+      ["B·T means and variances, each over d = 6 numbers", "uses only the token's own vector", "identical in training and at batch-1 decode"]);
+  })();
+
+  /* ---------------------------------------------------------- fig: residual gradient highway */
+  (function () {
+    const s = document.getElementById("fig-residual");
+    arrowDef(s, "ar-res", palette.ink);
+    arrowDef(s, "ar-res-b", palette.brick);
+    const MY = 100, nodes = [60, 270, 480, 690], plus = [230, 440, 650];
+    for (let l = 0; l < 3; l++) {
+      const x0 = nodes[l], p = plus[l];
+      LN(s, x0 + 24, MY, p - 14, MY, { "marker-end": "url(#ar-res)" });
+      const bx = x0 + 44, bwid = p - x0 - 88;
+      s.appendChild(svg("path", { d: `M${x0 + 34},${MY} L${x0 + 34},180 L${bx - 3},180`, fill: "none", stroke: palette.ink, "stroke-width": 1.2, "marker-end": "url(#ar-res)" }));
+      s.appendChild(svg("rect", { x: bx, y: 162, width: bwid, height: 36, rx: 7, fill: GREEN_T, stroke: palette.green, "stroke-width": 1.2 }));
+      T(s, bx + bwid / 2, 185, "F" + ["₀", "₁", "₂"][l], { "font-size": 14 });
+      s.appendChild(svg("path", { d: `M${bx + bwid},180 L${p},180 L${p},${MY + 17}`, fill: "none", stroke: palette.ink, "stroke-width": 1.2, "marker-end": "url(#ar-res)" }));
+      s.appendChild(svg("circle", { cx: p, cy: MY, r: 13, fill: "#fff", stroke: palette.ink, "stroke-width": 1.3 }));
+      T(s, p, MY + 5, "+", { "font-size": 16 });
+      LN(s, p + 13, MY, nodes[l + 1] - 24, MY, { "marker-end": "url(#ar-res)" });
+    }
+    nodes.forEach((x, i) => {
+      s.appendChild(svg("rect", { x: x - 22, y: MY - 16, width: 44, height: 32, rx: 6, fill: palette.paper2, stroke: palette.ink, "stroke-width": 1.1 }));
+      T(s, x, MY + 5, "x" + ["₀", "₁", "₂", "₃"][i], { "font-size": 14 });
+    });
+    LN(s, 712, MY, 752, MY, { "marker-end": "url(#ar-res)" });
+    s.appendChild(svg("rect", { x: 756, y: MY - 16, width: 44, height: 32, rx: 6, fill: "#fff", stroke: palette.ink, "stroke-width": 1.6 }));
+    T(s, 778, MY + 5, "L", { "font-size": 14 });
+    LN(s, 778, 50, 60, 50, { stroke: palette.brick, "stroke-width": 2, "stroke-dasharray": "6 4", "marker-end": "url(#ar-res-b)" });
+    T(s, 420, 40, "gradient highway: ∂L/∂x₃ reaches x₀ through the identity terms, untouched", { class: "mono", "font-size": 11.5, fill: palette.brick });
+    T(s, 420, 228, "each step back: ∂xₗ₊₁/∂xₗ = I + ∂Fₗ/∂xₗ   (identity path + branch path)", { class: "mono", "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- widget: activation explorer */
+  (function () {
+    const w = widget("w-act", { title: "Activation functions and their slopes", kicker: "Interactive", note: "Dashed lines are derivatives. The derivative is what the backward pass multiplies by, so wherever a dashed line sits near zero, gradients die. GELU here is the exact \\(x\\,\\Phi(x)\\), not the tanh approximation (they differ by less than 0.001)." });
+    const ACTS = [
+      { id: "relu", name: "ReLU", f: x => Math.max(0, x), d: x => x > 0 ? 1 : 0, color: palette.ink },
+      { id: "gelu", name: "GELU", f: x => x * Phi(x), d: x => Phi(x) + x * phiN(x), color: palette.green },
+      { id: "silu", name: "SiLU", f: x => x * sig(x), d: x => { const s_ = sig(x); return s_ * (1 + x * (1 - s_)); }, color: palette.blue },
+      { id: "sigmoid", name: "sigmoid", f: sig, d: x => sig(x) * (1 - sig(x)), color: palette.brick },
+      { id: "tanh", name: "tanh", f: Math.tanh, d: x => 1 - Math.tanh(x) ** 2, color: palette.gold }
+    ];
+    const on = new Set(["relu", "gelu", "sigmoid"]);
+    let showD = true;
+    const row = el("div", { class: "btnrow act-toggle" });
+    ACTS.forEach(a => {
+      const b = el("button", { class: "btn" + (on.has(a.id) ? " on" : ""), text: a.name, style: { borderLeft: "4px solid " + a.color }, onclick: () => { on.has(a.id) ? on.delete(a.id) : on.add(a.id); b.classList.toggle("on", on.has(a.id)); draw(); } });
+      row.appendChild(b);
+    });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Show" })), row]));
+    const cd = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Curves" })));
+    seg(cd, { options: [{ value: "f", label: "f(x)" }, { value: "fd", label: "f(x) and f′(x)" }], value: "fd", onChange: v => { showD = v === "fd"; draw(); } });
+    w.controls.appendChild(cd);
+    const px = slider(w.controls, { label: "Probe x", min: -4, max: 4, step: 0.05, value: -1, fmt: v => v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 330, x: [-4, 4], y: [-1.2, 3.2], xlabel: "x", ylabel: "f(x),  f′(x)" });
+    const tbl = el("div", { style: { overflowX: "auto", marginTop: "10px" } }); w.body.appendChild(tbl);
+    function draw() {
+      const L = [{ vline: px.value, color: palette.muted, dash: "3 3" }];
+      ACTS.filter(a => on.has(a.id)).forEach(a => {
+        L.push({ fn: a.f, color: a.color, width: 2.4, label: a.name, samples: 400 });
+        if (showD) L.push({ fn: a.d, color: a.color, width: 1.5, dash: "5 4", samples: 400 });
+        L.push({ marker: [px.value, a.f(px.value)], color: a.color, r: 4.5 });
+      });
+      P.draw(L);
+      const t = el("table", { class: "t", style: { margin: "0" } });
+      t.appendChild(el("thead", null, el("tr", null, ["Function", "f(x)", "f′(x)", "gradient passed back (of 1.0)"].map((h, i) => el("th", { class: i ? "num" : "", text: h })))));
+      const tb = el("tbody"); t.appendChild(tb);
+      ACTS.filter(a => on.has(a.id)).forEach(a => {
+        const d = a.d(px.value);
+        tb.appendChild(el("tr", null, [
+          el("td", { html: `<span style="color:${a.color};font-weight:600">${a.name}</span>` }),
+          el("td", { class: "num", text: a.f(px.value).toFixed(3) }),
+          el("td", { class: "num", text: d.toFixed(3) }),
+          el("td", { class: "num", html: `<span style="color:${d < 0.1 ? palette.brick : d < 0.5 ? palette.gold : palette.green}">${(d * 100).toFixed(0)}%</span>` })
+        ]));
+      });
+      tbl.innerHTML = ""; tbl.appendChild(t);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: sum of ReLUs fit */
+  (function () {
+    const w = widget("w-fit", { title: "Approximate a curve with N ReLUs", kicker: "Interactive", note: "Kinks are fixed (evenly spaced, or random), and only the output weights \\(c_i\\) are fitted, by least squares on 601 points. That is training just the last layer of a 1 → N → 1 network. Real training also moves the kinks, which is why gradient descent usually needs fewer units than this. The first kink sits at the left edge, so its ReLU acts as a straight-line term." });
+    const TARGETS = {
+      wave: { label: "smooth wave: 0.8 sin 2x + 0.2x", f: x => 0.8 * Math.sin(2 * x) + 0.2 * x },
+      bump: { label: "bump: exp(−2x²)", f: x => Math.exp(-2 * x * x) },
+      abs: { label: "|x| − 1 (one kink)", f: x => Math.abs(x) - 1 },
+      fast: { label: "fast wave: 0.8 sin 4x", f: x => 0.8 * Math.sin(4 * x) },
+      step: { label: "step at x = 0.4", f: x => x > 0.4 ? 1 : 0 }
+    };
+    let tgt = "wave", place = "even", pieces = true;
+    select(w.controls, { label: "Target", options: Object.entries(TARGETS).map(([v, o]) => ({ value: v, label: o.label })), value: "wave", onChange: v => { tgt = v; draw(); } });
+    const ns = slider(w.controls, { label: "ReLUs N", min: 1, max: 40, step: 1, value: 6, onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Kink placement" })));
+    seg(c1, { options: [{ value: "even", label: "evenly spaced" }, { value: "random", label: "random" }], value: "even", onChange: v => { place = v; draw(); } });
+    w.controls.appendChild(c1);
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Individual ReLUs" })));
+    seg(c2, { options: [{ value: "on", label: "show" }, { value: "off", label: "hide" }], value: "on", onChange: v => { pieces = v === "on"; draw(); } });
+    w.controls.appendChild(c2);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 330, x: [-3, 3], y: [-1.6, 2.1], xlabel: "x", ylabel: "f(x)" });
+    const set = stats(w.body, [{ key: "rmse", label: "RMS error" }, { key: "max", label: "Max error" }, { key: "params", label: "Net parameters" }, { key: "seg", label: "Linear pieces" }]);
+    const M = 601, XS = Array.from({ length: M }, (_, i) => -3 + 6 * i / (M - 1));
+    function kinks(N) {
+      if (place === "even") return Array.from({ length: N }, (_, i) => -3 + 6 * i / N);
+      const R = rng(1000 + N);
+      for (let tries = 0; tries < 200; tries++) {
+        const k = [-3, ...Array.from({ length: N - 1 }, () => -2.94 + 5.88 * R())].sort((a, b) => a - b);
+        let ok = true; for (let i = 1; i < k.length; i++) if (k[i] - k[i - 1] < 0.04) ok = false;
+        if (3 - k[k.length - 1] < 0.04) ok = false;
+        if (ok) return k;
+      }
+      return Array.from({ length: N }, (_, i) => -3 + 6 * i / N);
+    }
+    function solve(A, y) { // Gaussian elimination with partial pivoting
+      const n = y.length;
+      for (let c = 0; c < n; c++) {
+        let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+        [A[c], A[p]] = [A[p], A[c]]; [y[c], y[p]] = [y[p], y[c]];
+        for (let r = c + 1; r < n; r++) { const m = A[r][c] / A[c][c]; if (!m) continue; for (let k = c; k < n; k++) A[r][k] -= m * A[c][k]; y[r] -= m * y[c]; }
+      }
+      const x = new Array(n).fill(0);
+      for (let r = n - 1; r >= 0; r--) { let s_ = y[r]; for (let k = r + 1; k < n; k++) s_ -= A[r][k] * x[k]; x[r] = s_ / A[r][r]; }
+      return x;
+    }
+    function draw() {
+      const N = ns.value, f = TARGETS[tgt].f;
+      const k = kinks(N), nodes = [...k, 3], nn = nodes.length;
+      // least squares in the (well-conditioned) hat-function basis on the nodes, same span as {1, ReLU(x - k_i)}
+      const A = Array.from({ length: nn }, () => new Array(nn).fill(0)), rhs = new Array(nn).fill(0);
+      XS.forEach(x => {
+        let j = 0; while (j < nn - 2 && x > nodes[j + 1]) j++;
+        const t = (x - nodes[j]) / (nodes[j + 1] - nodes[j]), wl = 1 - t, wr = t, y = f(x);
+        A[j][j] += wl * wl; A[j][j + 1] += wl * wr; A[j + 1][j] += wl * wr; A[j + 1][j + 1] += wr * wr;
+        rhs[j] += wl * y; rhs[j + 1] += wr * y;
+      });
+      for (let i = 0; i < nn; i++) A[i][i] += 1e-10;
+      const v = solve(A, rhs);
+      // convert node values to ReLU form: f̂(x) = c0 + Σ c_i ReLU(x − k_i)
+      const slope = []; for (let j = 0; j < nn - 1; j++) slope.push((v[j + 1] - v[j]) / (nodes[j + 1] - nodes[j]));
+      const c0 = v[0], c = slope.map((sl, j) => j === 0 ? sl : sl - slope[j - 1]);
+      const fhat = x => c.reduce((acc, ci, i) => acc + ci * Math.max(0, x - k[i]), c0);
+      const L = [{ fn: f, color: palette.muted, width: 3.5, label: "target", samples: 600 }];
+      if (pieces) c.forEach((ci, i) => L.push({ fn: x => ci * Math.max(0, x - k[i]), color: "rgba(47,93,138,.35)", width: 1 }));
+      L.push({ fn: fhat, color: palette.green, width: 2.2, label: `sum of ${N} ReLU${N > 1 ? "s" : ""} + bias`, samples: 600 });
+      if (pieces) L.push({ fn: () => -99, color: "rgba(47,93,138,.6)", width: 1, label: "each cᵢ·ReLU(x − kᵢ)" });
+      k.forEach(ki => L.push({ points: [[ki, -1.6], [ki, -1.45]], color: palette.blue, width: 2 }));
+      P.draw(L);
+      let se = 0, mx = 0; XS.forEach(x => { const e = Math.abs(fhat(x) - f(x)); se += e * e; mx = Math.max(mx, e); });
+      const rmse = Math.sqrt(se / M);
+      set("rmse", rmse < 1e-6 ? "≈ 0" : rmse.toFixed(4), rmse < 0.02 ? "good" : rmse < 0.08 ? "warn" : "bad", "over 601 points");
+      set("max", mx < 1e-6 ? "≈ 0" : mx.toFixed(3), mx < 0.05 ? "good" : mx < 0.2 ? "warn" : "bad", "worst single point");
+      set("params", String(3 * N + 1), null, `1 → ${N} → 1: ${N} w, ${N} b, ${N} c, 1 bias`);
+      set("seg", String(N), null, "straight segments on [−3, 3]");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: step-through backprop */
+  (function () {
+    const w = widget("w-backprop", { title: "Backprop, one node at a time", kicker: "Step-through", note: "Each box is a <code>Value</code>: its data (green) and its grad, \\(\\partial(\\text{output})/\\partial(\\text{box})\\) (brick). Forward steps compute data in topological order. The first backward step seeds the output's grad with 1; each later step visits one operation, newest first, and adds into its inputs' grads. The numerical check at the end nudges each leaf by \\(\\pm10^{-5}\\) and compares." });
+    const PRESETS = {
+      basic: { label: "(a·b + c)·f", vb: "0 0 760 300", nodes: [
+        { id: "a", v: 2, x: 70, y: 55 }, { id: "b", v: -3, x: 70, y: 150 },
+        { id: "e", op: "*", in: ["a", "b"], x: 290, y: 102 },
+        { id: "c", v: 10, x: 290, y: 210 },
+        { id: "d", op: "+", in: ["e", "c"], x: 500, y: 156 },
+        { id: "f", v: -2, x: 500, y: 262 },
+        { id: "L", op: "*", in: ["d", "f"], x: 700, y: 209 }] },
+      neuron: { label: "tanh(x₁w₁ + x₂w₂ + b)", vb: "0 0 900 300", nodes: [
+        { id: "x1", v: 2, x: 60, y: 40 }, { id: "w1", v: -3, x: 60, y: 112 },
+        { id: "x2", v: 0, x: 60, y: 188 }, { id: "w2", v: 1, x: 60, y: 260 },
+        { id: "p1", op: "*", in: ["x1", "w1"], x: 250, y: 76 },
+        { id: "p2", op: "*", in: ["x2", "w2"], x: 250, y: 224 },
+        { id: "s", op: "+", in: ["p1", "p2"], x: 440, y: 150 },
+        { id: "b", v: 6.8813735870195432, x: 440, y: 258 },
+        { id: "n", op: "+", in: ["s", "b"], x: 630, y: 204 },
+        { id: "o", op: "tanh", in: ["n"], x: 830, y: 204 }] },
+      fanout: { label: "fan-out: a·b + a", vb: "0 0 760 250", nodes: [
+        { id: "a", v: 3, x: 70, y: 70 }, { id: "b", v: -2, x: 70, y: 190 },
+        { id: "e", op: "*", in: ["a", "b"], x: 300, y: 160 },
+        { id: "L", op: "+", in: ["e", "a"], x: 560, y: 100 }] }
+    };
+    let key = "basic", N, byId, ops, fwd, bwd, active, hotEdges, msg;
+    const leafOverride = {};
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Expression" })));
+    seg(c1, { options: Object.entries(PRESETS).map(([v, p]) => ({ value: v, label: p.label })), value: "basic", onChange: v => { key = v; reset(); } });
+    w.controls.appendChild(c1);
+    const btns = el("div", { class: "btnrow" });
+    const B = (text, fn, primary) => { const b = el("button", { class: "btn" + (primary ? " primary" : ""), text, onclick: fn }); btns.appendChild(b); return b; };
+    B("Forward step", () => { forwardStep(); render(); }, true);
+    B("Backward step", () => { backwardStep(); render(); }, true);
+    B("Run all", () => { while (fwd < ops.length) forwardStep(); while (bwd <= ops.length) backwardStep(); render(); });
+    B("Reset", () => reset());
+    B("Randomize leaves", () => { const R = rng(Math.floor(Math.random() * 1e9)); leafOverride[key] = {}; PRESETS[key].nodes.filter(n => !n.op).forEach(n => leafOverride[key][n.id] = Math.round((R() * 6 - 3) * 10) / 10); reset(); });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Step" })), btns]));
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 300" }); wrap.appendChild(s);
+    const msgEl = el("div", { class: "bp-msg" }); w.body.appendChild(msgEl);
+    const set = stats(w.body, [{ key: "phase", label: "Phase" }, { key: "out", label: "Output value" }, { key: "check", label: "Numerical check" }]);
+    const texName = id => id.replace(/^([a-zA-Z]+)(\d)$/, "$1_$2");
+    const paren = v => v < 0 ? `(${r4(v)})` : r4(v);
+    const leafVal = n => (leafOverride[key] && leafOverride[key][n.id] != null) ? leafOverride[key][n.id] : n.v;
+    function evalWith(over) {
+      const val = {};
+      N.forEach(n => {
+        if (!n.op) val[n.id] = over && over[n.id] != null ? over[n.id] : n.data0;
+        else { const a = val[n.in[0]], b = n.in[1] ? val[n.in[1]] : 0; val[n.id] = n.op === "*" ? a * b : n.op === "+" ? a + b : Math.tanh(a); }
+      });
+      return val[N[N.length - 1].id];
+    }
+    function reset() {
+      const P = PRESETS[key];
+      s.setAttribute("viewBox", P.vb);
+      N = P.nodes.map(n => Object.assign({}, n, { data: n.op ? null : leafVal(n), data0: n.op ? null : leafVal(n), grad: 0, touched: false }));
+      byId = {}; N.forEach(n => byId[n.id] = n);
+      ops = N.filter(n => n.op); fwd = 0; bwd = -1; active = null; hotEdges = []; 
+      msg = { lead: "Ready", lines: ["Press <b>Forward step</b> to compute the first operation. Leaves (shaded) already have values."] };
+      render();
+    }
+    function forwardStep() {
+      if (fwd >= ops.length) { msg = { lead: "Forward pass done", lines: ["Every node has a value. Now press <b>Backward step</b>."] }; return; }
+      const n = ops[fwd++], a = byId[n.in[0]], b = n.in[1] ? byId[n.in[1]] : null;
+      n.data = n.op === "*" ? a.data * b.data : n.op === "+" ? a.data + b.data : Math.tanh(a.data);
+      active = n.id; hotEdges = n.in.map(i => [i, n.id]);
+      const tx = n.op === "*" ? `${texName(n.id)} = ${texName(a.id)}\\cdot ${texName(b.id)} = ${paren(a.data)}\\,${paren(b.data)} = ${r4(n.data)}`
+        : n.op === "+" ? `${texName(n.id)} = ${texName(a.id)} + ${texName(b.id)} = ${r4(a.data)} + ${paren(b.data)} = ${r4(n.data)}`
+        : `${texName(n.id)} = \\tanh(${texName(a.id)}) = \\tanh(${r4(a.data)}) = ${r4(n.data)}`;
+      msg = { lead: `Forward ${fwd} of ${ops.length} · compute ${n.id}`, lines: [katex(tx)] };
+    }
+    function backwardStep() {
+      const root = N[N.length - 1], R_ = texName(root.id);
+      const g = id => `\\tfrac{\\partial ${R_}}{\\partial ${texName(id)}}`;
+      if (fwd < ops.length) { msg = { lead: "Not yet", lines: ["Finish the forward pass first. Every local derivative needs the node values."] }; return; }
+      if (bwd === -1) {
+        root.grad = 1; root.touched = true; bwd = 0; active = root.id; hotEdges = [];
+        msg = { lead: `Backward 1 of ${ops.length + 1} · seed the output`, lines: [katex(`${g(root.id)} = 1`) + " &nbsp;(the output changes one-for-one with itself)"] };
+        return;
+      }
+      if (bwd >= ops.length) { bwd = ops.length + 1; msg = { lead: "Backward pass done", lines: ["Every leaf now holds \\(\\partial(\\text{output})/\\partial(\\text{leaf})\\). Compare with the numerical check below."].map(t => t.replace(/\\\((.*?)\\\)/g, (_, m) => katex(m))) }; return; }
+      const n = ops[ops.length - 1 - bwd]; bwd++;
+      active = n.id; hotEdges = n.in.map(i => [i, n.id]);
+      const lines = [];
+      const add = (inp, local, localTex) => {
+        const before = inp.grad, had = inp.touched, contrib = local * n.grad;
+        inp.grad += contrib; inp.touched = true;
+        let t = `${g(inp.id)} \\mathrel{+}= ${localTex}\\cdot ${g(n.id)} = ${paren(local)}\\,${paren(n.grad)} = ${r4(contrib)}`;
+        if (had) t += `\\;\\Rightarrow\\; ${r4(before)} + ${paren(contrib)} = ${r4(inp.grad)}`;
+        lines.push(katex(t) + (had ? " &nbsp;<b style='color:" + palette.brick + "'>accumulated: second path into " + inp.id + "</b>" : ""));
+      };
+      const a = byId[n.in[0]], b = n.in[1] ? byId[n.in[1]] : null;
+      if (n.op === "*") { add(a, b.data, texName(b.id)); add(b, a.data, texName(a.id)); }
+      else if (n.op === "+") { add(a, 1, "1"); add(b, 1, "1"); }
+      else add(a, 1 - n.data * n.data, `(1 - ${texName(n.id)}^2)`);
+      const opName = n.op === "*" ? "multiply: each input gets the other input × grad" : n.op === "+" ? "add: copies the grad to both inputs" : "tanh: local slope is 1 − tanh²";
+      msg = { lead: `Backward ${bwd + 1} of ${ops.length + 1} · through the ${n.op} that made ${n.id} (${opName})`, lines };
+    }
+    function render() {
+      while (s.firstChild) s.removeChild(s.firstChild);
+      arrowDef(s, "ar-bp", palette.ink); arrowDef(s, "ar-bp-hot", palette.brick);
+      const bw = 90, bh = 56, opR = 16;
+      const isHot = (from, to) => hotEdges.some(([f, t]) => f === from && t === to);
+      const backward = bwd >= 0;
+      ops.forEach(n => {
+        const ox = n.x - 95, oy = n.y;
+        n.in.forEach(id => {
+          const a = byId[id], fx = a.x + bw / 2, fy = a.y, dx = ox - fx, dy = oy - fy, dl = Math.hypot(dx, dy);
+          const hot = isHot(id, n.id);
+          LN(s, fx, fy, ox - dx / dl * (opR + 3), oy - dy / dl * (opR + 3), { stroke: hot ? (backward ? palette.brick : palette.green) : "rgba(28,27,25,.5)", "stroke-width": hot ? 2.6 : 1.2, "marker-end": hot && backward ? "url(#ar-bp-hot)" : "url(#ar-bp)" });
+        });
+        LN(s, ox + opR, oy, n.x - bw / 2 - 3, n.y, { stroke: active === n.id ? (backward ? palette.brick : palette.green) : "rgba(28,27,25,.5)", "stroke-width": active === n.id ? 2.6 : 1.2, "marker-end": "url(#ar-bp)" });
+        s.appendChild(svg("circle", { cx: ox, cy: oy, r: n.op === "tanh" ? 20 : opR, fill: active === n.id ? "rgba(154,123,34,.22)" : palette.paper2, stroke: palette.ink, "stroke-width": 1.2 }));
+        T(s, ox, oy + (n.op === "tanh" ? 4 : 5), n.op === "*" ? "×" : n.op, { "font-size": n.op === "tanh" ? 11 : 15, class: n.op === "tanh" ? "mono" : null });
+      });
+      N.forEach(n => {
+        const act = active === n.id;
+        s.appendChild(svg("rect", { x: n.x - bw / 2, y: n.y - bh / 2, width: bw, height: bh, rx: 8, fill: n.op ? "#fff" : palette.paper2, stroke: act ? palette.gold : "rgba(28,27,25,.35)", "stroke-width": act ? 2.6 : 1.1 }));
+        T(s, n.x, n.y - 10, n.id, { "font-size": 13, "font-weight": 600 });
+        T(s, n.x, n.y + 7, "data " + (n.data == null ? "?" : r4(n.data)), { class: "mono", "font-size": 11.5, fill: n.data == null ? palette.faint : palette.green });
+        T(s, n.x, n.y + 22, "grad " + r4(n.grad), { class: "mono", "font-size": 11.5, fill: n.touched ? palette.brick : palette.faint });
+      });
+      msgEl.innerHTML = `<span class="lead">${msg.lead}</span>` + msg.lines.map(l => `<span class="ln">${l}</span>`).join("");
+      const root = N[N.length - 1];
+      set("phase", bwd > ops.length ? "done" : bwd >= 0 ? "backward" : fwd === ops.length ? "forward done" : "forward", bwd > ops.length ? "good" : null, `${fwd}/${ops.length} ops computed`);
+      set("out", root.data == null ? "?" : r4(root.data), null, root.id);
+      if (bwd > ops.length) {
+        const h = 1e-5; let worst = 0; const parts = [];
+        N.filter(n => !n.op).forEach(n => {
+          const up = evalWith({ [n.id]: n.data0 + h }), dn = evalWith({ [n.id]: n.data0 - h });
+          const num = (up - dn) / (2 * h); worst = Math.max(worst, Math.abs(num - n.grad));
+          parts.push(`${n.id} ${r4(num)}`);
+        });
+        set("check", worst < 1e-6 ? "matches" : "max diff " + worst.toExponential(1), worst < 1e-6 ? "good" : "bad", parts.join(" · "));
+      } else set("check", "–", null, "available after the backward pass");
+    }
+    reset();
+  })();
+
+  /* ---------------------------------------------------------- widget: vanishing / exploding gradients */
+  (function () {
+    const w = widget("w-vanish", { title: "Gradient size, layer by layer", kicker: "Simulation", note: "A real 64-unit-wide network with random Gaussian weights of std \\(g/\\sqrt{64}\\), no biases. One random input goes forward, one random gradient comes back from the top. The brick curve is the gradient's norm at each layer relative to the top (log scale); the dashed blue curve is the forward activations' RMS. Residual mode computes \\(\\mathbf{a}^{l} = \\mathbf{a}^{l-1} + \\tfrac{1}{\\sqrt{L}}\\varphi(W^{l}\\mathbf{a}^{l-1})\\)." });
+    const n = 64, LMAX = 120;
+    const R = rng(3);
+    const base = Array.from({ length: LMAX }, () => { const a = new Float64Array(n * n); for (let i = 0; i < a.length; i++) a[i] = R.normal(); return a; });
+    const x0 = Float64Array.from({ length: n }, () => R.normal());
+    const gTop = Float64Array.from({ length: n }, () => R.normal());
+    const ACT = {
+      tanh: { f: Math.tanh, d: z => 1 - Math.tanh(z) ** 2 },
+      relu: { f: z => z > 0 ? z : 0, d: z => z > 0 ? 1 : 0 },
+      sigmoid: { f: sig, d: z => { const s_ = sig(z); return s_ * (1 - s_); } },
+      linear: { f: z => z, d: () => 1 }
+    };
+    let resid = false;
+    const act = select(w.controls, { label: "Activation", options: [{ value: "tanh", label: "tanh" }, { value: "relu", label: "ReLU" }, { value: "sigmoid", label: "sigmoid" }, { value: "linear", label: "none (linear)" }], value: "relu", onChange: draw });
+    const depth = slider(w.controls, { label: "Depth L", min: 2, max: LMAX, step: 1, value: 50, onInput: draw });
+    const gain = slider(w.controls, { label: "Weight gain g", min: 0.5, max: 2.5, step: 0.01, value: 1.0, fmt: v => v.toFixed(2), onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Architecture" })));
+    seg(c1, { options: [{ value: "plain", label: "plain" }, { value: "res", label: "residual" }], value: "plain", onChange: v => { resid = v === "res"; draw(); } });
+    w.controls.appendChild(c1);
+    const pre = el("div", { class: "btnrow" });
+    [["ReLU · He (g = √2)", "relu", Math.SQRT2], ["ReLU · g = 1", "relu", 1], ["tanh · Xavier (g = 1)", "tanh", 1], ["tanh · g = 5/3", "tanh", 5 / 3], ["sigmoid · g = 1", "sigmoid", 1]].forEach(([t, a, g]) =>
+      pre.appendChild(el("button", { class: "btn", text: t, onclick: () => { act.value = a; gain.value = g; draw(); } })));
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Presets" })), pre]));
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 320, x: [0, 50], y: [1e-10, 1e10], logy: true, xlabel: "layer (0 = input end)", ylabel: "relative size (log)", yticks: [1e-10, 1e-5, 1, 1e5, 1e10], yfmt: v => v === 1 ? "1" : "1e" + Math.round(Math.log10(v)), margin: { l: 58 } });
+    const set = stats(w.body, [{ key: "ratio", label: "Grad at layer 0 ÷ top" }, { key: "gamma", label: "Per-layer factor γ" }, { key: "rms", label: "Activation RMS at top" }, { key: "verdict", label: "Trainable?" }]);
+    const nrm = v => { let s_ = 0; for (let i = 0; i < v.length; i++) s_ += v[i] * v[i]; return Math.sqrt(s_); };
+    function sim(L, g, F, res) {
+      const sc = g / Math.sqrt(n), rs = res ? 1 / Math.sqrt(L) : 1, zs = [], as = [x0];
+      for (let l = 0; l < L; l++) {
+        const W = base[l], a = as[l], z = new Float64Array(n), na = new Float64Array(n);
+        for (let i = 0; i < n; i++) { let s_ = 0; const row = i * n; for (let j = 0; j < n; j++) s_ += W[row + j] * a[j]; z[i] = s_ * sc; }
+        for (let i = 0; i < n; i++) na[i] = res ? a[i] + rs * F.f(z[i]) : F.f(z[i]);
+        zs.push(z); as.push(na);
+      }
+      const gn = new Array(L + 1); let gA = gTop.slice(); const top = nrm(gA); gn[L] = 1;
+      for (let l = L - 1; l >= 0; l--) {
+        const z = zs[l], W = base[l], gz = new Float64Array(n), gp = new Float64Array(n);
+        for (let i = 0; i < n; i++) gz[i] = gA[i] * F.d(z[i]) * rs * sc;
+        for (let i = 0; i < n; i++) { const gi = gz[i]; if (!gi) continue; const row = i * n; for (let j = 0; j < n; j++) gp[j] += W[row + j] * gi; }
+        if (res) for (let j = 0; j < n; j++) gp[j] += gA[j];
+        gA = gp; gn[l] = nrm(gA) / top;
+      }
+      return { gn, rms: as.map(a => nrm(a) / Math.sqrt(n)) };
+    }
+    function draw() {
+      const L = depth.value, F = ACT[act.value];
+      const { gn, rms } = sim(L, gain.value, F, resid);
+      P.x[1] = L;
+      const fl = v => Math.max(v, 1e-30);
+      P.draw([
+        { band: [0, Math.max(1, L * 0.1)], color: palette.brick, opacity: 0.05 },
+        { hline: 1, color: palette.muted, dash: "2 3" },
+        { points: gn.map((v, i) => [i, fl(v)]), color: palette.brick, width: 2.4, label: "‖∂L/∂aˡ‖ ÷ ‖∂L/∂aᴸ‖", dots: L <= 40, r: 2.5 },
+        { points: rms.map((v, i) => [i, fl(v)]), color: palette.blue, width: 1.6, dash: "6 4", label: "forward activation RMS" }
+      ]);
+      const ratio = gn[0], gamma = Math.pow(Math.max(ratio, 1e-300), 1 / L);
+      set("ratio", sci(ratio), ratio > 1e-2 && ratio < 1e2 ? "good" : ratio > 1e-6 && ratio < 1e6 ? "warn" : "bad", ratio < 1 ? "vanishing" : "growing");
+      set("gamma", gamma.toFixed(3), Math.abs(Math.log(gamma)) < 0.05 ? "good" : Math.abs(Math.log(gamma)) < 0.2 ? "warn" : "bad", "geometric mean per layer");
+      set("rms", sci(rms[L]), rms[L] > 0.05 && rms[L] < 20 ? "good" : "warn", "input RMS ≈ " + rms[0].toFixed(2));
+      const ok = ratio > 1e-2 && ratio < 1e2 && rms[L] > 1e-3 && rms[L] < 1e3;
+      set("verdict", ok ? "yes" : ratio <= 1e-2 ? "early layers starve" : ratio >= 1e2 ? "explodes" : "activations off-scale", ok ? "good" : "bad", "first 10% of layers shaded");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: train an MLP in the browser */
+  (function () {
+    const w = widget("w-train", { title: "Train a 2 → H → H → 1 network, live", kicker: "Live training", note: "Full-batch gradient descent on 240 training points with binary cross-entropy on the logit. Background colour is the network's predicted probability (green = class 1, brick = class 0, paler = less sure). Test accuracy uses 240 fresh points from the same distribution. Weights start from Glorot normal for tanh and He normal for ReLU, biases at 0. Each Reset draws a new random initialization." });
+    const VIEW = 1.8;
+    function makeData(kind, n, seed) {
+      const R = rng(seed), X = new Float64Array(2 * n), Y = new Float64Array(n), m = n / 2;
+      let k = 0;
+      for (let c = 0; c < 2; c++) for (let i = 0; i < m; i++, k++) {
+        let x, y;
+        if (kind === "moons") {
+          const t = R() * Math.PI;
+          if (c === 0) { x = Math.cos(t); y = Math.sin(t); } else { x = 1 - Math.cos(t); y = 0.5 - Math.sin(t); }
+          x = (x + 0.1 * R.normal() - 0.5) / 1.1; y = (y + 0.1 * R.normal() - 0.25) / 1.1;
+        } else if (kind === "spiral") {
+          const u = (i + R()) / m, r = 0.1 + 1.45 * u, th = u * 3.5 * Math.PI + c * Math.PI;
+          x = r * Math.cos(th) + 0.04 * R.normal(); y = r * Math.sin(th) + 0.04 * R.normal();
+        } else if (kind === "circles") {
+          const t = R() * 2 * Math.PI, r = (c === 0 ? 1.25 : 0.55) + 0.09 * R.normal();
+          x = r * Math.cos(t); y = r * Math.sin(t);
+        } else {
+          const sx = R() < 0.5 ? -1 : 1, sy = c === 1 ? sx : -sx;
+          x = 0.8 * sx + 0.3 * R.normal(); y = 0.8 * sy + 0.3 * R.normal();
+        }
+        X[2 * k] = clamp(x, -VIEW + 0.02, VIEW - 0.02); X[2 * k + 1] = clamp(y, -VIEW + 0.02, VIEW - 0.02); Y[k] = c;
+      }
+      return { X, Y, n };
+    }
+    let kind = "moons", H = 16, actName = "tanh", optName = "adam", seedCtr = 1;
+    let train, test, p, g, m1, m2, t, O, h1, h2, gz1, gz2, steps, lossH, last, running = false, raf = 0, frame = 0, diverged = false, gen = 0;
+    const phi = z => actName === "tanh" ? Math.tanh(z) : (z > 0 ? z : 0);
+    const dphi = h => actName === "tanh" ? 1 - h * h : (h > 0 ? 1 : 0);
+    function build() {
+      O = { W1: 0, b1: 2 * H, W2: 3 * H, b2: 3 * H + H * H, W3: 4 * H + H * H, b3: 5 * H + H * H };
+      const P = H * H + 5 * H + 1;
+      p = new Float64Array(P); g = new Float64Array(P); m1 = new Float64Array(P); m2 = new Float64Array(P);
+      h1 = new Float64Array(H); h2 = new Float64Array(H); gz1 = new Float64Array(H); gz2 = new Float64Array(H);
+      const R = rng(7919 * seedCtr + H);
+      const std = (fi, fo) => actName === "tanh" ? Math.sqrt(2 / (fi + fo)) : Math.sqrt(2 / fi);
+      for (let i = 0; i < 2 * H; i++) p[O.W1 + i] = R.normal() * std(2, H);
+      for (let i = 0; i < H * H; i++) p[O.W2 + i] = R.normal() * std(H, H);
+      for (let i = 0; i < H; i++) p[O.W3 + i] = R.normal() * Math.sqrt(1 / H);
+      t = 0; steps = 0; lossH = []; diverged = false; last = { loss: NaN, acc: NaN };
+    }
+    function forward(x0, x1) { // returns logit, leaves h1/h2 filled
+      for (let j = 0; j < H; j++) h1[j] = phi(p[O.W1 + 2 * j] * x0 + p[O.W1 + 2 * j + 1] * x1 + p[O.b1 + j]);
+      let o = p[O.b3];
+      for (let k = 0; k < H; k++) {
+        let z = p[O.b2 + k]; const row = O.W2 + k * H;
+        for (let j = 0; j < H; j++) z += p[row + j] * h1[j];
+        h2[k] = phi(z); o += p[O.W3 + k] * h2[k];
+      }
+      return o;
+    }
+    function lossAndGrad() {
+      g.fill(0);
+      const { X, Y, n } = train; let loss = 0, correct = 0;
+      for (let s_ = 0; s_ < n; s_++) {
+        const x0 = X[2 * s_], x1 = X[2 * s_ + 1], y = Y[s_];
+        const o = forward(x0, x1);
+        loss += Math.max(o, 0) - o * y + Math.log1p(Math.exp(-Math.abs(o)));
+        if ((o > 0 ? 1 : 0) === y) correct++;
+        const go = (sig(o) - y) / n;                       // dL/dlogit for BCE
+        g[O.b3] += go;
+        for (let k = 0; k < H; k++) { g[O.W3 + k] += go * h2[k]; gz2[k] = go * p[O.W3 + k] * dphi(h2[k]); g[O.b2 + k] += gz2[k]; }
+        gz1.fill(0);
+        for (let k = 0; k < H; k++) {                        // dL/dW2 = δ2 h1ᵀ ;  δ1 = (W2ᵀ δ2) ⊙ φ'
+          const gk = gz2[k]; if (gk === 0) continue; const row = O.W2 + k * H;
+          for (let j = 0; j < H; j++) { g[row + j] += gk * h1[j]; gz1[j] += p[row + j] * gk; }
+        }
+        for (let j = 0; j < H; j++) { const d = gz1[j] * dphi(h1[j]); g[O.W1 + 2 * j] += d * x0; g[O.W1 + 2 * j + 1] += d * x1; g[O.b1 + j] += d; }
+      }
+      return { loss: loss / n, acc: correct / n };
+    }
+    function update(lr) {
+      t++;
+      if (optName === "adam") {
+        const c1 = 1 - Math.pow(0.9, t), c2 = 1 - Math.pow(0.999, t);
+        for (let i = 0; i < p.length; i++) { m1[i] = 0.9 * m1[i] + 0.1 * g[i]; m2[i] = 0.999 * m2[i] + 0.001 * g[i] * g[i]; p[i] -= lr * (m1[i] / c1) / (Math.sqrt(m2[i] / c2) + 1e-8); }
+      } else {
+        for (let i = 0; i < p.length; i++) { m1[i] = 0.9 * m1[i] + g[i]; p[i] -= lr * m1[i]; }
+      }
+    }
+    function step() {
+      if (diverged) return;
+      last = lossAndGrad();
+      if (!isFinite(last.loss) || p.some(v => !isFinite(v))) { diverged = true; running = false; return; }
+      lossH.push(last.loss); steps++;
+      update(Math.pow(10, lr.value));
+    }
+    function testAcc() {
+      const { X, Y, n } = test; let c = 0;
+      for (let s_ = 0; s_ < n; s_++) if ((forward(X[2 * s_], X[2 * s_ + 1]) > 0 ? 1 : 0) === Y[s_]) c++;
+      return c / n;
+    }
+    // ---- controls
+    select(w.controls, { label: "Dataset", options: [{ value: "moons", label: "two moons" }, { value: "circles", label: "circles" }, { value: "xor", label: "XOR (4 blobs)" }, { value: "spiral", label: "spiral (hard)" }], value: "moons", onChange: v => { kind = v; newData(); reset(); } });
+    const cH = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Hidden width H" })));
+    seg(cH, { options: [4, 8, 16, 32].map(v => ({ value: v, label: String(v) })), value: 16, onChange: v => { H = v; reset(); } });
+    w.controls.appendChild(cH);
+    const cA = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Activation" })));
+    seg(cA, { options: [{ value: "tanh", label: "tanh" }, { value: "relu", label: "ReLU" }], value: "tanh", onChange: v => { actName = v; reset(); } });
+    w.controls.appendChild(cA);
+    const cO = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Optimizer" })));
+    seg(cO, { options: [{ value: "adam", label: "Adam" }, { value: "sgd", label: "SGD + momentum" }], value: "adam", onChange: v => { optName = v; lr.value = v === "adam" ? -1.7 : -1; m1.fill(0); m2.fill(0); t = 0; draw(true); } });
+    w.controls.appendChild(cO);
+    const lr = slider(w.controls, { label: "Learning rate", min: -3, max: 0.5, step: 0.05, value: -1.7, fmt: v => Math.pow(10, v).toPrecision(2) });
+    const btns = el("div", { class: "btnrow" });
+    const runBtn = el("button", { class: "btn primary", text: "Train", onclick: () => { running ? pause() : start(); } });
+    btns.appendChild(runBtn);
+    btns.appendChild(el("button", { class: "btn", text: "Step ×10", onclick: () => { for (let i = 0; i < 10; i++) step(); draw(true); } }));
+    btns.appendChild(el("button", { class: "btn", text: "Reset", onclick: () => { seedCtr++; reset(); } }));
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Run" })), btns]));
+    // ---- drawing surfaces
+    const split = el("div", { class: "nn-split" }); w.body.appendChild(split);
+    const cvWrap = el("div", { class: "canvas-wrap" }); split.appendChild(cvWrap);
+    const CW = 640, cv = el("canvas", { width: CW, height: CW, "aria-label": "decision boundary" }); cvWrap.appendChild(cv);
+    const ctx = cv.getContext("2d");
+    const G = 64, off = el("canvas", { width: G, height: G }), octx = off.getContext("2d"), img = octx.createImageData(G, G);
+    const lossWrap = el("div", { class: "canvas-wrap" }); split.appendChild(lossWrap);
+    const LP = plot(lossWrap, { width: 460, height: 400, x: [0, 200], y: [1e-3, 2], logy: true, xlabel: "step", ylabel: "training loss (BCE, nats)", yticks: [1e-3, 1e-2, 1e-1, 1], yfmt: v => String(v), margin: { l: 56, r: 14 } });
+    const set = stats(w.body, [{ key: "step", label: "Steps" }, { key: "loss", label: "Train loss" }, { key: "acc", label: "Train accuracy" }, { key: "test", label: "Test accuracy" }, { key: "params", label: "Parameters" }]);
+    const toPx = v => (v + VIEW) / (2 * VIEW) * CW, toPy = v => (VIEW - v) / (2 * VIEW) * CW;
+    function drawBoundary() {
+      const d = img.data, P0 = [247, 246, 242], C1 = [26, 122, 82], C0 = [176, 67, 46];
+      for (let r = 0; r < G; r++) for (let c = 0; c < G; c++) {
+        const x = -VIEW + (c + 0.5) / G * 2 * VIEW, y = VIEW - (r + 0.5) / G * 2 * VIEW;
+        const pr = sig(forward(x, y)), tt = Math.min(1, Math.abs(pr - 0.5) * 2) * 0.5, base = pr > 0.5 ? C1 : C0, i = 4 * (r * G + c);
+        d[i] = P0[0] + (base[0] - P0[0]) * tt; d[i + 1] = P0[1] + (base[1] - P0[1]) * tt; d[i + 2] = P0[2] + (base[2] - P0[2]) * tt; d[i + 3] = 255;
+      }
+      octx.putImageData(img, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(off, 0, 0, CW, CW);
+      ctx.strokeStyle = "rgba(28,27,25,.12)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(toPx(0), 0); ctx.lineTo(toPx(0), CW); ctx.moveTo(0, toPy(0)); ctx.lineTo(CW, toPy(0)); ctx.stroke();
+      const { X, Y, n } = train;
+      for (let s_ = 0; s_ < n; s_++) {
+        ctx.beginPath(); ctx.arc(toPx(X[2 * s_]), toPy(X[2 * s_ + 1]), 6, 0, 2 * Math.PI);
+        ctx.fillStyle = Y[s_] ? palette.green : palette.brick; ctx.fill();
+        ctx.lineWidth = 1.6; ctx.strokeStyle = "#fff"; ctx.stroke();
+      }
+      if (diverged) {
+        ctx.fillStyle = "rgba(247,246,242,.85)"; ctx.fillRect(0, CW / 2 - 40, CW, 80);
+        ctx.fillStyle = palette.brick; ctx.font = "600 22px sans-serif"; ctx.textAlign = "center";
+        ctx.fillText("Diverged: loss became NaN/∞. Lower the LR and Reset.", CW / 2, CW / 2 + 8);
+      }
+    }
+    function drawLoss() {
+      const n = lossH.length, every = Math.max(1, Math.ceil(n / 400)), pts = [];
+      for (let i = 0; i < n; i += every) pts.push([i + 1, Math.max(lossH[i], 1e-3)]);
+      if (n) pts.push([n, Math.max(lossH[n - 1], 1e-3)]);
+      LP.x[1] = Math.max(200, Math.ceil(n * 1.1 / 100) * 100);
+      LP.draw([{ hline: Math.LN2, color: palette.muted, label: "ln 2 = coin flip" }, { points: pts, color: palette.brick, width: 2, label: "train loss" }]);
+    }
+    function stat() {
+      set("step", String(steps), null, optName === "adam" ? "Adam" : "SGD, momentum 0.9");
+      set("loss", isFinite(last.loss) ? last.loss.toFixed(4) : (diverged ? "NaN" : "–"), diverged ? "bad" : last.loss < 0.1 ? "good" : last.loss < 0.4 ? "warn" : null, "lr " + Math.pow(10, lr.value).toPrecision(2));
+      set("acc", isFinite(last.acc) ? (100 * last.acc).toFixed(1) + "%" : "–", last.acc > 0.97 ? "good" : last.acc > 0.8 ? "warn" : null, "240 points");
+      const ta = diverged ? NaN : testAcc();
+      set("test", isFinite(ta) ? (100 * ta).toFixed(1) + "%" : "–", ta > 0.95 ? "good" : ta > 0.8 ? "warn" : null, "240 held-out points");
+      set("params", String(p.length), null, `2·${H}+${H} + ${H}²+${H} + ${H}+1`);
+    }
+    function draw(all) { drawBoundary(); if (all !== false) drawLoss(); stat(); }
+    function loop(myGen) {
+      if (!running || myGen !== gen) return;
+      const t0 = performance.now(); let k = 0;
+      while (k < 60 && performance.now() - t0 < 9 && running) { step(); k++; }
+      frame++;
+      drawBoundary();
+      if (frame % 5 === 0 || !running) { drawLoss(); stat(); }
+      if (!running) { pause(); return; }
+      raf = requestAnimationFrame(() => loop(myGen));
+    }
+    function start() { if (diverged) return; running = true; runBtn.textContent = "Pause"; const my = ++gen; raf = requestAnimationFrame(() => loop(my)); }
+    function pause() { running = false; gen++; cancelAnimationFrame(raf); runBtn.textContent = "Train"; draw(true); }
+    function newData() { train = makeData(kind, 240, 11); test = makeData(kind, 240, 97); }
+    function reset() { const was = running; running = false; gen++; cancelAnimationFrame(raf); runBtn.textContent = "Train"; build(); draw(true); if (was) start(); }
+    newData(); build(); draw(true);
+  })();
+})();
+</script>
+</body>
+</html>
