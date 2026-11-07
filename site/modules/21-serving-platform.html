@@ -1,0 +1,1869 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · The serving platform — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .lbtable td.best { color: #1a7a52; font-weight: 600; }
+  .lbtable td.worst { color: #b0432e; }
+  .lbtable tr.sel td { background: rgba(26,122,82,.06); }
+</style>
+</head>
+<body data-module="21">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 21 · Inference engineering II</p>
+<h1 class="title">The serving <span class="it">platform</span></h1>
+<p class="lede">An engine like vLLM or SGLang turns a GPU into a fast token factory. Whether users ever see that speed depends on everything wrapped around it: the gateway that admits requests, the router that picks a replica, the autoscaler that decides how many replicas exist, the minutes it takes a new one to load 140 GB of weights, and the dashboards that tell you any of this is going wrong. This module is about that wrapper.</p>
+<div class="meta"><span class="tag">~5 hours</span><span class="tag n">prereqs: 08, 13, 19 (17 helps)</span><span class="tag g">hands-on: vLLM, Prometheus, Kubernetes, asyncio</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Draw the full serving stack, from client SDK to GPU, and say which layer owns auth, quotas, routing, scaling, and telemetry.</li>
+    <li>Explain why round-robin load balancing fails for LLMs, and choose between least-loaded, KV-aware, and prefix-affinity routing for a given workload.</li>
+    <li>Use Little's law and basic queueing results to predict when latency will explode, then size a fleet with headroom.</li>
+    <li>Break a cold start into its parts, estimate each one, and pick the mitigation that attacks the dominant term.</li>
+    <li>Define SLOs and error budgets on TTFT and inter-token latency, and compute cost per million tokens from GPU price and measured throughput.</li>
+    <li>Run an open-loop load test that avoids coordinated omission and find the throughput your fleet sustains at its latency target.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="stack">The full stack</h2>
+
+<p>Module 19 followed one request through an engine. In production, that engine is one box out of six or seven, and the request has already crossed three network hops before it gets there. Here's the whole path, with the parts that run per request (the <strong>data plane</strong>) separated from the parts that run every few seconds or minutes to keep the fleet in shape (the <strong>control plane</strong>).</p>
+
+<figure class="fig wide"><svg viewBox="0 0 960 540" id="fig-stack"></svg>
+<figcaption>The serving platform. Solid arrows are the request path; the green dashed arrow is the token stream flowing back. Dotted lines carry telemetry. The control plane never touches individual requests: it reads metrics and changes configuration (how many replicas, which model version, which tenant gets what quota). Keeping the two apart is what lets the data plane keep serving when the control plane is down.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Layer</th><th>Decides</th><th>Typical tools</th><th>Fails how</th></tr></thead>
+  <tbody>
+    <tr><td>Client SDK</td><td>Timeouts, retries, streaming parse, cancellation</td><td>OpenAI-compatible SDKs, <code>httpx</code></td><td>Retry storms, timeouts shorter than legitimate generations</td></tr>
+    <tr><td>Edge / API gateway</td><td>Who you are, whether you're allowed, how much you may send</td><td>Envoy, NGINX, cloud API gateways, LLM gateways (LiteLLM and similar)</td><td>Buffering a stream, idle timeouts cutting long responses</td></tr>
+    <tr><td>Router / load balancer</td><td>Which replica serves this request</td><td>Envoy with an endpoint picker, SGLang router, llm-d scheduler, Dynamo router</td><td>Herding onto one replica, low prefix-cache hit rate</td></tr>
+    <tr><td>Engine replicas</td><td>Batching, KV memory, scheduling inside one model server</td><td>vLLM, SGLang, TensorRT-LLM, TGI</td><td>Preemptions, OOM, slow decode when batch grows</td></tr>
+    <tr><td>Artifact store / registry</td><td>Which weights, tokenizer, and adapters a replica loads</td><td>Object storage, Hugging Face Hub mirror, OCI registry</td><td>Slow cold starts, wrong revision loaded</td></tr>
+    <tr><td>Telemetry</td><td>What happened and how fast</td><td>Prometheus, OpenTelemetry, DCGM exporter, log pipeline</td><td>Missing percentiles, PII in logs, label cardinality blowups</td></tr>
+  </tbody>
+</table>
+
+<div class="grid2">
+  <div class="card"><div class="k">Data plane</div><h4>Per request, milliseconds matter</h4><p>Gateway, router, engines. Must be stateless where possible, horizontally scalable, and keep working on cached config if the control plane disappears. Every component here adds latency to every request, so it should do as little as possible.</p></div>
+  <div class="card blue"><div class="k">Control plane</div><h4>Per minute, correctness matters</h4><p>Autoscaler, orchestrator (usually Kubernetes), rollout controller, quota and tenant config. Reads metrics, writes desired state. A slow control plane delays scale-up; a broken one should freeze the fleet in place, never tear it down.</p></div>
+</div>
+
+<p>The platform's own overhead is small next to the engine's. That's why most serving work is about queueing and GPU time, not about the proxy.</p>
+
+<div class="formula" data-name="End-to-end latency budget">
+  <div class="tex">$$\htmlClass{t1}{T_{\text{e2e}}} = \htmlClass{t2}{t_{\text{net}}} + \htmlClass{t3}{t_{\text{gw}}} + \htmlClass{t4}{t_{\text{route}}} + \htmlClass{t5}{t_{\text{queue}}} + \htmlClass{t6}{t_{\text{prefill}}} + (n_{\text{out}} - 1)\,\htmlClass{t7}{t_{\text{ITL}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(T_{\text{e2e}}\)</dt><dd>time from the client sending the request to receiving the last token</dd></div>
+    <div data-t="t2"><dt>\(t_{\text{net}}\)</dt><dd>network round trips client ↔ edge (tens of ms across a continent)</dd></div>
+    <div data-t="t3"><dt>\(t_{\text{gw}}\)</dt><dd>gateway work: TLS, auth lookup, quota check, tokenization for token-based quotas</dd></div>
+    <div data-t="t4"><dt>\(t_{\text{route}}\)</dt><dd>router decision, including any prefix hashing or metric lookups</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{queue}}\)</dt><dd>waiting for a batch slot or KV memory, at the router or inside the engine</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{prefill}}\)</dt><dd>processing the uncached part of the prompt (Module 08)</dd></div>
+    <div data-t="t7"><dt>\(t_{\text{ITL}}\)</dt><dd>inter-token latency during decode</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>TTFT is everything up to and including prefill. The rest is decode. The platform layers (gateway, router) usually add single-digit milliseconds each; queueing can add seconds.</p>
+  <p class="why"><b>Why it matters</b>When TTFT regresses, the first question is which term grew. Queue time is the usual culprit, and it's a capacity or routing problem, not an engine problem. Instrument each term separately (<a href="#observability">observability</a>) or you'll tune the wrong thing.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="streaming">Streaming APIs and cancellation</h2>
+
+<p>Nearly every LLM API streams. A 500-token answer at 40 ms per token takes 20 seconds to finish, but the first words show up in under a second. The de facto wire format is the OpenAI-compatible chat completions API over <strong>Server-Sent Events</strong> (SSE): a plain HTTP response with <code>Content-Type: text/event-stream</code> that stays open while the server writes one <code>data:</code> line per chunk.</p>
+
+<div class="code" data-lang="bash" data-title="what a stream looks like on the wire"><pre><code>
+curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "chat", "stream": true, "stream_options": {"include_usage": true},
+       "messages": [{"role": "user", "content": "Say hi"}]}'
+
+data: {"id":"chatcmpl-7f3","object":"chat.completion.chunk","model":"chat","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-7f3","object":"chat.completion.chunk","model":"chat","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-7f3","object":"chat.completion.chunk","model":"chat","choices":[{"index":0,"delta":{"content":" there!"},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-7f3","object":"chat.completion.chunk","model":"chat","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}
+
+data: [DONE]
+</code></pre></div>
+
+<p>Each event is <code>data: &lt;json&gt;</code> followed by a blank line. The text arrives in <code>choices[0].delta.content</code>, the reason the stream ended in <code>finish_reason</code>, token counts in a final usage chunk if you asked for it with <code>stream_options</code>, and the sentinel <code>[DONE]</code> closes the stream. One chunk can carry more than one token, so counting chunks is only an approximation of counting tokens.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 440" id="fig-sse"></svg>
+<figcaption>Life of a streamed request, and what cancellation has to do. When the client goes away, every hop must notice and close its upstream connection, so the engine aborts the sequence and returns its KV blocks to the free pool. If any hop keeps the upstream connection open, the engine keeps decoding to <code>max_tokens</code> for nobody.</figcaption></figure>
+
+<h3>Cancellation frees GPU memory</h3>
+<p>A request that nobody is reading still holds KV cache and still takes a slot in every decode step. For Llama-3-8B, KV is about 128 KB per token in fp16 (<a href="08-inference.html#kvcache">Module 08</a>), so a zombie stream with 8K tokens of context pins 1 GiB of GPU memory. Users abandon requests all the time: they hit stop, close the tab, or the client's own timeout fires and it retries. Without cancellation, a retry doubles the work and the original keeps running.</p>
+<p>Current versions of vLLM and SGLang abort a request when the HTTP connection to them closes. The platform's job is to make sure that close propagates: the gateway and router must tie the upstream request's lifetime to the downstream connection, not let it run to completion in the background.</p>
+
+<h3>Timeouts for streams</h3>
+<p>A single "request timeout" is the wrong tool for a stream that can legitimately run for minutes. Use separate limits:</p>
+<table class="t">
+  <thead><tr><th>Timeout</th><th>Measures</th><th>Illustrative value</th><th>On expiry</th></tr></thead>
+  <tbody>
+    <tr><td>Connect</td><td>TCP + TLS handshake</td><td>3–5 s</td><td>Retry on another replica</td></tr>
+    <tr><td>Time to first byte</td><td>Queue + prefill</td><td>30–120 s (long prompts, reasoning models)</td><td>Cancel, maybe retry if nothing was streamed</td></tr>
+    <tr><td>Idle between chunks</td><td>A stalled stream</td><td>30–60 s</td><td>Cancel; do not silently retry mid-answer</td></tr>
+    <tr><td>Total deadline</td><td>Whole request</td><td>Set from <code>max_tokens</code> × expected ITL, with margin</td><td>Cancel</td></tr>
+  </tbody>
+</table>
+
+<div class="pitfall"><b>Pitfall · proxies that buffer or time out streams</b>
+<p>Two classic production bugs. First, a proxy buffers the response, so the client sees nothing until the whole answer is done and TTFT looks like end-to-end latency. In NGINX, turn off <code>proxy_buffering</code> for these routes (or send <code>X-Accel-Buffering: no</code>). Second, an idle timeout at a load balancer (60 seconds by default on AWS's Application Load Balancer, for example) kills streams that pause, for example a reasoning model whose hidden thinking tokens aren't forwarded. Raise the idle timeout for LLM routes, or have the server send SSE comment lines (<code>: keep-alive</code>) as heartbeats.</p>
+</div>
+
+<div class="code" data-lang="python" data-title="client: separate timeouts and real cancellation"><pre><code>
+import asyncio, httpx
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(
+    base_url="http://localhost:8000/v1", api_key="none",
+    timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),  # read = max gap between chunks
+    max_retries=0,                       # retries are a platform decision, see the reliability section
+)
+
+async def ask(prompt: str, deadline_s: float = 120.0) -&gt; str:
+    out = []
+    async def consume():
+        stream = await client.chat.completions.create(
+            model="chat", stream=True, max_tokens=800,
+            messages=[{"role": "user", "content": prompt}])
+        try:
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    out.append(chunk.choices[0].delta.content)
+        finally:
+            await stream.close()          # closes the HTTP connection, so the server aborts the sequence
+    await asyncio.wait_for(consume(), timeout=deadline_s)   # total deadline; cancels consume() on expiry
+    return "".join(out)
+</code></pre></div>
+
+<!-- ================================================================== -->
+<h2 id="routing">Load balancing for LLMs</h2>
+
+<p>Classic web load balancing assumes requests cost about the same, so spreading them evenly spreads work evenly. LLM requests break that assumption badly. One request has a 50-token prompt and stops after 5 tokens; the next has a 60K-token prompt and writes 3,000 tokens. In GPU time they differ by three orders of magnitude or more, and the router can see only half of it up front: the prompt length is known, the output length isn't.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 300" id="fig-rr"></svg>
+<figcaption>The same nine requests (numbers are service time in seconds, arriving one per second) sent to three replicas. Round-robin deals them out by position and replica A gets three long jobs in a row, so short requests wait behind them. Least-outstanding-work sends each request to the replica that will be free soonest. Each replica here serves one request at a time for clarity; real engines batch, which softens the effect but doesn't remove it, because a batch still slows down as it fills.</figcaption></figure>
+
+<h3>Connections are not requests</h3>
+<p>A Kubernetes <code>Service</code> (kube-proxy) balances <em>connections</em> at layer 4. HTTP clients keep connections alive and reuse them, so a client with a pooled connection can pin all its traffic to one pod. LLM traffic needs a layer-7 balancer that picks a backend <em>per request</em>, and for streams the connection stays open as long as the answer takes, which makes per-connection balancing even more lopsided.</p>
+
+<h3>Routing policies</h3>
+<table class="t">
+  <thead><tr><th>Policy</th><th>Picks</th><th>Needs</th><th>Weakness</th></tr></thead>
+  <tbody>
+    <tr><td>Round-robin / random</td><td>Next in rotation</td><td>Nothing</td><td>Blind to request cost and cache state</td></tr>
+    <tr><td>Least outstanding requests</td><td>Replica with fewest in-flight requests</td><td>Router-side counters</td><td>Counts a 50-token and a 50K-token request the same</td></tr>
+    <tr><td>Least outstanding tokens</td><td>Fewest estimated tokens in flight (prompt + <code>max_tokens</code> or a predicted output)</td><td>Token counts at the router</td><td>Output length is a guess</td></tr>
+    <tr><td>KV- / queue-aware</td><td>Lowest KV utilization or waiting queue, scraped from engines</td><td>Fresh engine metrics</td><td>Metrics are seconds old; everyone herds to the same "idle" replica</td></tr>
+    <tr><td>Prefix / session affinity</td><td>The replica that already has this prompt prefix cached</td><td>Prefix hashing, consistent hashing</td><td>Hot prefixes overload one replica unless load is bounded</td></tr>
+    <tr><td>Scored combination</td><td>Weighted sum of cache overlap, queue, and KV usage</td><td>All of the above</td><td>More knobs to tune; the weights are workload-specific</td></tr>
+  </tbody>
+</table>
+
+<p>Prefix affinity matters because prefix caching is per replica. <a href="19-engines.html#radix">Module 19</a> showed an engine skipping prefill for a cached prefix; that only helps if the next request with that prefix lands on the same replica. Spread a hot 10K-token system prompt across all replicas and every replica stores its own copy, wasting KV memory the fleet could have used for other prefixes.</p>
+
+<div class="formula" data-name="Fleet prefix-cache capacity">
+  <div class="tex">$$\htmlClass{t1}{C_{\text{eff}}} = \frac{\htmlClass{t2}{N}\cdot \htmlClass{t3}{C}}{\htmlClass{t4}{\bar k}}, \qquad \htmlClass{t5}{P_{\text{hit}}^{\text{random}}} \approx \frac{1}{\htmlClass{t2}{N}} \;\text{ for a session's next turn}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C_{\text{eff}}\)</dt><dd>distinct prefix tokens the whole fleet can keep cached</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>number of replicas</dd></div>
+    <div data-t="t3"><dt>\(C\)</dt><dd>KV capacity per replica left over for cached prefixes, in tokens</dd></div>
+    <div data-t="t4"><dt>\(\bar k\)</dt><dd>average number of replicas holding a copy of each cached prefix: up to \(N\) under round-robin for hot prefixes, close to 1 under affinity</dd></div>
+    <div data-t="t5"><dt>\(P_{\text{hit}}^{\text{random}}\)</dt><dd>chance a conversation's follow-up lands on the replica that holds its history, if routing ignores the cache</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Duplicated prefixes divide your fleet's cache by the duplication factor. With 8 replicas and cache-blind routing, a multi-turn chat finds its own history on the right replica about one time in eight.</p>
+  <p class="why"><b>Why it matters</b>Agents resend a growing context every turn. At 1-in-8 hits, each turn re-prefills the whole history; at near-100% hits, each turn prefills only the new message. That's often a 5–10× difference in prefill work for long agent sessions (rule of thumb; it depends on how fast contexts grow).</p>
+</div>
+
+<h3>Affinity without hot spots</h3>
+<p>Strict hashing (<code>replica = hash(prefix) mod N</code>) breaks when one prefix is popular: every request carrying it lands on one replica. <strong>Consistent hashing with bounded loads</strong> (Mirrokni, Thorup &amp; Zadimoghaddam, 2016) fixes this. Hash as usual, but if the chosen replica already carries more than \((1+\varepsilon)\) times the average load, walk the hash ring to the next replica. Hot prefixes then occupy two or three replicas instead of melting one. A related trick for metric-driven routing is the <strong>power of two choices</strong> (Mitzenmacher, 2001): sample two replicas at random and pick the less loaded. It avoids the herd that forms when every router sends to the single "least loaded" replica based on the same stale scrape.</p>
+
+<p>Current open-source routers combine these signals. The Kubernetes Gateway API Inference Extension defines an endpoint picker that scores model servers on queue length, KV utilization, and loaded LoRA adapters; llm-d builds a prefix-cache-aware scheduler on top of it; NVIDIA Dynamo's router estimates KV overlap per worker; SGLang ships a cache-aware router that keeps an approximate radix tree per worker. These projects move fast, so treat the details as examples and check current docs.</p>
+
+<div id="w-lb"></div>
+
+<div class="flag"><b>Router-side cache state is a guess</b>
+<p>The router doesn't see engine evictions directly. It either keeps its own approximate model of what each replica holds (and drifts), or subscribes to engine KV events (more accurate, more plumbing). Either way, check the hit rate the engines themselves report. A router that believes it's achieving 90% hits while the engines report 40% is evicting faster than it thinks.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="queueing">Queueing theory you need</h2>
+
+<p>Three results explain most capacity surprises. You don't need the derivations, but you do need the shapes. The first one, Little's law, was introduced in <a href="13-eval-production.html#serving">Module 13</a>; here it does more work.</p>
+
+<div class="formula" data-name="Little's law">
+  <div class="tex">$$\htmlClass{t1}{L} = \htmlClass{t2}{\lambda}\,\htmlClass{t3}{W}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(L\)</dt><dd>average number of requests in the system (queued + running)</dd></div>
+    <div data-t="t2"><dt>\(\lambda\)</dt><dd>average arrival rate (requests per second)</dd></div>
+    <div data-t="t3"><dt>\(W\)</dt><dd>average time each request spends in the system</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>In-flight work equals arrival rate times time-in-system. It holds for any stable system, regardless of arrival pattern or scheduling.</p>
+  <p class="why"><b>Why it matters</b>At 40 requests/s with an 8-second average response, 320 requests are in flight. If each replica runs at most 64 sequences (<code>--max-num-seqs</code>), you need at least 5 replicas just to hold them, and every one of those 320 sequences holds KV memory. It also works in reverse: measure \(L\) (running + waiting) and \(\lambda\) from metrics and you get \(W\) for free, which is a good sanity check on your latency histograms.</p>
+</div>
+
+<div class="formula" data-name="Utilization">
+  <div class="tex">$$\htmlClass{t1}{\rho} = \frac{\htmlClass{t2}{\lambda}}{\htmlClass{t3}{c}\,\htmlClass{t4}{\mu}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\rho\)</dt><dd>utilization: fraction of capacity in use. Must stay below 1 or the queue grows without bound</dd></div>
+    <div data-t="t2"><dt>\(\lambda\)</dt><dd>arrival rate</dd></div>
+    <div data-t="t3"><dt>\(c\)</dt><dd>number of servers (replicas, or batch slots)</dd></div>
+    <div data-t="t4"><dt>\(\mu\)</dt><dd>service rate per server: requests per second one server completes, \(1/\tau\) for mean service time \(\tau\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>\(\rho = 0.7\) means the fleet is busy 70% of the time on average. The remaining 30% is the slack that absorbs bursts, and the next formula shows how quickly latency grows as that slack shrinks.</p>
+</div>
+
+<div class="formula" data-name="M/M/1 time in system (simplified model)">
+  <div class="tex">$$\htmlClass{t1}{W} = \frac{1}{\htmlClass{t2}{\mu} - \htmlClass{t3}{\lambda}} = \frac{\htmlClass{t4}{\tau}}{1 - \htmlClass{t5}{\rho}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(W\)</dt><dd>mean time in system (wait + service) for one server with Poisson arrivals and exponential service times</dd></div>
+    <div data-t="t2"><dt>\(\mu\)</dt><dd>service rate</dd></div>
+    <div data-t="t3"><dt>\(\lambda\)</dt><dd>arrival rate</dd></div>
+    <div data-t="t4"><dt>\(\tau\)</dt><dd>mean service time, \(1/\mu\)</dd></div>
+    <div data-t="t5"><dt>\(\rho\)</dt><dd>utilization \(\lambda/\mu\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Latency is the service time divided by the spare capacity. With \(\tau = 2\) s: at 50% utilization \(W = 4\) s, at 80% it's 10 s, at 90% it's 20 s, at 95% it's 40 s. Every halving of the spare capacity doubles the wait.</p>
+  <p class="why"><b>Why it matters</b>This is the reason for headroom. The curve is flat for a long time and then turns vertical. The last 10% of utilization costs more latency than the first 80% combined. An LLM server isn't an M/M/1 queue (it batches, and its service rate changes with batch size), so read this for the shape, not the numbers.</p>
+</div>
+
+<div class="formula" data-name="Variability makes it worse (Pollaczek–Khinchine / Kingman)">
+  <div class="tex">$$\htmlClass{t1}{W_q} \approx \frac{\htmlClass{t2}{\rho}}{1-\htmlClass{t2}{\rho}}\cdot\frac{\htmlClass{t3}{c_a^2} + \htmlClass{t4}{c_s^2}}{2}\cdot \htmlClass{t5}{\tau}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(W_q\)</dt><dd>mean time waiting in queue, before service starts</dd></div>
+    <div data-t="t2"><dt>\(\rho\)</dt><dd>utilization</dd></div>
+    <div data-t="t3"><dt>\(c_a^2\)</dt><dd>squared coefficient of variation of inter-arrival times (1 for Poisson, larger for bursty traffic)</dd></div>
+    <div data-t="t4"><dt>\(c_s^2\)</dt><dd>squared coefficient of variation of service times. LLM requests with long-tailed output lengths often have \(c_s\) of 1–3</dd></div>
+    <div data-t="t5"><dt>\(\tau\)</dt><dd>mean service time</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Queueing delay is utilization pressure times variability times service time. Kingman's approximation (1961) covers general single-server queues; with Poisson arrivals (\(c_a^2=1\)) it's the exact Pollaczek–Khinchine result for M/G/1.</p>
+  <p class="why"><b>Why it matters</b>Mixed request lengths raise \(c_s\), and the wait grows with \(c_s^2\). A workload where some requests generate 10× the median output queues far worse than its average suggests. That's an argument for separating short interactive traffic from long batch traffic, and for chunked prefill, which breaks giant prompts into pieces that don't block everyone else.</p>
+</div>
+
+<div id="w-queue"></div>
+
+<div class="intuition"><b>The headroom rule</b>
+<p>Plan to run at 60–80% of the capacity you measured <em>at your latency target</em> during the peak hour (a rule of thumb, not a law). The headroom absorbs bursts, uneven routing, a replica failing or restarting, and the minutes it takes the autoscaler to react. Pooling helps too: one shared queue in front of \(c\) servers waits far less than \(c\) separate queues at the same utilization, which is the queueing argument for load-aware routing over static assignment.</p>
+</div>
+
+<div class="flag"><b>Where LLM servers differ from textbook queues</b>
+<p>An engine is a batch server. Its throughput rises with batch size until compute, KV memory, or your ITL target caps it, and each request's speed falls as the batch grows. So "capacity" isn't a fixed \(\mu\): it's the throughput at the largest batch that still meets your SLO. Measure that by load testing (<a href="#loadtest">below</a>) and plug it in as \(c\mu\). The queue also forms in two places: at the router (waiting for a replica) and inside the engine (waiting for KV blocks, visible as <code>num_requests_waiting</code>).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="autoscaling">Autoscaling</h2>
+
+<p>Traffic follows the sun, product launches, and batch jobs someone forgot to tell you about. Autoscaling adds replicas when demand rises and removes them when it falls. The hard parts are choosing a signal that actually measures load, and living with the minutes it takes a new replica to become useful.</p>
+
+<h3>Which signal to scale on</h3>
+<table class="t">
+  <thead><tr><th>Signal</th><th>What it measures</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>CPU utilization</td><td>The Python API server and tokenizer, not the GPU</td><td>Nearly useless. Can sit at 20% while requests queue for minutes</td></tr>
+    <tr><td>GPU utilization (<code>nvidia-smi</code>, <code>DCGM_FI_DEV_GPU_UTIL</code>)</td><td>Fraction of time <em>any</em> kernel was running</td><td>Misleading. Reads near 100% at modest load because decode launches kernels continuously, so it can't tell 30% load from 100%</td></tr>
+    <tr><td>Requests in flight (running + waiting) per replica</td><td>Concurrency, directly related to batch size via Little's law</td><td>Good default. Target a fraction of the concurrency at which you still meet SLO</td></tr>
+    <tr><td>Queue depth (<code>num_requests_waiting</code>)</td><td>Requests that couldn't get a batch slot or KV memory</td><td>Good leading indicator. Zero most of the time, so pair it with in-flight</td></tr>
+    <tr><td>KV cache utilization</td><td>Fraction of KV blocks in use</td><td>Useful for memory-bound workloads (long contexts). Prefix caching keeps it high even when idle in some engines, so check what your engine reports</td></tr>
+    <tr><td>TTFT / ITL SLO burn</td><td>What users actually experience</td><td>Best as a safety net and alert. Purely reactive: it fires after users are already hurting</td></tr>
+    <tr><td>Tokens/s per replica</td><td>Work done</td><td>Fine for planning, but saturates at capacity, so it can't show how far past capacity you are</td></tr>
+  </tbody>
+</table>
+
+<p>The scale-up delay is the sum of several terms: the metric scrape interval, the autoscaler's evaluation period, any stabilization window, and then the full <a href="#coldstart">cold start</a>. For large models on fresh nodes that adds up to several minutes: the worked example in the next section reaches 7.5 minutes before counting any autoscaler lag. Traffic that ramps faster than that has to be absorbed by headroom.</p>
+
+<div class="formula" data-name="Required replicas">
+  <div class="tex">$$\htmlClass{t1}{R} = \left\lceil \frac{\htmlClass{t2}{X_{\text{peak}}}}{\htmlClass{t3}{G_{\text{rep}}}} \times (1 + \htmlClass{t4}{h}) \right\rceil$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(R\)</dt><dd>replicas to run during the peak</dd></div>
+    <div data-t="t2"><dt>\(X_{\text{peak}}\)</dt><dd>peak demand in tokens/s (use the same unit you benchmarked, usually output tokens/s at your real input/output mix)</dd></div>
+    <div data-t="t3"><dt>\(G_{\text{rep}}\)</dt><dd>per-replica goodput: tokens/s one replica sustains while meeting the TTFT and ITL targets, measured by load test</dd></div>
+    <div data-t="t4"><dt>\(h\)</dt><dd>headroom fraction (0.25–0.5 is common), covering bursts, routing imbalance, and one replica down</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Divide peak demand by what one replica can do <em>at SLO</em>, add headroom, round up.</p>
+  <p class="why"><b>Why it matters</b>Peak 60,000 tok/s, replica goodput 2,500 tok/s, 30% headroom: 24 × 1.3 = 31.2, so 32 replicas. Using the replica's maximum throughput instead of its goodput at SLO is the most common sizing error, because maximum throughput is measured at a batch size whose latency nobody would accept. This is the replica-level version of the GPU formula in <a href="13-eval-production.html#serving">Module 13</a>.</p>
+</div>
+
+<div id="w-autoscale"></div>
+
+<div class="code" data-lang="yaml" data-title="KEDA ScaledObject: scale on in-flight requests from vLLM metrics"><pre><code>
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: llm-chat
+spec:
+  scaleTargetRef:
+    name: llm-chat                  # the Deployment below
+  minReplicaCount: 2                # keep 2 for availability; see scale-to-zero below
+  maxReplicaCount: 24
+  pollingInterval: 15
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies: [{type: Percent, value: 100, periodSeconds: 60}]   # may double each minute
+        scaleDown:
+          stabilizationWindowSeconds: 900                              # wait 15 min before shrinking
+          policies: [{type: Pods, value: 1, periodSeconds: 120}]
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring:9090
+      # running + waiting across the deployment; KEDA divides by replicas and compares to threshold
+      query: sum(vllm:num_requests_running{model_name="chat"}) + sum(vllm:num_requests_waiting{model_name="chat"})
+      threshold: "40"               # target in-flight per replica, ~70% of the concurrency that meets SLO
+</code></pre></div>
+
+<h3>Scale-to-zero</h3>
+<p>Running zero replicas when idle saves real money for dev environments, rarely used fine-tunes, and batch pipelines. The price is that the first request after idle waits for a full cold start, often minutes for a large model. That's acceptable when the caller is a batch job and unacceptable for a chat UI. Middle grounds: keep one small replica warm, scale to zero only outside business hours, serve rarely used LoRA adapters on a shared base model so they never need their own replica (<a href="19-engines.html#multilora">Module 19</a>), or hold requests at the gateway while a replica boots and return 503 with <code>Retry-After</code> if it takes too long.</p>
+
+<div class="pitfall"><b>Pitfall · scaling down kills streams</b>
+<p>When the autoscaler removes a replica, Kubernetes sends SIGTERM. If the pod exits immediately, every in-flight stream on it dies mid-sentence. Scale down slowly (long stabilization windows), mark the pod unready first so the router stops sending new requests, and give it a termination grace period long enough to finish its longest legitimate stream (see the Deployment in the <a href="#k8s">Kubernetes section</a>).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="coldstart">Cold starts</h2>
+
+<p>A web service container starts in seconds. An LLM replica can take ten minutes, and almost all of that time is spent moving bytes. Break it down and each part has a different fix.</p>
+
+<ol>
+  <li><strong>Node provisioning.</strong> If no GPU node has room, the cluster autoscaler requests a VM from the cloud. Minutes, and sometimes the provider has no capacity at all for that GPU type in that zone.</li>
+  <li><strong>Container image pull.</strong> Serving images bundle CUDA, PyTorch, and the engine, often 5–10 GB or more. Pulling and decompressing layers is frequently slower than the raw network.</li>
+  <li><strong>Weight download.</strong> 16 GB for an 8B model in bf16, 140 GB for a 70B. From object storage, Hugging Face, or a model registry.</li>
+  <li><strong>Load into GPU memory.</strong> Read from local disk or page cache, deserialize, copy over PCIe, possibly shard across tensor-parallel GPUs.</li>
+  <li><strong>Warmup.</strong> <code>torch.compile</code>, CUDA graph capture for each batch size, KV cache allocation, a first dummy request. Tens of seconds to a few minutes.</li>
+</ol>
+
+<div class="formula" data-name="Cold-start time">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{cold}}} = \htmlClass{t2}{t_{\text{node}}} + \htmlClass{t3}{t_{\text{image}}} + \frac{\htmlClass{t4}{W}}{\htmlClass{t5}{BW_{\text{storage}}}} + \frac{\htmlClass{t4}{W}}{\htmlClass{t6}{BW_{\text{load}}}} + \htmlClass{t7}{t_{\text{warmup}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{cold}}\)</dt><dd>time from "scale up" to the replica passing its readiness check</dd></div>
+    <div data-t="t2"><dt>\(t_{\text{node}}\)</dt><dd>getting a GPU node: 0 if one is free, minutes if the cluster must provision one</dd></div>
+    <div data-t="t3"><dt>\(t_{\text{image}}\)</dt><dd>pulling and unpacking the container image: 0 if cached on the node</dd></div>
+    <div data-t="t4"><dt>\(W\)</dt><dd>weight bytes this replica must fetch and load</dd></div>
+    <div data-t="t5"><dt>\(BW_{\text{storage}}\)</dt><dd>achieved download bandwidth from where the weights live (object store, NVMe cache, a peer)</dd></div>
+    <div data-t="t6"><dt>\(BW_{\text{load}}\)</dt><dd>effective rate from local storage into GPU memory including deserialization; often well below PCIe peak</dd></div>
+    <div data-t="t7"><dt>\(t_{\text{warmup}}\)</dt><dd>compilation, CUDA graph capture, allocation, first request</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Get a machine, get the software, get the weights, put them on the GPU, warm up. Written as a sum because that's what a naive startup does; streaming loaders overlap the two weight terms so the slower one dominates.</p>
+  <p class="why"><b>Why it matters</b>Worked example (illustrative bandwidths): a 70B bf16 model, \(W = 140\) GB, on a fresh node. 240 s node + 40 s image + 140/1.5 ≈ 93 s download + 140/8 ≈ 18 s load + 60 s warmup ≈ 450 s, about 7.5 minutes. Requests keep arriving the whole time: at 5 req/s, that's over 2,000 requests needing somewhere else to go.</p>
+</div>
+
+<div id="w-cold"></div>
+
+<h3>Mitigations, by the term they attack</h3>
+<table class="t">
+  <thead><tr><th>Mitigation</th><th>Attacks</th><th>Caveat</th></tr></thead>
+  <tbody>
+    <tr><td>Warm pool: spare GPU nodes (or standby replicas) kept ready</td><td>\(t_{\text{node}}\), everything if replicas are pre-loaded</td><td>You pay for idle GPUs; size the pool for the ramp, not the peak</td></tr>
+    <tr><td>Pre-pulled images (DaemonSet pre-pull, node image baked with the engine), slimmer images, lazy-pulling snapshotters</td><td>\(t_{\text{image}}\)</td><td>Lazy pulling shifts cost to first file access; measure end to end</td></tr>
+    <tr><td>Node-local NVMe or host cache of weights, shared read-only volume, peer-to-peer distribution</td><td>\(BW_{\text{storage}}\)</td><td>Cache invalidation on new model versions; disk space per model</td></tr>
+    <tr><td>Parallel or streaming loaders (e.g. vLLM's <code>--load-format runai_streamer</code> for safetensors from object storage)</td><td>Overlaps download and load; uses many concurrent reads</td><td>Gains depend on the storage backend and NIC; benchmark yours</td></tr>
+    <tr><td><code>safetensors</code> with memory mapping</td><td>\(BW_{\text{load}}\)</td><td>Fast and safe (no pickle); still bound by disk and PCIe</td></tr>
+    <tr><td>Persisted compile caches (vLLM keeps <code>torch.compile</code> artifacts under its cache directory)</td><td>\(t_{\text{warmup}}\)</td><td>Cache is specific to engine version, model, GPU type, and flags</td></tr>
+    <tr><td>Engine sleep mode (vLLM <code>--enable-sleep-mode</code>): offload weights to CPU memory and free KV while idle, wake on demand</td><td>Most terms, for model swapping on an existing node</td><td>Needs host RAM for the weights; wake time is seconds, not zero</td></tr>
+    <tr><td>Process or GPU snapshot/restore (CRIU, CUDA checkpointing)</td><td>Load + warmup</td><td>Experimental in most stacks; driver and version sensitive</td></tr>
+  </tbody>
+</table>
+
+<div class="mle"><b>MLE angle · measure every phase</b>
+<p>Log a timestamp at each phase boundary (pod scheduled, image pulled, container started, weights downloaded, model loaded, server ready) and plot the breakdown per deploy. The phase you guessed is rarely the phase that dominates, and the fix for a 3-minute image pull looks nothing like the fix for a 3-minute download.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="k8s">Kubernetes and GPU scheduling</h2>
+
+<p>Most self-hosted LLM fleets run on Kubernetes. It doesn't know what a GPU is out of the box. A vendor <strong>device plugin</strong> (NVIDIA's, AMD's) runs on each GPU node and advertises GPUs as an extended resource such as <code>nvidia.com/gpu: 8</code>. Pods request whole units of it in their resource limits, and the scheduler places them only on nodes with enough free units. The NVIDIA GPU Operator packages the driver, container toolkit, device plugin, and DCGM exporter together.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 960 430" id="fig-k8s"></svg>
+<figcaption>A typical cluster layout. CPU nodes run the gateway and router. GPU nodes are tainted so that only pods that tolerate the taint (the model servers) land on them, and labelled by GPU type so a 70B replica asks for H100s explicitly. A tensor-parallel replica wants all its GPUs on one node, connected by NVLink. The bottom row shows the two common ways to share one GPU between small models: MIG gives hardware-isolated slices, time-slicing gives none.</figcaption></figure>
+
+<h3>Placing GPU pods</h3>
+<ul>
+  <li><strong>Node pools, taints, and tolerations.</strong> Taint GPU nodes (for example <code>nvidia.com/gpu=present:NoSchedule</code>) so ordinary pods don't eat expensive capacity, and add a matching toleration to model servers. Label nodes by GPU type and select on it.</li>
+  <li><strong>Topology.</strong> Tensor parallelism across GPUs without NVLink, or across nodes, is much slower. Request a whole 8-GPU node for TP=8, or 4 GPUs for TP=4, and let the device plugin's topology awareness pick NVLink-connected GPUs where it supports that.</li>
+  <li><strong>Shared memory.</strong> PyTorch and NCCL use <code>/dev/shm</code> for inter-process communication; the container default (64 MB) breaks tensor-parallel startup. Mount a memory-backed <code>emptyDir</code>.</li>
+  <li><strong>Newer APIs.</strong> Dynamic Resource Allocation (DRA) is Kubernetes' more expressive API for devices (requesting GPUs by attributes, sharing, partitions), and has been graduating through recent releases. Expect GPU scheduling to move toward it.</li>
+</ul>
+
+<h3>Sharing one GPU</h3>
+<table class="t">
+  <thead><tr><th>Mode</th><th>How</th><th>Isolation</th><th>Good for</th><th>Caveat</th></tr></thead>
+  <tbody>
+    <tr><td>Whole GPU</td><td>One pod per GPU (or per TP group)</td><td>Full</td><td>Anything that fills a GPU</td><td>Wasteful for small models at low traffic</td></tr>
+    <tr><td>MIG (A100, H100, and newer datacenter GPUs)</td><td>Hardware partitions with dedicated memory and compute, e.g. H100 80GB as 7 × <code>1g.10gb</code></td><td>Memory and fault isolated</td><td>Several small models or tenants with predictable latency</td><td>Fixed profiles; slices can't borrow idle compute from neighbours; reconfiguring needs the GPU idle</td></tr>
+    <tr><td>Time-slicing</td><td>Device plugin advertises one GPU as N; contexts take turns</td><td>None: shared memory, no fault isolation</td><td>Dev, notebooks, very light traffic</td><td>One pod can OOM the others; latency of each depends on everyone</td></tr>
+    <tr><td>MPS</td><td>Kernels from several processes run concurrently</td><td>Partial (limits configurable)</td><td>Many small concurrent workloads</td><td>A fault in one client can affect others; setup is fiddlier</td></tr>
+  </tbody>
+</table>
+
+<p>For LLM serving, MIG is the only sharing mode you'd put in front of paying users, and only for models small enough to fit a slice with room for KV cache. Two engines on one time-sliced GPU each think they own all of its memory unless you cap them (vLLM's <code>--gpu-memory-utilization</code>), which is exactly the setup the lab uses to fake two replicas on one card.</p>
+
+<h3>Serving operators and projects</h3>
+<p>You can run engines as plain Deployments, but several open-source projects add LLM-aware pieces on top. As examples, not an endorsement or a complete list: <strong>KServe</strong> provides model-serving custom resources with autoscaling and canary rollout; <strong>llm-d</strong> is a Kubernetes-native stack around vLLM with prefix-cache-aware scheduling and prefill/decode disaggregation (the subject of Module 20); <strong>NVIDIA Dynamo</strong> is a distributed inference framework with a KV-aware router and disaggregated serving across several engines; <strong>Ray Serve</strong> is a Python-first serving framework with LLM-specific APIs, useful when the model is one step in a larger Python pipeline. The Gateway API Inference Extension is the shared routing layer several of these build on.</p>
+
+<div class="code" data-lang="yaml" data-title="deployment.yaml: one vLLM replica per GPU, with probes and graceful termination"><pre><code>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-chat
+  labels: {app: llm-chat}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}   # never drop below current capacity during a deploy
+  selector:
+    matchLabels: {app: llm-chat}
+  template:
+    metadata:
+      labels: {app: llm-chat}
+    spec:
+      nodeSelector:
+        gpu-type: l40s                                  # your node-pool label
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 330                # longest legitimate stream + preStop delay
+      containers:
+      - name: vllm
+        # pin by digest, not a moving tag (copy the digest from your registry)
+        image: vllm/vllm-openai@sha256:REPLACE_WITH_DIGEST
+        command: ["vllm", "serve"]
+        args:
+        - /models/qwen2.5-7b-instruct                   # pre-downloaded, pinned revision
+        - --served-model-name=chat
+        - --port=8000
+        - --max-model-len=16384
+        - --gpu-memory-utilization=0.90
+        - --max-num-seqs=64
+        - --enable-prefix-caching
+        env:
+        - {name: HF_HUB_OFFLINE, value: "1"}            # never fetch at runtime
+        ports:
+        - {name: http, containerPort: 8000}
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: 64Gi
+          requests:
+            cpu: "8"
+            memory: 64Gi
+        startupProbe:                                   # covers load + warmup; liveness waits for it
+          httpGet: {path: /health, port: http}
+          periodSeconds: 10
+          failureThreshold: 90                          # up to 15 minutes
+        readinessProbe:                                 # gates traffic
+          httpGet: {path: /health, port: http}
+          periodSeconds: 5
+          failureThreshold: 2
+        livenessProbe:                                  # restarts a wedged server; keep it lenient
+          httpGet: {path: /health, port: http}
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 4
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 20"]         # let endpoints update before SIGTERM arrives
+        volumeMounts:
+        - {name: models, mountPath: /models, readOnly: true}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: models
+        persistentVolumeClaim: {claimName: model-cache}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 16Gi}
+</code></pre></div>
+
+<div class="flag"><b>What this YAML doesn't guarantee</b>
+<p>The <code>preStop</code> sleep gives load balancers time to stop sending new requests, but whether in-flight streams finish after SIGTERM depends on the engine version and how its server handles shutdown. Test it: start a long stream, delete the pod, and see whether the stream completes. If it doesn't, the router has to drain the replica (stop sending, wait for in-flight to reach zero) before the pod is deleted. Also add a PodDisruptionBudget so node maintenance can't take down every replica at once.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="tenancy">Multi-tenancy, fairness, and security</h2>
+
+<p>A shared fleet serves many teams or customers. Without limits, one tenant's batch job of 10,000 long prompts fills every queue and everyone else's TTFT goes to minutes. Multi-tenancy has three layers: <strong>quotas</strong> (how much each tenant may send), <strong>priority</strong> (who goes first when there's a queue), and <strong>isolation</strong> (what one tenant can learn about or do to another).</p>
+
+<h3>Rate limiting with a token bucket</h3>
+<p>The standard limiter is a bucket that holds up to \(b\) tokens and refills at \(r\) tokens per second. Each request removes its cost; if the bucket doesn't have enough, the request is rejected (HTTP 429) or queued. For LLMs, "tokens" can be literal: limit tokens per minute rather than requests per minute, because one request can cost 1,000× another.</p>
+
+<div class="formula" data-name="Token bucket">
+  <div class="tex">$$\htmlClass{t1}{B(t)} = \min\!\big(\htmlClass{t2}{b},\; \htmlClass{t1}{B(t_0)} + \htmlClass{t3}{r}\,(t - t_0)\big), \qquad \text{admit if } \htmlClass{t1}{B(t)} \ge \htmlClass{t4}{c}, \qquad \htmlClass{t5}{A(T)} \le \htmlClass{t2}{b} + \htmlClass{t3}{r}\,T$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(B(t)\)</dt><dd>tokens in the bucket at time \(t\) (refilled lazily since the last check at \(t_0\))</dd></div>
+    <div data-t="t2"><dt>\(b\)</dt><dd>burst size: bucket capacity, the most a tenant can send at once after being idle</dd></div>
+    <div data-t="t3"><dt>\(r\)</dt><dd>refill rate: the sustained rate the tenant is entitled to</dd></div>
+    <div data-t="t4"><dt>\(c\)</dt><dd>cost of this request, e.g. prompt tokens + <code>max_tokens</code>, reconciled after it finishes</dd></div>
+    <div data-t="t5"><dt>\(A(T)\)</dt><dd>total cost admitted over any window of length \(T\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Idle time banks credit up to a cap. Over any window, a tenant can never get more than one full bucket plus the refill rate times the window.</p>
+  <p class="why"><b>Why it matters</b>\(r = 2{,}000\) tokens/s (120K tokens per minute) with \(b = 60{,}000\): an idle tenant can fire a 60K-token burst instantly, but sustained traffic is held to 2K tokens/s. The bound \(b + rT\) is what you use to prove the fleet can honour every tenant's quota at once: sum the \(r\)'s and compare against capacity.</p>
+</div>
+
+<div id="w-bucket"></div>
+
+<div class="code" data-lang="python" data-title="token_bucket.py: per-tenant, token-cost limiter with reconciliation"><pre><code>
+import time
+from dataclasses import dataclass, field
+
+@dataclass
+class Bucket:
+    rate: float                 # tokens refilled per second (r)
+    burst: float                # capacity (b)
+    level: float = field(default=None)
+    t_last: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self):
+        if self.level is None:
+            self.level = self.burst
+
+    def _refill(self):
+        now = time.monotonic()
+        self.level = min(self.burst, self.level + self.rate * (now - self.t_last))
+        self.t_last = now
+
+    def try_take(self, cost: float) -&gt; tuple[bool, float]:
+        """Returns (admitted, seconds_until_enough). Caller sends 429 + Retry-After if not admitted."""
+        self._refill()
+        if self.level &gt;= cost:
+            self.level -= cost
+            return True, 0.0
+        return False, (cost - self.level) / self.rate
+
+    def refund(self, amount: float):
+        """Return unused reservation (e.g. max_tokens reserved but generation stopped early)."""
+        self._refill()
+        self.level = min(self.burst, self.level + amount)
+
+buckets = {"team-search": Bucket(rate=2000, burst=60000), "team-batch": Bucket(rate=500, burst=5000)}
+
+def admit(tenant: str, prompt_tokens: int, max_tokens: int):
+    reserved = prompt_tokens + max_tokens
+    ok, wait = buckets[tenant].try_take(reserved)
+    return ok, wait, reserved
+
+def on_finish(tenant: str, reserved: int, prompt_tokens: int, completion_tokens: int):
+    buckets[tenant].refund(reserved - prompt_tokens - completion_tokens)
+</code></pre></div>
+
+<p>A single process works for one gateway. With several gateway replicas, keep buckets in a shared store (Redis with an atomic script is the usual approach) or give each gateway \(1/n\) of every tenant's rate and accept some unfairness.</p>
+
+<h3>Priority, fairness, and noisy neighbours</h3>
+<ul>
+  <li><strong>Priority classes.</strong> Interactive traffic first, batch traffic fills the gaps. Some engines accept a per-request priority (vLLM has a <code>--scheduling-policy priority</code> mode), and the router can hold batch requests back when interactive queues grow. Batch work tolerates hours of latency, which makes it the perfect filler for idle GPUs at night.</li>
+  <li><strong>Fair sharing inside the engine.</strong> First-come-first-served lets one tenant who sends 500 requests at once delay everyone. Sheng et al. (2024) proposed the Virtual Token Counter, which tracks tokens served per tenant and always schedules the tenant that has received the least service, weighting input and output tokens by their cost.</li>
+  <li><strong>Noisy neighbours.</strong> A tenant with 100K-token prompts monopolizes prefill and spikes everyone's ITL. Chunked prefill (<a href="19-engines.html#chunked">Module 19</a>) bounds the damage per step; per-tenant concurrency caps and separate pools for long-context traffic bound it further.</li>
+  <li><strong>LoRA per tenant.</strong> Customer-specific fine-tunes as LoRA adapters on a shared base model (<a href="19-engines.html#multilora">Module 19</a>) let hundreds of tenants share one fleet. The router should prefer replicas that already have the tenant's adapter loaded.</li>
+</ul>
+
+<h3>Isolation between tenants</h3>
+<p>Shared prefix caches create a timing side channel: if tenant A's request is fast because its prefix is cached, A learns that someone recently sent that prefix. vLLM supports a per-request <code>cache_salt</code> so that only requests with the same salt share cached blocks; salt per tenant (or per user, for sensitive data). Beyond caches, enforce per-tenant auth at the gateway, cap prompt length and <code>max_tokens</code> there (an unbounded <code>max_tokens</code> is a denial-of-service vector), and never echo one tenant's data into another's logs or metrics.</p>
+
+<h3>Handling prompts and data</h3>
+<p>Prompts contain whatever users paste: credentials, medical details, customer records. Decide retention up front, encrypt logs at rest, restrict who can read raw prompts, and keep them out of metric labels entirely. Details are in the <a href="#observability">observability section</a>.</p>
+
+<h3>Protecting weights</h3>
+<p>Fine-tuned weights represent training data and compute, and sometimes they memorized sensitive data. Keep them in private storage with credentials scoped to the serving pods, encrypt at rest, and log access. For the highest-sensitivity cases, GPUs from the H100 generation onward support confidential-computing modes that encrypt traffic between the CPU's trusted environment and the GPU; it's a specialized setup with performance and tooling costs.</p>
+
+<h3>Supply chain</h3>
+<p>A replica should start from exactly the bytes you tested. Pin container images by digest (<code>image@sha256:…</code>) rather than by tag, since tags move. Pin model revisions to a commit hash, mirror them into your own storage, and serve offline (<code>HF_HUB_OFFLINE=1</code>) so nothing new is pulled at startup. Record the SHA-256 of every weight file when you publish it and check it before loading. Sign images and model artifacts (Sigstore's cosign is one option) and keep a bill of materials for the serving image.</p>
+<p>The file format matters too. Pickle-based checkpoints (<code>.bin</code>, <code>.pt</code>) can execute arbitrary code when loaded; safetensors can't. <code>trust_remote_code=True</code> is the same risk by another name, because it runs Python from the model repository. Review that code, pin it, or avoid it.</p>
+
+<!-- ================================================================== -->
+<h2 id="slo">SLOs, error budgets, and goodput</h2>
+
+<p>A service-level objective states what "working" means as a number over a window. For LLM serving, "available" isn't enough: a server that answers every request after 40 seconds is up and useless. Write SLOs on the latency metrics users feel, at percentiles, per model and traffic class.</p>
+
+<div class="grid2">
+  <div class="card"><div class="k">Example · interactive chat</div><h4>Latency SLOs</h4><p>Over 28 days: 99% of requests get a first token within 2 s (for prompts under 8K tokens), and 99% of streams have p95 inter-token latency under 60 ms. 99.9% of requests return no 5xx error.</p></div>
+  <div class="card blue"><div class="k">Example · batch extraction</div><h4>Throughput SLOs</h4><p>95% of submitted jobs finish within 24 h. No latency target per request. Can run on spare or preemptible capacity, and yields to interactive traffic.</p></div>
+</div>
+
+<p>Notice the prompt-length qualifier. TTFT grows with prompt length (prefill is real work), so an unconditional TTFT SLO punishes you for serving long-context requests. Bucket by prompt length or set the target per token of uncached prompt.</p>
+
+<div class="formula" data-name="Error budget and burn rate">
+  <div class="tex">$$\htmlClass{t1}{E} = (1 - \htmlClass{t2}{S})\cdot \htmlClass{t3}{N_{\text{req}}}, \qquad \htmlClass{t4}{\beta} = \frac{\htmlClass{t5}{e_{\text{obs}}}}{1 - \htmlClass{t2}{S}}, \qquad \htmlClass{t6}{t_{\text{exhaust}}} = \frac{\htmlClass{t7}{T_{\text{window}}}}{\htmlClass{t4}{\beta}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(E\)</dt><dd>error budget: how many requests may miss the SLO in the window</dd></div>
+    <div data-t="t2"><dt>\(S\)</dt><dd>SLO target as a fraction, e.g. 0.99</dd></div>
+    <div data-t="t3"><dt>\(N_{\text{req}}\)</dt><dd>requests in the SLO window</dd></div>
+    <div data-t="t4"><dt>\(\beta\)</dt><dd>burn rate: how many times faster than "exactly on budget" you're spending it</dd></div>
+    <div data-t="t5"><dt>\(e_{\text{obs}}\)</dt><dd>observed fraction of bad requests over a recent alert window</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{exhaust}}\)</dt><dd>time until the whole budget is gone at this rate</dd></div>
+    <div data-t="t7"><dt>\(T_{\text{window}}\)</dt><dd>SLO window length, e.g. 30 days</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The budget is the slack the SLO allows. Burn rate compares how fast you're using it now to the rate that would use it up exactly at the end of the window.</p>
+  <p class="why"><b>Why it matters</b>10M requests a month at a 99% TTFT SLO gives 100K slow requests of budget. If 5% of requests are slow right now, \(\beta = 5\) and the month's budget is gone in 6 days. Google's SRE workbook recommends alerting on burn rate over two windows: page when \(\beta \gt 14.4\) over both 1 hour and 5 minutes (2% of a 30-day budget in an hour), open a ticket for slower burns. Alerts on raw causes like GPU temperature fire too often and miss the outages that matter.</p>
+</div>
+
+<div class="formula" data-name="SLO attainment and goodput">
+  <div class="tex">$$\htmlClass{t1}{\text{goodput}} = \htmlClass{t2}{\lambda_{\text{served}}}\cdot \htmlClass{t3}{A}, \qquad \htmlClass{t3}{A} = \Pr\big[\htmlClass{t4}{\text{TTFT}} \le \htmlClass{t5}{T_1} \,\wedge\, \htmlClass{t6}{\text{ITL}_{p95}} \le \htmlClass{t7}{T_2}\big]$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>goodput</dt><dd>requests per second that met every latency target</dd></div>
+    <div data-t="t2"><dt>\(\lambda_{\text{served}}\)</dt><dd>requests per second completed</dd></div>
+    <div data-t="t3"><dt>\(A\)</dt><dd>SLO attainment: fraction of requests meeting all targets</dd></div>
+    <div data-t="t4"><dt>TTFT</dt><dd>time to first token of a request</dd></div>
+    <div data-t="t5"><dt>\(T_1\)</dt><dd>TTFT target</dd></div>
+    <div data-t="t6"><dt>\(\text{ITL}_{p95}\)</dt><dd>95th percentile inter-token gap within that request's stream</dd></div>
+    <div data-t="t7"><dt>\(T_2\)</dt><dd>ITL target</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Throughput, but only counting requests that were fast enough. <a href="13-eval-production.html#serving">Module 13</a> defines it with TPOT; the idea is the same.</p>
+  <p class="why"><b>Why it matters</b>Every capacity number in this module should be a goodput number. Throughput keeps rising past the knee of the latency curve while goodput collapses, so "max throughput" is the wrong thing to plan with.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="capacity">Capacity planning and cost</h2>
+
+<p>A GPU costs the same per hour whether it's busy or idle. Cost per token is therefore a utilization problem as much as a hardware problem. <a href="13-eval-production.html#cost">Module 13</a> covered the API-versus-self-host break-even; here we size a real fleet against a daily traffic curve.</p>
+
+<div class="formula" data-name="Cost per million tokens">
+  <div class="tex">$$\htmlClass{t1}{c_{\text{1M}}} = \frac{\htmlClass{t2}{P_{\text{hr}}}}{\htmlClass{t3}{X}\times 3600}\times 10^6, \qquad \htmlClass{t3}{X} = \htmlClass{t4}{G_{\text{rep}}}\cdot \htmlClass{t5}{u}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(c_{\text{1M}}\)</dt><dd>dollars per million tokens served</dd></div>
+    <div data-t="t2"><dt>\(P_{\text{hr}}\)</dt><dd>price per replica-hour (GPU price × GPUs per replica, plus host and overhead)</dd></div>
+    <div data-t="t3"><dt>\(X\)</dt><dd>tokens per second the replica actually serves, averaged over the hours you pay for</dd></div>
+    <div data-t="t4"><dt>\(G_{\text{rep}}\)</dt><dd>replica goodput at SLO, from a load test</dd></div>
+    <div data-t="t5"><dt>\(u\)</dt><dd>average utilization: actual traffic ÷ goodput, over the day</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Hourly price divided by tokens per hour, scaled to a million.</p>
+  <p class="why"><b>Why it matters</b>At an illustrative $3/hr and 2,500 tok/s at SLO, a fully busy replica costs 3 ÷ (2,500 × 3,600) × 10⁶ ≈ $0.33 per 1M tokens. Run it at 40% average utilization and it's $0.83. Utilization moves cost as much as the choice of GPU, and diurnal traffic caps it: a fleet sized for a peak that's 3× the daily average can't average much above 33% unless it scales down at night or fills the gaps with batch work.</p>
+</div>
+
+<div id="w-cost"></div>
+
+<h3>Ways to pay for GPUs</h3>
+<table class="t">
+  <thead><tr><th>Model</th><th>Price (relative, illustrative)</th><th>Catch</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td>On-demand</td><td>1×</td><td>Highest price; large GPUs may simply be unavailable when you need them</td><td>Peaks above your committed base</td></tr>
+    <tr><td>Reserved / committed use</td><td>Often 30–60% off</td><td>Pay for 1–3 years whether you use it or not</td><td>The base load that never goes away</td></tr>
+    <tr><td>Spot / preemptible</td><td>Often 60–90% off</td><td>Reclaimed with short notice (about 2 minutes on AWS, about 30 seconds on GCP and Azure); availability varies</td><td>Batch inference, evals, overflow with fallback</td></tr>
+    <tr><td>Owned hardware</td><td>Capex + power + people</td><td>Lead times, utilization risk, ops burden</td><td>Large, steady, long-lived workloads</td></tr>
+    <tr><td>Hosted API</td><td>Per token</td><td>No control over model, latency, or data path; you pay margin</td><td>Low or spiky volume, frontier models</td></tr>
+  </tbody>
+</table>
+<p>A common shape: reserve capacity for the overnight trough, add on-demand replicas for the daily peak, and run offline work on spot capacity with checkpointing so a reclaimed node only loses minutes of progress. Interactive serving on spot is possible but needs enough spare capacity to absorb a reclaimed node within the notice period, which a multi-minute cold start rarely allows.</p>
+
+<!-- ================================================================== -->
+<h2 id="reliability">Reliability engineering</h2>
+
+<p>GPUs fail more often than CPUs (memory errors, falling off the bus, NCCL hangs), and engines have bugs. Reliability for LLM serving is mostly ordinary distributed-systems practice, adjusted for requests that hold GPU memory for seconds or minutes while they run.</p>
+
+<h3>Health checks: liveness vs readiness</h3>
+<table class="t">
+  <thead><tr><th>Probe</th><th>Question</th><th>On failure</th><th>LLM-specific advice</th></tr></thead>
+  <tbody>
+    <tr><td>Startup</td><td>Has it finished loading?</td><td>Keep waiting (up to a limit)</td><td>Generous: covers download, load, warmup</td></tr>
+    <tr><td>Readiness</td><td>Should it receive new requests now?</td><td>Removed from load balancing, not restarted</td><td>Fail it while draining or when the queue is far past target</td></tr>
+    <tr><td>Liveness</td><td>Is it wedged beyond recovery?</td><td>Container restarted</td><td>Lenient: a restart costs a full cold start. A busy server answering <code>/health</code> slowly is not dead</td></tr>
+  </tbody>
+</table>
+<p>A <code>/health</code> endpoint that returns 200 while the GPU is hung is a common blind spot. A deeper check sends a tiny generation (one token) every minute from a separate prober and alerts if it fails; don't wire that into liveness, or a slow minute restarts healthy replicas.</p>
+
+<h3>Retries, idempotency, and backoff</h3>
+<p>Retry only what's safe and useful. Connection failures and 429/503 responses <em>before any token was streamed</em> are retryable on another replica, honouring <code>Retry-After</code>. A stream that fails halfway is not transparently retryable: a fresh request generates different text, so the client would see a duplicated or spliced answer. Surface the error, or resume by sending the partial answer back as context if the product supports it. For requests with side effects (tool calls that send email, charge cards), use an idempotency key so a retry doesn't repeat the action.</p>
+<p>Space retries with exponential backoff plus random jitter. "Full jitter" waits a uniformly random time between 0 and \(\min(\text{cap}, \text{base}\cdot 2^n)\) before attempt \(n\) (Brooker, 2015), which keeps clients that failed together from retrying together.</p>
+
+<div class="formula" data-name="Retry amplification">
+  <div class="tex">$$\htmlClass{t1}{\mathbb{E}[\text{attempts}]} = \frac{1 - \htmlClass{t2}{p}^{\,\htmlClass{t3}{R}+1}}{1 - \htmlClass{t2}{p}}, \qquad \htmlClass{t4}{M_{\text{worst}}} = (1 + \htmlClass{t3}{R})^{\htmlClass{t5}{k}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathbb{E}[\text{attempts}]\)</dt><dd>expected attempts per request at one layer</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>probability an attempt fails</dd></div>
+    <div data-t="t3"><dt>\(R\)</dt><dd>maximum retries per layer</dd></div>
+    <div data-t="t4"><dt>\(M_{\text{worst}}\)</dt><dd>worst-case multiplication of load on the bottom layer</dd></div>
+    <div data-t="t5"><dt>\(k\)</dt><dd>number of layers that each retry independently (client, gateway, router...)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>When failures are rare, retries cost almost nothing. When everything fails, every layer multiplies the load: three layers with 2 retries each send up to 27 attempts to the engine for one user request.</p>
+  <p class="why"><b>Why it matters</b>Overload causes failures; retries then add load, causing more failures. That feedback loop turns a brief overload into an outage. Retry at one layer only (usually the one closest to the client that can pick a different replica), and use a retry budget: retries may add at most about 10% to the request rate, beyond which they're dropped.</p>
+</div>
+
+<h3>Rollouts, draining, and failover</h3>
+<figure class="fig wide"><svg viewBox="0 0 960 340" id="fig-rollout"></svg>
+<figcaption>Three ways to ship a new model or engine version. A rolling update replaces replicas one at a time and must drain each one: mark it unready, let in-flight streams finish, then stop it. A canary sends a small slice of traffic to the new version and promotes it only if latency, error rate, and quality metrics hold. Blue-green brings up a full second fleet and switches traffic at once, keeping the old fleet warm for instant rollback, at the cost of double capacity during the switch.</figcaption></figure>
+
+<p>Model rollouts deserve more caution than code rollouts because a new model can be fast, error-free, and worse. Gate promotion on the online quality signals from <a href="13-eval-production.html#online">Module 13</a> (judge scores on sampled traffic, user feedback, refusal rate), not just on latency and 5xx. Shadow traffic, where the new version gets a copy of requests and its answers are logged but not returned, lets you compare quality before any user sees it.</p>
+
+<div class="formula" data-name="Availability of serial and redundant parts">
+  <div class="tex">$$\htmlClass{t1}{A_{\text{serial}}} = \prod_{\htmlClass{t2}{i}} \htmlClass{t3}{a_i}, \qquad \htmlClass{t4}{A_{\text{redundant}}} = 1 - (1 - \htmlClass{t5}{a})^{\htmlClass{t6}{k}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(A_{\text{serial}}\)</dt><dd>availability of a chain where every component must work</dd></div>
+    <div data-t="t2"><dt>\(i\)</dt><dd>index over components in the request path</dd></div>
+    <div data-t="t3"><dt>\(a_i\)</dt><dd>availability of component \(i\)</dd></div>
+    <div data-t="t4"><dt>\(A_{\text{redundant}}\)</dt><dd>availability with \(k\) independent copies, any one of which suffices</dd></div>
+    <div data-t="t5"><dt>\(a\)</dt><dd>availability of one copy (e.g. one region)</dd></div>
+    <div data-t="t6"><dt>\(k\)</dt><dd>number of independent copies</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Chains multiply down; redundancy multiplies the failure probability down. Gateway 99.95% × router 99.95% × engine pool 99.5% ≈ 99.4%. Two independent regions at 99.5% each give 1 − 0.005² ≈ 99.998% on paper.</p>
+  <p class="why"><b>Why it matters</b>The redundant formula assumes failures are independent and failover is instant. Neither holds in practice: regions share software bugs, bad config pushes, and upstream dependencies, and failover takes time. Treat the result as an upper bound. The second region also needs spare capacity for the failed region's traffic, which for GPUs is expensive and may not exist on demand.</p>
+</div>
+
+<h3>Fallbacks</h3>
+<p>When the primary model is overloaded or down, a degraded answer usually beats an error. Options, roughly in order of quality: route to the same model in another region, to a smaller or quantized model with more headroom, to a hosted API, to a cached answer for common queries (with the semantic-cache caveats from <a href="13-eval-production.html#cost">Module 13</a>), or to a clear "try again shortly" message. Decide the ladder ahead of time, test it regularly, and tag degraded responses in telemetry so they're visible in quality metrics.</p>
+
+<!-- ================================================================== -->
+<h2 id="observability">Observability</h2>
+
+<p><a href="13-eval-production.html#observe">Module 13</a> covered application-level tracing and quality monitoring. This section is the infrastructure side: what to scrape from engines and GPUs, how to trace a request through the platform, and how to log prompts without creating a liability.</p>
+
+<h3>Metric catalogue</h3>
+<table class="t">
+  <thead><tr><th>Metric</th><th>Source (vLLM names; check your version)</th><th>Watch for</th></tr></thead>
+  <tbody>
+    <tr><td>Request rate, by model / tenant / status</td><td>Gateway; <code>vllm:request_success_total</code></td><td>Traffic shifts, error spikes</td></tr>
+    <tr><td>TTFT histogram</td><td><code>vllm:time_to_first_token_seconds</code></td><td>p95/p99 vs SLO; correlate with queue time</td></tr>
+    <tr><td>Inter-token latency histogram</td><td><code>vllm:inter_token_latency_seconds</code></td><td>Rises as batches grow or long prefills interleave</td></tr>
+    <tr><td>End-to-end latency</td><td><code>vllm:e2e_request_latency_seconds</code></td><td>Mostly tracks output length; segment by it</td></tr>
+    <tr><td>Queue time</td><td><code>vllm:request_queue_time_seconds</code>, plus router-side queue</td><td>The first thing to grow under overload</td></tr>
+    <tr><td>Running / waiting requests</td><td><code>vllm:num_requests_running</code>, <code>vllm:num_requests_waiting</code></td><td>Batch size; waiting &gt; 0 sustained means short on capacity or KV</td></tr>
+    <tr><td>KV cache utilization</td><td><code>vllm:kv_cache_usage_perc</code> (older: <code>gpu_cache_usage_perc</code>)</td><td>Near 1.0 plus preemptions = memory-bound</td></tr>
+    <tr><td>Preemptions</td><td><code>vllm:num_preemptions_total</code></td><td>Any sustained rate means wasted recompute (<a href="19-engines.html#preempt">Module 19</a>)</td></tr>
+    <tr><td>Prefix-cache hit rate</td><td><code>vllm:prefix_cache_hits_total</code> ÷ <code>vllm:prefix_cache_queries_total</code></td><td>Drops after routing changes or prompt-template edits</td></tr>
+    <tr><td>Tokens in / out per second</td><td><code>vllm:prompt_tokens_total</code>, <code>vllm:generation_tokens_total</code></td><td>Throughput and cost attribution</td></tr>
+    <tr><td>GPU utilization, SM activity, memory, power, temperature, XID errors</td><td>DCGM exporter: <code>DCGM_FI_DEV_GPU_UTIL</code>, <code>DCGM_FI_PROF_SM_ACTIVE</code>, <code>DCGM_FI_DEV_FB_USED</code>, <code>DCGM_FI_DEV_POWER_USAGE</code>, <code>DCGM_FI_DEV_XID_ERRORS</code></td><td>Hardware faults, throttling; SM activity is more honest than GPU util</td></tr>
+    <tr><td>Error rates by type</td><td>Gateway and router: 429, 5xx, timeouts, client cancels</td><td>Cancels spiking often means latency got bad enough that users gave up</td></tr>
+  </tbody>
+</table>
+
+<div class="code" data-lang="bash" data-title="PromQL: the queries behind an LLM serving dashboard"><pre><code>
+# p95 TTFT per model over 5 minutes, from the engine's histogram
+histogram_quantile(0.95, sum by (le, model_name) (rate(vllm:time_to_first_token_seconds_bucket[5m])))
+
+# p99 inter-token latency
+histogram_quantile(0.99, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[5m])))
+
+# fraction of requests with TTFT over 1 s in the last hour (le must match an existing bucket bound)
+1 - sum(rate(vllm:time_to_first_token_seconds_bucket{le="1.0"}[1h]))
+  / sum(rate(vllm:time_to_first_token_seconds_count[1h]))
+
+# output tokens/s across the fleet, and per replica
+sum(rate(vllm:generation_tokens_total[1m]))
+sum by (pod) (rate(vllm:generation_tokens_total[1m]))
+
+# saturation: waiting requests and KV usage
+sum(vllm:num_requests_waiting)
+max by (pod) (vllm:kv_cache_usage_perc)
+
+# prefix-cache hit rate (token-weighted)
+sum(rate(vllm:prefix_cache_hits_total[5m])) / sum(rate(vllm:prefix_cache_queries_total[5m]))
+
+# preemptions per minute
+sum(rate(vllm:num_preemptions_total[5m])) * 60
+</code></pre></div>
+
+<div class="pitfall"><b>Pitfall · percentiles don't average</b>
+<p>Averaging each replica's p95 doesn't give the fleet's p95. Aggregate the histogram buckets first (<code>sum by (le)</code>), then take the quantile, as above. And <code>histogram_quantile</code> interpolates within buckets, so its precision is only as good as the bucket boundaries; if your SLO threshold sits between two wide buckets, the reported p95 can be off by a lot.</p>
+</div>
+
+<h3>Tracing across the platform</h3>
+<figure class="fig wide"><svg viewBox="0 0 960 330" id="fig-trace"></svg>
+<figcaption>One request's trace (illustrative timings). The gateway starts the trace and passes its context downstream in the W3C <code>traceparent</code> header; each hop adds its own spans. The waterfall makes the diagnosis immediate: here the platform overhead is a few milliseconds and the TTFT is dominated by 400 ms of engine queueing, so the fix is capacity or routing, not the proxy.</figcaption></figure>
+<p>Use OpenTelemetry for spans and propagate context through every hop, including the engine (vLLM can export OpenTelemetry traces when configured with an OTLP endpoint). Record token counts, cached tokens, model and adapter, tenant, and the replica that served the request as span attributes. Sample: tracing every token of every request is expensive; keep all errors and slow requests, and a fraction of the rest.</p>
+
+<h3>Logging prompts safely</h3>
+<ul>
+  <li>Redact before storage: run a PII and secrets detector at the gateway and replace matches with typed placeholders.</li>
+  <li>Separate the stores: metadata (lengths, latencies, IDs) can live long and be widely readable; raw prompts and completions get short retention and narrow access.</li>
+  <li>Never put prompt text, user IDs, or other unbounded values in metric labels. Besides the privacy problem, every distinct label value creates a new time series and will take down Prometheus.</li>
+  <li>Respect tenant contracts: some customers require zero retention, which means the platform must be able to turn content logging off per tenant.</li>
+</ul>
+
+<h3>Dashboards and alerts</h3>
+<p>One dashboard per model pool with the RED metrics (rate, errors, duration) plus saturation (queue, KV, preemptions), and a fleet view with GPU health. Page on SLO burn rate and on hard failures (all replicas unready, error rate spike). Ticket on slow burns, rising preemptions, falling prefix hit rate, and GPU XID errors. Don't page on GPU utilization.</p>
+
+<!-- ================================================================== -->
+<h2 id="loadtest">Benchmarking and load testing</h2>
+
+<p>Every number in the capacity formulas (goodput per replica, the latency knee, the headroom you need) comes from a load test. Most load tests in the wild measure the wrong thing. The usual mistakes follow.</p>
+
+<div class="grid2">
+  <div class="card bad"><div class="k">Closed loop</div><h4>N users, each waits for a reply before sending again</h4><p>Concurrency is fixed, so arrival rate falls automatically when the server slows down. The test can never overload the server, and it hides queueing. Fine for measuring "throughput at concurrency N"; misleading for latency under real traffic.</p></div>
+  <div class="card"><div class="k">Open loop</div><h4>Requests arrive on a schedule, regardless of replies</h4><p>Usually Poisson arrivals at rate \(\lambda\). When the server slows, requests pile up exactly as they would in production. This is the only way to see the latency explosion near capacity.</p></div>
+</div>
+
+<div class="formula" data-name="Poisson arrivals">
+  <div class="tex">$$\Pr[\htmlClass{t1}{\Delta t} \gt t] = e^{-\htmlClass{t2}{\lambda} t}, \qquad \htmlClass{t1}{\Delta t} = -\frac{\ln \htmlClass{t3}{U}}{\htmlClass{t2}{\lambda}}, \quad \htmlClass{t3}{U} \sim \text{Uniform}(0,1)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\Delta t\)</dt><dd>gap between consecutive arrivals, exponentially distributed with mean \(1/\lambda\)</dd></div>
+    <div data-t="t2"><dt>\(\lambda\)</dt><dd>target arrival rate, requests per second</dd></div>
+    <div data-t="t3"><dt>\(U\)</dt><dd>a uniform random number; the inverse-CDF trick turns it into an exponential gap</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Independent users produce arrivals with no memory: the time to the next one doesn't depend on how long you've waited. Draw each gap as minus log of a uniform, divided by the rate.</p>
+  <p class="why"><b>Why it matters</b>Poisson traffic is bursty in a specific way. At \(\lambda = 5\) req/s, the mean gap is 200 ms, but about 9.5% of gaps are under 20 ms (\(1 - e^{-0.1}\)). Evenly spaced test traffic hides those bursts and makes the server look better than it is. Real traffic is often burstier still; <code>vllm bench serve --burstiness</code> uses a gamma distribution where values below 1 are burstier than Poisson.</p>
+</div>
+
+<h3>The rest of the methodology</h3>
+<ul>
+  <li><strong>Realistic lengths.</strong> Sample prompt and output lengths from production logs, not a fixed 512 in / 128 out. Long tails dominate the queueing (the \(c_s^2\) term above). Enforce output length with <code>max_tokens</code> plus <code>ignore_eos</code> where the engine supports it, or the model will stop early and flatter your numbers.</li>
+  <li><strong>Realistic prefixes.</strong> If production shares system prompts, so should the test, or prefix caching gets no credit. If production doesn't, randomize prompts, or prefix caching gets too much.</li>
+  <li><strong>Warmup.</strong> Discard the first minute or so: compilation, cache population, and connection setup distort it.</li>
+  <li><strong>Coordinated omission</strong> (Gil Tene's term). If the load generator waits for a slow response before sending the next request, the requests that would have arrived during the stall are never sent, so they never record their terrible latency. Open-loop generation fixes most of it; also measure latency from the <em>scheduled</em> send time, so a load generator that falls behind its own schedule still records the delay.</li>
+  <li><strong>Enough samples for the percentile.</strong> A p99 from 200 requests rests on the 2 slowest; use thousands of requests per rate, and report several runs.</li>
+  <li><strong>Measure at SLO.</strong> Sweep the arrival rate upward. At each step record throughput, p50/p95/p99 TTFT and ITL. The capacity of the system is the highest rate at which the SLO percentiles still hold, not the highest rate it survived.</li>
+</ul>
+
+<figure class="fig"><div id="fig-knee"></div>
+<figcaption>A throughput-latency curve from an open-loop sweep (synthetic data with the typical shape). Each dot is one arrival rate. Latency stays nearly flat while the engine absorbs load into bigger batches, then turns sharply upward at the knee as queues form. The usable capacity is where the curve crosses the SLO line, noticeably left of the maximum throughput the server can be pushed to.</figcaption></figure>
+
+<div class="code" data-lang="bash" data-title="the quick version: vLLM's built-in benchmark"><pre><code>
+vllm bench serve \
+  --backend openai-chat --endpoint /v1/chat/completions \
+  --base-url http://localhost:9000 --model chat --tokenizer Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset-name random --random-input-len 1500 --random-output-len 250 \
+  --request-rate 8 --burstiness 1.0 --num-prompts 2000 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,95,99 \
+  --goodput ttft:1000 tpot:50
+</code></pre></div>
+
+<p>Built-in tools are good for engine comparisons. For your own workload, a small custom load generator is worth writing, because you control the prompt mix, the prefix sharing, and exactly what gets measured.</p>
+
+<div class="code" data-lang="python" data-title="loadgen.py: open-loop Poisson load test measuring TTFT and ITL"><pre><code>
+import asyncio, csv, math, random, sys, time
+import numpy as np
+from openai import AsyncOpenAI
+
+BASE_URL = sys.argv[1] if len(sys.argv) &gt; 1 else "http://localhost:9000/v1"
+client = AsyncOpenAI(base_url=BASE_URL, api_key="none", max_retries=0, timeout=300)
+MODEL = "chat"
+rnd = random.Random(0)
+
+# 16 shared "system prompts" (~1,500 tokens each) with Zipf-like popularity, like a multi-app fleet
+SYSTEMS = [f"You are assistant #{k} for product line {k}. " + "Follow the style guide strictly. " * 220
+           for k in range(16)]
+WEIGHTS = [1 / (k + 1) for k in range(16)]
+
+def sample_request():
+    system = rnd.choices(SYSTEMS, weights=WEIGHTS)[0]
+    user = f"Ticket {rnd.randrange(10**9)}: summarize the issue and propose a fix. " * rnd.randint(1, 20)
+    max_tokens = int(min(1024, rnd.lognormvariate(math.log(150), 0.8)))   # long-tailed outputs
+    return system, user, max(16, max_tokens)
+
+async def one_request(t_sched: float, results: list):
+    system, user, max_tokens = sample_request()
+    first, stamps, ok = None, [], True
+    try:
+        stream = await client.chat.completions.create(
+            model=MODEL, stream=True, max_tokens=max_tokens, temperature=0.7,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            extra_body={"ignore_eos": True},            # vLLM: generate exactly max_tokens
+        )
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                now = time.perf_counter()
+                first = first or now
+                stamps.append(now)
+    except Exception:
+        ok = False
+    end = time.perf_counter()
+    itl = np.diff(stamps) if len(stamps) &gt; 1 else np.array([np.nan])
+    results.append({
+        "t_sched": t_sched, "ok": ok,
+        "ttft": (first - t_sched) if first else np.nan,          # from the SCHEDULED time: no coordinated omission
+        "itl_p95": float(np.nanpercentile(itl, 95)), "n_chunks": len(stamps), "e2e": end - t_sched,
+    })
+
+async def run_rate(rate: float, duration: float = 180.0, warmup: float = 30.0):
+    results, tasks = [], []
+    t0 = time.perf_counter()
+    t_next = t0
+    while t_next - t0 &lt; duration:
+        delay = t_next - time.perf_counter()
+        if delay &gt; 0:
+            await asyncio.sleep(delay)
+        tasks.append(asyncio.create_task(one_request(t_next, results)))   # fire and forget: open loop
+        t_next += -math.log(1.0 - rnd.random()) / rate                     # Poisson inter-arrival
+    await asyncio.gather(*tasks)
+    keep = [r for r in results if r["t_sched"] - t0 &gt;= warmup]
+    good = [r for r in keep if r["ok"]]
+    ttft = np.array([r["ttft"] for r in good]); itl = np.array([r["itl_p95"] for r in good])
+    meets = np.mean((ttft &lt;= 1.0) &amp; (itl &lt;= 0.05)) if len(good) else 0.0
+    span = duration - warmup
+    return {"rate": rate, "n": len(keep), "errors": len(keep) - len(good),
+            "chunks_per_s": sum(r["n_chunks"] for r in good) / span,
+            "ttft_p50": np.nanpercentile(ttft, 50), "ttft_p95": np.nanpercentile(ttft, 95),
+            "ttft_p99": np.nanpercentile(ttft, 99), "itl_p95_median": np.nanmedian(itl),
+            "slo_attainment": meets, "goodput_rps": meets * len(good) / span}
+
+async def main():
+    rows = []
+    for rate in [1, 2, 4, 6, 8, 10, 12, 16]:
+        row = await run_rate(rate)
+        print({k: round(v, 3) if isinstance(v, float) else v for k, v in row.items()}, flush=True)
+        rows.append(row)
+    with open("sweep.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
+
+asyncio.run(main())
+</code></pre></div>
+
+<div class="flag"><b>Make sure the load generator isn't the bottleneck</b>
+<p>One Python process can drive a few hundred concurrent streams before its own event loop starts adding latency. Check client CPU during the run, compare a run at low rate against server-side TTFT metrics (they should agree within milliseconds), and split the load across processes or machines for big sweeps.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="playbook">The cost-optimization playbook</h2>
+
+<p>Once the fleet is measured, these are the levers, roughly in the order worth trying. Each "typical effect" is a rule of thumb from common experience; your workload decides the real number, so re-run the load test after each change and keep the ones that move goodput per dollar.</p>
+
+<table class="t">
+  <thead><tr><th>#</th><th>Lever</th><th>Typical effect (rule of thumb)</th><th>Risk / cost</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Measure the baseline: goodput at SLO per replica, utilization over the day, $/1M tokens</td><td>None by itself; every later step is judged against it</td><td>A day of work</td></tr>
+    <tr><td class="num">2</td><td>Right-size the model: a smaller or distilled model where task evals allow</td><td>Often the biggest single win; cost scales roughly with active parameters</td><td>Quality; prove it on your eval set (<a href="13-eval-production.html#evalset">Module 13</a>)</td></tr>
+    <tr><td class="num">3</td><td>Quantize: FP8 on GPUs that support it, INT4 weight-only for memory-bound decode (<a href="09-quantization.html#choose">Module 09</a>)</td><td>Commonly 1.3–2× more throughput per GPU, or the same model on a cheaper GPU</td><td>Small quality loss; measure it</td></tr>
+    <tr><td class="num">4</td><td>Right-size the GPU: match memory and bandwidth to the model and context length</td><td>Small models on big GPUs waste money; check $/goodput across 2–3 GPU types</td><td>Benchmark time</td></tr>
+    <tr><td class="num">5</td><td>Tune batching: <code>--max-num-seqs</code>, <code>--max-num-batched-tokens</code>, chunked prefill (<a href="19-engines.html#tuning">Module 19</a>)</td><td>Moves the knee; often tens of percent of goodput</td><td>Can hurt ITL; always tune against the SLO</td></tr>
+    <tr><td class="num">6</td><td>Prefix caching plus prompt layout: stable content first, volatile content last</td><td>Large TTFT and prefill savings for agent and RAG traffic</td><td>Nearly free</td></tr>
+    <tr><td class="num">7</td><td>Cache-aware routing (prefix affinity with bounded load)</td><td>Turns per-replica cache into fleet-level hit rate; matters more as replica count grows</td><td>Router complexity, hot-spot risk</td></tr>
+    <tr><td class="num">8</td><td>Speculative decoding (<a href="08-inference.html#spec">Module 08</a>)</td><td>Lower ITL at low-to-moderate batch sizes; gains shrink as batches fill</td><td>Extra memory and tuning; can reduce peak throughput</td></tr>
+    <tr><td class="num">9</td><td>Autoscale on in-flight requests; reserve the base, on-demand the peak</td><td>Raises average utilization; committed pricing on the base</td><td>Cold starts during ramps</td></tr>
+    <tr><td class="num">10</td><td>Move non-interactive work to batch: spot capacity, off-peak hours, offline engine mode</td><td>Uses the GPU hours you already pay for at night</td><td>Preemption handling</td></tr>
+    <tr><td class="num">11</td><td>Response caching for repeated requests (exact match first, semantic with care)</td><td>Highly workload-dependent; zero GPU cost per hit</td><td>Stale or wrong answers (<a href="13-eval-production.html#cost">Module 13</a>)</td></tr>
+  </tbody>
+</table>
+
+<div class="intuition"><b>Order matters</b>
+<p>Steps 2–4 change what a replica <em>is</em>, so they change every downstream measurement: tune batching after choosing the model, the quantization, and the GPU, not before. And re-check quality at the end; a stack of individually acceptable changes can add up to a regression that no single step showed.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on lab</h2>
+
+<p>Build a two-replica fleet behind your own router, load it open-loop, and see the effects from this module in your own numbers. A single 24 GB+ GPU (rented by the hour is fine) runs two small replicas; two GPUs make it more realistic. On a Mac, swap vLLM for two <code>llama-server</code> processes; the router and load generator work unchanged against any OpenAI-compatible server, but the prefix-cache metric names differ.</p>
+
+<h3>1. Two replicas</h3>
+<div class="code" data-lang="bash" data-title="launch two vLLM replicas on one GPU"><pre><code>
+pip install vllm openai fastapi uvicorn httpx numpy
+
+# each replica gets ~40% of GPU memory; metrics are served at /metrics on the same port
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen2.5-1.5B-Instruct --served-model-name chat \
+  --port 8001 --gpu-memory-utilization 0.40 --max-model-len 8192 --enable-prefix-caching &amp;
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen2.5-1.5B-Instruct --served-model-name chat \
+  --port 8002 --gpu-memory-utilization 0.40 --max-model-len 8192 --enable-prefix-caching &amp;
+
+# wait for both, then check the metrics endpoint
+until curl -sf localhost:8001/health &amp;&amp; curl -sf localhost:8002/health; do sleep 5; done
+curl -s localhost:8001/metrics | grep -E "^vllm:(num_requests|kv_cache_usage|prefix_cache)"
+</code></pre></div>
+
+<h3>2. A router with three policies</h3>
+<div class="code" data-lang="python" data-title="router.py: round-robin, least-loaded, or prefix affinity with bounded load"><pre><code>
+import hashlib, itertools, json, os
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+BACKENDS = os.environ.get("BACKENDS", "http://localhost:8001,http://localhost:8002").split(",")
+POLICY = os.environ.get("POLICY", "rr")          # rr | least | prefix
+PREFIX_CHARS = int(os.environ.get("PREFIX_CHARS", "2000"))
+EPS = 0.25                                       # bounded load: at most (1+EPS) x average in-flight
+
+app = FastAPI()
+client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=5.0))
+rr = itertools.cycle(range(len(BACKENDS)))
+inflight = [0] * len(BACKENDS)
+
+def prefix_key(body: dict) -&gt; int:
+    text = json.dumps(body.get("messages", []), sort_keys=True)[:PREFIX_CHARS]
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
+
+def pick(body: dict) -&gt; int:
+    n = len(BACKENDS)
+    if POLICY == "least":
+        return min(range(n), key=lambda i: inflight[i])
+    if POLICY == "prefix":
+        start = prefix_key(body) % n
+        cap = (1 + EPS) * (sum(inflight) + 1) / n
+        for step in range(n):                    # walk the ring until a replica is under the cap
+            i = (start + step) % n
+            if inflight[i] + 1 &lt;= cap or step == n - 1:
+                return i
+    return next(rr)
+
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    body = await req.json()
+    i = pick(body)
+    inflight[i] += 1
+    try:
+        upstream = await client.send(
+            client.build_request("POST", BACKENDS[i] + "/v1/chat/completions", json=body), stream=True)
+    except Exception:
+        inflight[i] -= 1
+        raise
+
+    async def relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:                                 # runs on normal end AND on client disconnect
+            await upstream.aclose()              # closing upstream makes the engine abort the sequence
+            inflight[i] -= 1
+
+    return StreamingResponse(relay(), status_code=upstream.status_code,
+                             media_type=upstream.headers.get("content-type"),
+                             headers={"x-backend": str(i)})
+
+# run:  POLICY=prefix uvicorn router:app --port 9000
+</code></pre></div>
+<p>The prefix key hashes the first 2,000 characters of the serialized messages. With long system prompts that's effectively "which system prompt", so requests sharing one go to the same replica. With short system prompts it starts including user text and degrades toward session affinity. Try a few values of <code>PREFIX_CHARS</code>, and think about why hashing token blocks (as engines do) would be more precise.</p>
+
+<h3>3. Sweep and compare</h3>
+<div class="code" data-lang="bash" data-title="run the sweep under each policy, and read hit rates from the engines"><pre><code>
+for policy in rr prefix; do
+  POLICY=$policy uvicorn router:app --port 9000 &amp;  ROUTER=$!
+  sleep 3
+  python loadgen.py http://localhost:9000/v1 | tee sweep-$policy.log
+  mv sweep.csv sweep-$policy.csv
+  for p in 8001 8002; do       # cumulative counters: diff before/after, or restart replicas between policies
+    curl -s localhost:$p/metrics | grep -E "^vllm:prefix_cache_(hits|queries)_total"
+  done
+  kill $ROUTER
+done
+</code></pre></div>
+
+<p>For a cleaner comparison, point a Prometheus server at both replicas (scrape <code>/metrics</code> every 5 s) and use the hit-rate and <code>histogram_quantile</code> queries from the observability section over the window of each run.</p>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have: (1) a plot of throughput (output tokens/s) against p95 TTFT for at least six arrival rates under one policy, with the knee and the SLO crossing (pick TTFT ≤ 1 s) marked; (2) a table comparing round-robin and prefix affinity at the same two arrival rates, with columns <em>prefix-cache hit rate · p50 TTFT · p95 TTFT · goodput</em>; (3) a one-paragraph explanation of the differences using the formulas in this module (fleet cache capacity, the queueing curve), including at least one thing that didn't match your prediction and why; and (4) a cancellation check: start a long stream through the router, kill the client, and show from <code>vllm:num_requests_running</code> that the engine dropped it within a second or two.</p>
+</div>
+
+<h3>Further reading</h3>
+<ul>
+  <li><a href="https://sre.google/workbook/alerting-on-slos/">Google SRE Workbook, "Alerting on SLOs"</a>: burn-rate alerting, worked through.</li>
+  <li><a href="https://arxiv.org/abs/1608.01350">Mirrokni, Thorup &amp; Zadimoghaddam, "Consistent Hashing with Bounded Loads"</a> (2016).</li>
+  <li><a href="https://arxiv.org/abs/2401.00588">Sheng et al., "Fairness in Serving Large Language Models"</a> (2024): the Virtual Token Counter.</li>
+  <li><a href="https://arxiv.org/abs/2401.09670">Zhong et al., "DistServe"</a> (2024): goodput as the serving objective.</li>
+  <li><a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">Brooker, "Exponential Backoff and Jitter"</a> (2015).</li>
+  <li><a href="https://gateway-api-inference-extension.sigs.k8s.io/">Kubernetes Gateway API Inference Extension</a>: model-aware routing on Kubernetes.</li>
+  <li><a href="https://docs.vllm.ai/">vLLM documentation</a>: the metrics, production deployment, and benchmarking pages in particular.</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="21-main" data-title="Check yourself · The serving platform">
+  <div class="q" data-answer="2"><p>Your fleet receives 30 requests/s with an average time in system of 10 s. Each replica is configured with <code>--max-num-seqs 48</code>. What's the minimum number of replicas just to hold the in-flight requests?</p>
+    <ol><li>1</li><li>4</li><li>7</li><li>30</li></ol>
+    <div class="explain">Little's law: \(L = \lambda W = 30 \times 10 = 300\) requests in flight. 300 / 48 = 6.25, so at least 7 replicas, before any headroom. With 70% target utilization you'd want 10.</div></div>
+  <div class="q" data-answer="0"><p>A replica's utilization goes from 80% to 90%. Using the M/M/1 model as intuition, what happens to mean time in system?</p>
+    <ol><li>It roughly doubles</li><li>It rises by about 12%</li><li>It stays the same until 100%</li><li>It rises by 10 percentage points</li></ol>
+    <div class="explain">\(W = \tau/(1-\rho)\): at 0.8 it's \(5\tau\), at 0.9 it's \(10\tau\). Halving the spare capacity doubles the wait, which is why the last stretch of utilization is so expensive in latency.</div></div>
+  <div class="q" data-answer="3"><p>You autoscale on GPU utilization with a 70% target. Under moderate traffic, what most likely happens?</p>
+    <ol><li>The fleet stays right-sized</li><li>The fleet scales to zero</li><li>Nothing, because GPU utilization is always 0 during decode</li><li>GPU utilization reads near 100% at modest load, so the fleet keeps scaling up and rarely scales down</li></ol>
+    <div class="explain">The standard GPU utilization metric is the fraction of time any kernel is running. Decode launches kernels continuously, so it saturates long before the GPU is out of capacity. Scale on in-flight requests or queue depth instead.</div></div>
+  <div class="q" data-answer="1"><p>A replica costs $4/hour and sustains 2,000 output tokens/s at your SLO. Averaged over the day it runs at 50% of that. What's the cost per million output tokens?</p>
+    <ol><li>About $0.28</li><li>About $1.11</li><li>About $0.56</li><li>About $2.00</li></ol>
+    <div class="explain">Actual throughput is 1,000 tok/s. 4 ÷ (1,000 × 3,600) × 10⁶ ≈ $1.11. At 100% utilization it would be $0.56; idle time doubles the cost.</div></div>
+  <div class="q" data-answer="2"><p>A closed-loop load test with 32 concurrent users reports p99 TTFT of 0.8 s. Production at the same average throughput sees p99 TTFT of 6 s. What's the most likely explanation?</p>
+    <ol><li>Production uses a different tokenizer</li><li>The test machine had a faster GPU</li><li>The closed loop throttled its own arrivals when the server slowed, hiding queueing; real traffic is open-loop and bursty</li><li>p99 can't be measured with 32 users</li></ol>
+    <div class="explain">In a closed loop, a slow response delays the next request, so the queue never grows and the slow periods are under-sampled (coordinated omission). Open-loop Poisson arrivals keep coming during stalls, as real users do.</div></div>
+  <div class="q" data-answer="1"><p>The client SDK, the gateway, and the router each retry failed requests up to 2 times. During an overload where nearly every attempt fails, how many attempts can one user request generate at the engine?</p>
+    <ol><li>6</li><li>27</li><li>9</li><li>3</li></ol>
+    <div class="explain">Each layer makes up to 3 attempts, and they nest: \((1+2)^3 = 27\). That multiplication is how retries turn overload into an outage. Retry at one layer, with a budget.</div></div>
+  <div class="q" data-answer="0"><p>A cold start for a 70B bf16 model (140 GB) on a node that's already up with the image cached: download at 1.4 GB/s, load at 7 GB/s, 60 s warmup. Which change helps most?</p>
+    <ol><li>A node-local NVMe cache of the weights at ~5 GB/s</li><li>A faster PCIe generation</li><li>Pre-pulling the container image</li><li>Disabling the readiness probe</li></ol>
+    <div class="explain">Download is 140/1.4 = 100 s, load 140/7 = 20 s, warmup 60 s, total ≈ 180 s. The download dominates; an NVMe cache cuts it to 28 s. Faster PCIe only attacks the 20 s load term (and the effective load rate is usually below PCIe peak anyway), and the image is already cached.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, widget, fmtNum, rng, palette, clamp } = C;
+
+  /* ============================================================ shared helpers */
+  const COLS = { ink: palette.ink, muted: palette.muted, green: palette.green, brick: palette.brick, blue: palette.blue, gold: palette.gold, plum: palette.plum, teal: palette.teal };
+  function canvas(id) {
+    const s = document.getElementById(id);
+    const defs = svg("defs");
+    Object.entries(COLS).forEach(([k, c]) => defs.appendChild(svg("marker", { id: id + "-" + k, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: c }))));
+    s.appendChild(defs);
+    const T = (x, y, t, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, "text-anchor": "middle", text: t }, o || {})));
+    const box = (x, y, w, h, o) => s.appendChild(svg("rect", Object.assign({ x, y, width: w, height: h, rx: 8, fill: "#fff", stroke: "rgba(28,27,25,.3)", "stroke-width": 1.2 }, o || {})));
+    const line = (pts, o) => {
+      o = o || {};
+      const c = o.color || "ink";
+      return s.appendChild(svg("path", { d: "M" + pts.map(p => p[0] + "," + p[1]).join(" L"), fill: "none", stroke: COLS[c] || c, "stroke-width": o.width || 1.4, "stroke-dasharray": o.dash || null, "marker-end": o.noarrow ? null : "url(#" + id + "-" + c + ")", "marker-start": o.both ? "url(#" + id + "-" + c + ")" : null }));
+    };
+    const node = (x, y, w, h, title, lines, o) => {
+      o = o || {};
+      box(x, y, w, h, { fill: o.fill || "#fff", stroke: o.stroke || "rgba(28,27,25,.3)", "stroke-dasharray": o.dash || null });
+      const n = (lines || []).length;
+      const ty = y + h / 2 - n * 6.5 + 4.5;
+      T(x + w / 2, ty, title, { "font-weight": 600, "font-size": o.fs || 13, fill: o.tcolor || palette.ink });
+      (lines || []).forEach((t, i) => T(x + w / 2, ty + 15 + i * 13, t, { "font-size": 11, fill: palette.muted }));
+    };
+    return { s, T, box, line, node };
+  }
+  const pct = (arr, p) => { if (!arr.length) return NaN; const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.max(0, Math.floor(p * (a.length - 1))))]; };
+  const fmtS = v => !isFinite(v) ? "∞" : v >= 100 ? fmtNum(v, 0) + " s" : v >= 10 ? fmtNum(v, 1) + " s" : v >= 1 ? fmtNum(v, 2) + " s" : fmtNum(v * 1000, 0) + " ms";
+  const money = v => "$" + (v >= 1e6 ? fmtNum(v / 1e6, 2) + "M" : v >= 1e4 ? fmtNum(v / 1e3, 1) + "K" : v >= 100 ? fmtNum(v, 0) : fmtNum(v, 2));
+  const ctlSeg = (parent, label, options, value, onChange) => {
+    const c = el("div", { class: "ctl" }, el("label", null, el("span", { text: label })));
+    const sg = seg(c, { options, value, onChange });
+    parent.appendChild(c);
+    return sg;
+  };
+
+  /* ============================================================ FIG: full stack */
+  (function () {
+    const cv = canvas("fig-stack");
+    const { s, T, line, node } = cv;
+    // bands
+    s.appendChild(svg("rect", { x: 10, y: 10, width: 940, height: 110, rx: 10, fill: "rgba(47,93,138,.05)", stroke: "rgba(47,93,138,.45)", "stroke-dasharray": "5 4" }));
+    s.appendChild(svg("rect", { x: 10, y: 140, width: 850, height: 262, rx: 10, fill: "rgba(28,27,25,.025)", stroke: "rgba(28,27,25,.25)", "stroke-dasharray": "5 4" }));
+    T(24, 40, "CONTROL PLANE", { "text-anchor": "start", class: "mono", "font-size": 12, fill: palette.blue, "font-weight": 600 });
+    T(24, 58, "seconds to minutes", { "text-anchor": "start", class: "mono", "font-size": 11, fill: palette.blue });
+    T(24, 76, "writes desired state", { "text-anchor": "start", class: "mono", "font-size": 11, fill: palette.blue });
+    T(24, 160, "DATA PLANE · per request, milliseconds", { "text-anchor": "start", class: "mono", "font-size": 12, fill: palette.ink, "font-weight": 600 });
+    // control boxes
+    const cfill = { fill: "#fbfcfe", stroke: "rgba(47,93,138,.5)" };
+    node(185, 30, 180, 72, "Tenant & quota config", ["API keys, rate limits", "priorities, adapters"], cfill);
+    node(400, 30, 180, 72, "Rollout controller", ["model versions", "canary weights, drain"], cfill);
+    node(615, 30, 160, 72, "Orchestrator", ["Kubernetes: place,", "start, stop replicas"], cfill);
+    node(795, 30, 145, 72, "Autoscaler", ["reads metrics,", "sets replica count"], cfill);
+    line([[795, 66], [777, 66]], { color: "blue" });
+    // data plane boxes
+    node(28, 222, 122, 96, "Client SDK", ["streaming parse", "timeouts", "retries, cancel"]);
+    node(190, 205, 170, 130, "Edge / API gateway", ["TLS, auth", "quotas, rate limits", "size caps", "tenant → model pool"]);
+    node(400, 205, 180, 130, "Request router", ["model / LoRA pool", "prefix / KV-aware", "least-loaded", "router queue"]);
+    [172, 247, 322].forEach((y, i) => node(630, y, 190, 62, "Engine replica " + (i + 1), ["vLLM / SGLang on GPU node", "batching · KV cache"], { fill: "rgba(26,122,82,.06)", stroke: "rgba(26,122,82,.5)" }));
+    // request path
+    line([[150, 258], [188, 258]]);
+    line([[360, 258], [398, 258]]);
+    [203, 278, 353].forEach(y => line([[580, 262], [628, y]]));
+    // token stream back
+    line([[189, 292], [152, 292]], { color: "green", dash: "5 4" });
+    line([[399, 292], [362, 292]], { color: "green", dash: "5 4" });
+    line([[629, 300], [582, 300]], { color: "green", dash: "5 4" });
+    // control arrows down
+    line([[275, 102], [275, 203]], { color: "blue", dash: "5 4" });
+    line([[490, 102], [490, 203]], { color: "blue", dash: "5 4" });
+    line([[695, 102], [695, 170]], { color: "blue", dash: "5 4" });
+    T(281, 185, "keys, limits", { "text-anchor": "start", "font-size": 10.5, fill: palette.blue, class: "mono" });
+    T(496, 185, "pools, weights %", { "text-anchor": "start", "font-size": 10.5, fill: palette.blue, class: "mono" });
+    T(701, 130, "place / stop", { "text-anchor": "start", "font-size": 10.5, fill: palette.blue, class: "mono" });
+    // storage + telemetry
+    node(630, 430, 190, 60, "Model artifact store", ["weights, tokenizer, adapters"], { fill: "rgba(122,63,110,.05)", stroke: "rgba(122,63,110,.5)" });
+    line([[725, 428], [725, 386]], { color: "plum", dash: "4 3" });
+    T(732, 414, "weights on cold start", { "text-anchor": "start", "font-size": 10.5, fill: palette.plum, class: "mono" });
+    node(190, 430, 390, 60, "Metrics · Logs · Traces", ["Prometheus · OpenTelemetry · DCGM exporter"], { fill: "rgba(154,123,34,.06)", stroke: "rgba(154,123,34,.55)" });
+    line([[275, 336], [275, 428]], { color: "gold", dash: "2 3" });
+    line([[490, 336], [490, 428]], { color: "gold", dash: "2 3" });
+    line([[630, 372], [605, 372], [605, 460], [582, 460]], { color: "gold", dash: "2 3" });
+    line([[385, 491], [385, 512], [900, 512], [900, 104]], { color: "gold", dash: "2 3" });
+    T(895, 300, "metrics", { "font-size": 10.5, fill: palette.gold, class: "mono", transform: "rotate(-90 895 300)" });
+    // legend
+    const ly = 532;
+    [["request", "ink", null], ["token stream (SSE)", "green", "5 4"], ["telemetry", "gold", "2 3"], ["desired state", "blue", "5 4"], ["artifacts", "plum", "4 3"]].forEach(([t, c, d], i) => {
+      const x = 40 + i * 175;
+      s.appendChild(svg("line", { x1: x, x2: x + 26, y1: ly - 4, y2: ly - 4, stroke: COLS[c], "stroke-width": 2, "stroke-dasharray": d }));
+      T(x + 32, ly, t, { "text-anchor": "start", "font-size": 11, fill: palette.muted });
+    });
+  })();
+
+  /* ============================================================ FIG: SSE sequence */
+  (function () {
+    const cv = canvas("fig-sse");
+    const { s, T, line, box } = cv;
+    const X = { c: 90, g: 300, r: 510, e: 750 };
+    [["Client", X.c], ["Gateway", X.g], ["Router", X.r], ["Engine", X.e]].forEach(([t, x]) => {
+      box(x - 60, 12, 120, 30, { fill: "#fbfaf7" });
+      T(x, 32, t, { "font-weight": 600 });
+      s.appendChild(svg("line", { x1: x, x2: x, y1: 42, y2: 400, stroke: palette.faint, "stroke-dasharray": "3 4" }));
+    });
+    const msg = (x1, x2, y, label, o) => {
+      o = o || {};
+      line([[x1, y], [x2 + (x2 > x1 ? -3 : 3), y]], { color: o.color || "ink", dash: o.dash });
+      T((x1 + x2) / 2, y - 6, label, { "font-size": 11, fill: COLS[o.color || "ink"], class: "mono" });
+    };
+    msg(X.c, X.g, 72, "POST /v1/chat/completions  stream=true");
+    box(X.g - 62, 82, 124, 22, { fill: "rgba(47,93,138,.08)", stroke: "rgba(47,93,138,.4)", rx: 4 });
+    T(X.g, 97, "auth · quota · size caps", { "font-size": 10.5, fill: palette.blue });
+    msg(X.g, X.r, 124, "forward");
+    msg(X.r, X.e, 146, "pick replica (prefix-aware)");
+    box(X.e - 14, 152, 28, 38, { fill: "rgba(154,123,34,.25)", stroke: "none", rx: 3 });
+    T(X.e + 22, 175, "queue", { "text-anchor": "start", "font-size": 11, fill: palette.gold });
+    box(X.e - 14, 190, 28, 40, { fill: "rgba(47,93,138,.3)", stroke: "none", rx: 3 });
+    T(X.e + 22, 214, "prefill", { "text-anchor": "start", "font-size": 11, fill: palette.blue });
+    box(X.e - 14, 230, 28, 100, { fill: "rgba(26,122,82,.3)", stroke: "none", rx: 3 });
+    T(X.e + 22, 270, "decode:", { "text-anchor": "start", "font-size": 11, fill: palette.green });
+    T(X.e + 22, 284, "one token per step", { "text-anchor": "start", "font-size": 11, fill: palette.green });
+    [240, 262, 284].forEach((y, i) => msg(X.e - 16, X.c, y, i === 0 ? "data: {\"delta\": {\"content\": \"Hel\"}}" : "", { color: "green", dash: "5 4" }));
+    // TTFT bracket
+    s.appendChild(svg("path", { d: `M${X.c - 18},72 L${X.c - 26},72 L${X.c - 26},240 L${X.c - 18},240`, fill: "none", stroke: palette.ink, "stroke-width": 1 }));
+    T(X.c - 34, 156, "TTFT", { "font-size": 11, class: "mono", transform: `rotate(-90 ${X.c - 34} 156)` });
+    // disconnect
+    T(X.c, 314, "✕", { "font-size": 18, fill: palette.brick, "font-weight": 700 });
+    T(X.c + 14, 312, "client disconnects (stop button, tab closed, own timeout)", { "text-anchor": "start", "font-size": 11, fill: palette.brick });
+    msg(X.g, X.r, 340, "close upstream", { color: "brick" });
+    msg(X.r, X.e - 16, 362, "close upstream", { color: "brick" });
+    box(X.e - 70, 370, 140, 26, { fill: "rgba(176,67,46,.08)", stroke: "rgba(176,67,46,.55)", rx: 5 });
+    T(X.e, 388, "abort · free KV blocks", { "font-size": 11.5, fill: palette.brick, "font-weight": 600 });
+    T(450, 428, "If any hop keeps its upstream connection open, the engine keeps decoding to max_tokens for nobody.", { "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ============================================================ FIG: round-robin vs least work */
+  (function () {
+    const cv = canvas("fig-rr");
+    const { s, T } = cv;
+    const dur = [8, 1, 1, 7, 1, 1, 6, 1, 1];
+    function schedule(policy) {
+      const free = [0, 0, 0], out = [];
+      dur.forEach((d, i) => {
+        const t = i;
+        let r;
+        if (policy === "rr") r = i % 3;
+        else { r = 0; for (let k = 1; k < 3; k++) if (Math.max(0, free[k] - t) < Math.max(0, free[r] - t)) r = k; }
+        const start = Math.max(t, free[r]);
+        free[r] = start + d;
+        out.push({ i, r, t, start, end: start + d, d });
+      });
+      return out;
+    }
+    const A = schedule("rr"), B = schedule("least");
+    const tmax = Math.max(...A.map(o => o.end), ...B.map(o => o.end));
+    const panel = (x0, title, sch) => {
+      const W = 380, sx = t => x0 + 30 + t / tmax * (W - 40);
+      T(x0 + W / 2, 20, title, { "font-weight": 600, "font-size": 13 });
+      ["A", "B", "C"].forEach((nm, r) => {
+        const y = 40 + r * 56;
+        T(x0 + 14, y + 26, nm, { class: "mono", "font-size": 12, fill: palette.muted });
+        s.appendChild(svg("line", { x1: sx(0), x2: sx(tmax), y1: y + 44, y2: y + 44, stroke: palette.line }));
+      });
+      sch.forEach(o => {
+        const y = 40 + o.r * 56;
+        if (o.start > o.t) {
+          s.appendChild(svg("rect", { x: sx(o.t), y: y + 30, width: sx(o.start) - sx(o.t), height: 8, rx: 2, fill: "rgba(154,123,34,.35)" }));
+        }
+        const long = o.d >= 5;
+        s.appendChild(svg("rect", { x: sx(o.start) + 0.5, y: y + 6, width: Math.max(2, sx(o.end) - sx(o.start) - 1), height: 22, rx: 3, fill: long ? "rgba(176,67,46,.55)" : "rgba(26,122,82,.55)" }));
+        T((sx(o.start) + sx(o.end)) / 2, y + 21, String(o.d), { "font-size": 10.5, fill: "#fff", class: "mono", "font-weight": 600 });
+      });
+      const ay = 40 + 3 * 56 + 4;
+      for (let t = 0; t <= tmax; t += 3) {
+        s.appendChild(svg("line", { x1: sx(t), x2: sx(t), y1: ay - 4, y2: ay + 2, stroke: palette.ink }));
+        T(sx(t), ay + 14, String(t), { "font-size": 10, class: "mono", fill: palette.muted });
+      }
+      const waits = sch.map(o => o.start - o.t);
+      const shortW = sch.filter(o => o.d < 5).map(o => o.start - o.t);
+      T(x0 + W / 2, ay + 36, `mean wait ${fmtNum(waits.reduce((a, b) => a + b, 0) / waits.length, 1)} s · max ${fmtNum(Math.max(...waits), 0)} s · short jobs ${fmtNum(shortW.reduce((a, b) => a + b, 0) / shortW.length, 1)} s`, { "font-size": 11, fill: palette.ink });
+    };
+    panel(20, "Round-robin", A);
+    panel(480, "Least outstanding work", B);
+    T(450, 292, "gold strip = waiting in a replica's queue · brick = long request · green = short · axis in seconds", { "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ============================================================ WIDGET: load balancer simulation */
+  (function () {
+    const w = widget("w-lb", { title: "Route a request stream across replicas", kicker: "Simulation", note: "Each replica is modelled as 8 batch slots with a FIFO queue. Service time = uncached prompt tokens ÷ 4,000 tok/s + output tokens × 30 ms; outputs are long-tailed (lognormal, median 150). Each replica's prefix cache holds its K most recent prefixes (LRU). Load is relative to fleet capacity with <em>no</em> cache hits, so better routing runs the same traffic at lower effective load. Strict affinity hashes each prefix to one replica. KV-aware scores every replica by expected queueing plus uncached prefill, a simplified version of what llm-d's and Dynamo's schedulers do. The numbers are illustrative; the ranking is the point." });
+    const P = { N: 4, load: 0.8, groups: 12, skew: 1.0, prefix: 6000, cache: 3 };
+    let view = "kv";
+    slider(w.controls, { label: "Replicas", min: 2, max: 16, step: 1, value: P.N, fmt: v => String(v), onInput: v => { P.N = v; draw(); } });
+    slider(w.controls, { label: "Offered load", min: 0.4, max: 1.05, step: 0.01, value: P.load, fmt: v => Math.round(v * 100) + "% of no-cache capacity", onInput: v => { P.load = v; draw(); } });
+    slider(w.controls, { label: "Distinct shared prefixes", min: 1, max: 64, step: 1, value: P.groups, fmt: v => String(v), onInput: v => { P.groups = v; draw(); } });
+    slider(w.controls, { label: "Popularity skew (Zipf s)", min: 0, max: 2, step: 0.1, value: P.skew, fmt: v => v.toFixed(1) + (v === 0 ? " (uniform)" : ""), onInput: v => { P.skew = v; draw(); } });
+    slider(w.controls, { label: "Prefix length", min: 1000, max: 16000, step: 500, value: P.prefix, fmt: v => fmtNum(v / 1000, 1) + "K tokens", onInput: v => { P.prefix = v; draw(); } });
+    slider(w.controls, { label: "Prefixes cached per replica (K)", min: 1, max: 16, step: 1, value: P.cache, fmt: v => String(v), onInput: v => { P.cache = v; draw(); } });
+    const POL = [["rr", "Round-robin"], ["least", "Least outstanding requests"], ["aff", "Strict prefix affinity"], ["kv", "KV-aware (cache + load score)"]];
+    const tableBox = el("div", { style: { overflowX: "auto" } });
+    w.body.appendChild(tableBox);
+    const vc = ctlSeg(w.body, "Per-replica work share for", POL.map(([v, l]) => ({ value: v, label: l.split(" (")[0] })), view, v => { view = v; draw(); });
+    vc.el.parentNode.style.marginTop = "10px";
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 170 });
+    const set = stats(w.body, [{ key: "lam", label: "Arrival rate" }, { key: "best", label: "Best p95 TTFT" }, { key: "hit", label: "Hit rate (selected)" }, { key: "imb", label: "Imbalance (selected)" }]);
+
+    const RPRE = 4000, TPOT = 0.03, S = 8, NREQ = 3000;
+    function gen() {
+      const R = rng(17);
+      const wts = Array.from({ length: P.groups }, (_, k) => 1 / Math.pow(k + 1, P.skew));
+      const tot = wts.reduce((a, b) => a + b, 0);
+      const cum = []; let acc = 0; wts.forEach(v => { acc += v / tot; cum.push(acc); });
+      const meanU = 300 * Math.exp(0.32), meanO = 150 * Math.exp(0.5);
+      const meanSvc = (P.prefix + meanU) / RPRE + meanO * TPOT;
+      const lambda = P.load * P.N * S / meanSvc;
+      const reqs = []; let t = 0;
+      for (let i = 0; i < NREQ; i++) {
+        t += -Math.log(1 - R()) / lambda;
+        const u0 = R(); let g = cum.findIndex(c => u0 <= c); if (g < 0) g = P.groups - 1;
+        const u = Math.max(10, Math.round(300 * Math.exp(0.8 * R.normal())));
+        const o = Math.max(1, Math.min(2000, Math.round(150 * Math.exp(1.0 * R.normal()))));
+        reqs.push({ t, g, u, o });
+      }
+      return { reqs, lambda, meanSvc };
+    }
+    const hashG = g => ((Math.imul(g + 1, 2654435761) >>> 0) >>> 7);
+    function sim(policy, st) {
+      const N = P.N;
+      const slots = Array.from({ length: N }, () => new Array(S).fill(0));
+      const fin = Array.from({ length: N }, () => []);
+      const lru = Array.from({ length: N }, () => []);
+      const busy = new Array(N).fill(0);
+      const qd = [], ttft = [];
+      let rrI = 0, hits = 0, cnt = 0;
+      const warm = Math.floor(st.reqs.length * 0.1);
+      st.reqs.forEach((q, idx) => {
+        const out = fin.map((f, r) => { const k = f.filter(x => x > q.t); fin[r] = k; return k.length; });
+        let r = 0;
+        if (policy === "rr") r = rrI++ % N;
+        else if (policy === "aff") r = hashG(q.g) % N;
+        else if (policy === "least") {
+          let best = Infinity;
+          for (let k = 0; k < N; k++) { const j = (idx + k) % N; if (out[j] < best) { best = out[j]; r = j; } }
+        } else {
+          let best = Infinity;
+          for (let k = 0; k < N; k++) {
+            const j = (idx + k) % N;
+            const cached = lru[j].indexOf(q.g) >= 0;
+            const cost = Math.max(0, out[j] - S + 1) / S * st.meanSvc + 0.15 * out[j] / S + (q.u + (cached ? 0 : P.prefix)) / RPRE;
+            if (cost < best) { best = cost; r = j; }
+          }
+        }
+        const sl = slots[r]; let m = 0;
+        for (let k = 1; k < S; k++) if (sl[k] < sl[m]) m = k;
+        const start = Math.max(q.t, sl[m]);
+        const L = lru[r]; const pos = L.indexOf(q.g); const hit = pos >= 0;
+        if (hit) L.splice(pos, 1);
+        L.push(q.g); if (L.length > P.cache) L.shift();
+        const pre = (q.u + (hit ? 0 : P.prefix)) / RPRE;
+        const svc = pre + q.o * TPOT;
+        sl[m] = start + svc; fin[r].push(start + svc); busy[r] += svc;
+        if (idx >= warm) { qd.push(start - q.t); ttft.push(start - q.t + pre); cnt++; if (hit) hits++; }
+      });
+      const mean = busy.reduce((a, b) => a + b, 0) / N;
+      return { p50: pct(qd, 0.5), p95: pct(qd, 0.95), t95: pct(ttft, 0.95), hit: hits / cnt, imb: Math.max(...busy) / mean, busy };
+    }
+    function draw() {
+      const st = gen();
+      const res = {};
+      POL.forEach(([k]) => { res[k] = sim(k, st); });
+      const cols = [["p50", "p50 queue", false, fmtS], ["p95", "p95 queue", false, fmtS], ["t95", "p95 TTFT", false, fmtS], ["hit", "prefix hit rate", true, v => Math.round(v * 100) + "%"], ["imb", "load imbalance (max/mean)", false, v => fmtNum(v, 2) + "×"]];
+      const table = el("table", { class: "t lbtable", style: { margin: "0" } });
+      table.appendChild(el("thead", null, el("tr", null, [el("th", { text: "Policy" })].concat(cols.map(c => el("th", { class: "num", text: c[1] }))))));
+      const tb = el("tbody"); table.appendChild(tb);
+      POL.forEach(([k, label]) => {
+        const tr = el("tr", { class: k === view ? "sel" : "" }, [el("td", { text: label })]);
+        cols.forEach(([key, , higher, f]) => {
+          const vals = POL.map(([kk]) => res[kk][key]);
+          const best = higher ? Math.max(...vals) : Math.min(...vals), worst = higher ? Math.min(...vals) : Math.max(...vals);
+          const v = res[k][key];
+          tr.appendChild(el("td", { class: "num" + (v === best ? " best" : v === worst ? " worst" : ""), text: f(v) }));
+        });
+        tb.appendChild(tr);
+      });
+      tableBox.innerHTML = "";
+      tableBox.appendChild(table);
+      const sel = res[view];
+      const total = sel.busy.reduce((a, b) => a + b, 0);
+      const share = sel.busy.map(b => 100 * b / total);
+      const fair = 100 / P.N;
+      B.draw(share.map((_, i) => "R" + (i + 1)), share, { max: Math.max(...share, fair * 1.6), colors: share.map(v => v > fair * 1.25 ? palette.brick : v < fair * 0.75 ? palette.gold : palette.green), fmt: v => fmtNum(v, 0) + "%" });
+      const bestT = Math.min(...POL.map(([k]) => res[k].t95));
+      const bestName = POL.find(([k]) => res[k].t95 === bestT)[1];
+      set("lam", fmtNum(st.lambda, 1) + " req/s", null, "Poisson, " + P.N + " replicas × " + S + " slots");
+      set("best", fmtS(bestT), "good", bestName);
+      set("hit", Math.round(sel.hit * 100) + "%", sel.hit > 0.7 ? "good" : sel.hit > 0.35 ? "warn" : "bad", POL.find(([k]) => k === view)[1]);
+      set("imb", fmtNum(sel.imb, 2) + "×", sel.imb < 1.15 ? "good" : sel.imb < 1.5 ? "warn" : "bad", "1.00× = perfectly even work");
+    }
+    draw();
+  })();
+
+  /* ============================================================ WIDGET: queueing curve */
+  (function () {
+    const w = widget("w-queue", { title: "Arrival rate vs capacity: where latency explodes", kicker: "Interactive", note: "Pooled curve: M/M/c (Erlang C) waiting time scaled by (1 + c<sub>s</sub>²)/2, the Allen–Cunneen approximation. Separate-queues curve: c independent M/G/1 queues, each receiving 1/c of the traffic (Pollaczek–Khinchine, exact for that model). Both assume Poisson arrivals and a fixed service rate per server; a real engine's service rate depends on batch size, so use the measured capacity at SLO as c·μ." });
+    const P = { tau: 2, c: 4, rho: 0.7, cs: 1.5, slo: 6 };
+    slider(w.controls, { label: "Mean service time τ", min: 0.5, max: 10, step: 0.5, value: P.tau, fmt: v => v + " s", onInput: v => { P.tau = v; draw(); } });
+    slider(w.controls, { label: "Servers c (replicas)", min: 1, max: 16, step: 1, value: P.c, fmt: v => String(v), onInput: v => { P.c = v; draw(); } });
+    slider(w.controls, { label: "Arrival rate (utilization ρ)", min: 0.05, max: 0.98, step: 0.01, value: P.rho, fmt: v => Math.round(v * 100) + "% of capacity", onInput: v => { P.rho = v; draw(); } });
+    slider(w.controls, { label: "Service-time variability c_s", min: 0, max: 3, step: 0.1, value: P.cs, fmt: v => v.toFixed(1) + (v === 1 ? " (exponential)" : v === 0 ? " (identical)" : ""), onInput: v => { P.cs = v; draw(); } });
+    slider(w.controls, { label: "SLO on mean time in system", min: 1, max: 60, step: 1, value: P.slo, fmt: v => v + " s", onInput: v => { P.slo = v; draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "lam", label: "Arrival rate λ" }, { key: "wp", label: "W, pooled queue" }, { key: "ws", label: "W, separate queues" }, { key: "L", label: "In flight L = λW" }, { key: "max", label: "Max load meeting SLO" }]);
+    function erlangC(c, a) { let B = 1; for (let k = 1; k <= c; k++) B = a * B / (k + a * B); const r = a / c; return B / (1 - r + r * B); }
+    const Wpool = rho => { const a = rho * P.c; const Cw = erlangC(P.c, a); return P.tau + Cw * P.tau / (P.c - a) * (1 + P.cs * P.cs) / 2; };
+    const Wsplit = rho => P.tau + rho * P.tau * (1 + P.cs * P.cs) / (2 * (1 - rho));
+    let host = null;
+    function draw() {
+      if (host) wrap.removeChild(host);
+      host = el("div"); wrap.appendChild(host);
+      const ymax = Math.max(P.slo * 2.2, P.tau * 4);
+      const Pl = plot(host, { width: 760, height: 300, x: [0, 1], y: [0, ymax], xlabel: "utilization ρ = λ / (c μ)", ylabel: "mean time in system W (s)", xfmt: v => Math.round(v * 100) + "%" });
+      let lo = 0.001, hi = 0.999;
+      if (Wpool(lo) > P.slo) hi = lo; else for (let i = 0; i < 50; i++) { const m = (lo + hi) / 2; if (Wpool(m) <= P.slo) lo = m; else hi = m; }
+      const rmax = lo;
+      Pl.draw([
+        { band: [0.8, 1], color: palette.brick, opacity: 0.06 },
+        { fn: x => x < 0.995 ? Wsplit(x) : NaN, color: palette.brick, label: P.c + " separate queues (static assignment)" },
+        { fn: x => x < 0.995 ? Wpool(x) : NaN, color: palette.green, label: "one pooled queue (load-aware routing)" },
+        { hline: P.slo, color: palette.ink, label: "SLO " + P.slo + " s" },
+        { vline: rmax, color: palette.green, dash: "3 3" },
+        { marker: [P.rho, Math.min(Wsplit(P.rho), ymax * 0.98)], color: palette.brick },
+        { marker: [P.rho, Math.min(Wpool(P.rho), ymax * 0.98)], color: palette.green, label: "you are here" },
+        { text: [0.81, ymax * 0.06], label: "ρ > 80%: little headroom", color: palette.brick }
+      ]);
+      const lam = P.rho * P.c / P.tau, wp = Wpool(P.rho), ws = Wsplit(P.rho);
+      set("lam", fmtNum(lam, 2) + " req/s", null, "capacity " + fmtNum(P.c / P.tau, 2) + " req/s");
+      set("wp", fmtS(wp), wp <= P.slo ? "good" : "bad", "queue " + fmtS(wp - P.tau));
+      set("ws", fmtS(ws), ws <= P.slo ? "good" : "bad", "queue " + fmtS(ws - P.tau));
+      set("L", fmtNum(lam * wp, 1), null, "requests (pooled), Little's law");
+      set("max", Math.round(rmax * 100) + "%", rmax >= 0.7 ? "good" : rmax >= 0.5 ? "warn" : "bad", fmtNum(rmax * P.c / P.tau, 2) + " req/s, pooled");
+    }
+    draw();
+  })();
+
+  /* ============================================================ WIDGET: autoscaling */
+  (function () {
+    const w = widget("w-autoscale", { title: "Autoscaling a traffic spike: signal choice and scale-up lag", kicker: "Simulation", note: "Demand is in units of one replica's capacity at SLO. The autoscaler runs every 30 s with the HPA rule desired = ⌈ready × signal ÷ target⌉, may at most double per minute, and waits 10 minutes before scaling down. New replicas become ready after the cold-start time. Backlog accumulates whenever demand exceeds ready capacity; queue wait ≈ backlog ÷ capacity. Waiting requests count toward the in-flight signal, so a long cold start builds a backlog that makes the autoscaler overshoot, as real queue-driven scalers do. GPU utilization is modelled as saturating at 25% load (any running kernel counts as busy); CPU utilization barely moves with load. Simplified on purpose." });
+    const P = { mult: 3, ramp: 10, cold: 6, sig: "inflight", target: 0.7 };
+    slider(w.controls, { label: "Spike size", min: 1, max: 5, step: 0.25, value: P.mult, fmt: v => v + "× base", onInput: v => { P.mult = v; draw(); } });
+    slider(w.controls, { label: "Spike ramp time", min: 1, max: 60, step: 1, value: P.ramp, fmt: v => v + " min", onInput: v => { P.ramp = v; draw(); } });
+    slider(w.controls, { label: "Cold start", min: 0.5, max: 15, step: 0.5, value: P.cold, fmt: v => v + " min", onInput: v => { P.cold = v; draw(); } });
+    slider(w.controls, { label: "Target", min: 0.5, max: 0.9, step: 0.05, value: P.target, fmt: v => Math.round(v * 100) + "%", onInput: v => { P.target = v; draw(); } });
+    select(w.controls, { label: "Scaling signal", options: [{ value: "inflight", label: "In-flight requests per replica (running + waiting)" }, { value: "gpu", label: "GPU utilization (nvidia-smi)" }, { value: "cpu", label: "CPU utilization" }], value: P.sig, onChange: v => { P.sig = v; draw(); } });
+    const wrap1 = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap1);
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "8px" } }); w.body.appendChild(wrap2);
+    const set = stats(w.body, [{ key: "wait", label: "Worst queue wait" }, { key: "bad", label: "Minutes with wait > 2 s" }, { key: "rh", label: "Replica-hours" }, { key: "peak", label: "Max replicas" }]);
+    const BASE = 4, DT = 15, TM = 180, MINR = 2, MAXR = 40;
+    function demand(tm) {
+      const t0 = 40, t1 = t0 + P.ramp, t2 = 110, t3 = 130;
+      let f = 1;
+      if (tm >= t0 && tm < t1) f = 1 + (P.mult - 1) * (tm - t0) / P.ramp;
+      else if (tm >= t1 && tm < t2) f = P.mult;
+      else if (tm >= t2 && tm < t3) f = P.mult - (P.mult - 1) * (tm - t2) / (t3 - t2);
+      return BASE * f * (1 + 0.04 * Math.sin(tm / 3.1));
+    }
+    let h1 = null, h2 = null;
+    function draw() {
+      let ready = Math.ceil(BASE / P.target), pending = [], Q = 0, lastUp = -999;
+      const hist = [], D = [], RD = [], SP = [], WT = [];
+      let rh = 0, worst = 0, bad = 0, peak = ready;
+      const steps = TM * 60 / DT;
+      for (let i = 0; i <= steps; i++) {
+        const t = i * DT, tm = t / 60;
+        pending = pending.filter(p => { if (p <= t) { ready++; return false; } return true; });
+        const d = demand(tm), cap = ready;
+        Q = Math.max(0, Q + (d - cap) * DT);
+        const wait = Q / Math.max(cap, 1e-9);
+        const f = (d + Q / 120) / cap;
+        let sigv = P.sig === "inflight" ? f : P.sig === "gpu" ? Math.min(1, 4 * f) : 0.12 + 0.18 * Math.min(f, 1);
+        if (i % 2 === 0) {
+          let desired = Math.ceil(ready * sigv / P.target - 1e-9);
+          hist.push({ t, desired });
+          while (hist.length && hist[0].t < t - 600) hist.shift();
+          const spec0 = ready + pending.length;
+          let spec = desired > spec0 ? Math.min(desired, Math.max(spec0 * 2, spec0 + 1)) : Math.max(...hist.map(h => h.desired));
+          if (desired > spec0 && t - lastUp < 60) spec = Math.min(spec, spec0);
+          spec = clamp(spec, MINR, MAXR);
+          if (spec > spec0) { for (let k = spec0; k < spec; k++) pending.push(t + P.cold * 60); lastUp = t; }
+          else if (spec < spec0) {
+            let drop = spec0 - spec;
+            while (drop > 0 && pending.length) { pending.pop(); drop--; }
+            ready = Math.max(MINR, ready - drop);
+          }
+        }
+        rh += (ready + pending.length) * DT / 3600;
+        worst = Math.max(worst, wait);
+        if (wait > 2) bad += DT / 60;
+        peak = Math.max(peak, ready + pending.length);
+        D.push([tm, d]); RD.push([tm, ready]); SP.push([tm, ready + pending.length]); WT.push([tm, wait]);
+      }
+      const ideal = D.reduce((a, p) => a + p[1] / P.target, 0) * DT / 3600;
+      if (h1) wrap1.removeChild(h1);
+      if (h2) wrap2.removeChild(h2);
+      h1 = el("div"); wrap1.appendChild(h1);
+      h2 = el("div"); wrap2.appendChild(h2);
+      const ymax = Math.max(BASE * P.mult * 1.25, peak * 1.1);
+      plot(h1, { width: 760, height: 230, x: [0, TM], y: [0, ymax], xlabel: "time (min)", ylabel: "replicas' worth", margin: { b: 40 } }).draw([
+        { points: SP, color: palette.blue, dash: "4 3", width: 1.5, label: "replicas requested (incl. booting)" },
+        { points: RD, color: palette.green, width: 2.2, label: "ready capacity" },
+        { points: D, color: palette.ink, width: 1.8, label: "demand" }
+      ]);
+      const wmax = Math.min(Math.max(10, worst * 1.15), 1800);
+      plot(h2, { width: 760, height: 170, x: [0, TM], y: [0, wmax], xlabel: "time (min)", ylabel: "queue wait (s)", margin: { b: 40 } }).draw([
+        { points: WT.map(p => [p[0], Math.min(p[1], wmax)]), color: palette.brick, width: 2, area: true, areaOpacity: 0.12, label: "queue wait for a new request" },
+        { hline: 2, color: palette.ink, label: "2 s" }
+      ]);
+      set("wait", fmtS(worst), worst <= 2 ? "good" : worst <= 30 ? "warn" : "bad", "peak of the brick curve");
+      set("bad", fmtNum(bad, 0) + " min", bad < 1 ? "good" : bad < 15 ? "warn" : "bad", "of " + TM + " simulated");
+      set("rh", fmtNum(rh, 0), rh <= ideal * 1.3 ? "good" : rh <= ideal * 2 ? "warn" : "bad", fmtNum(rh / ideal, 2) + "× the right-sized fleet");
+      set("peak", String(peak), null, "limit " + MAXR);
+    }
+    draw();
+  })();
+
+  /* ============================================================ WIDGET: cold start timeline */
+  (function () {
+    const w = widget("w-cold", { title: "Where does a cold start go?", kicker: "Calculator", note: "Bandwidths are illustrative placeholders; measure your own. Image pull assumes ~0.25 GB/s including decompression and extraction, which is often the slow part. Streaming loaders overlap download and GPU load, so only the slower of the two is visible. Tensor-parallel replicas load shards on several GPUs at once, which mainly speeds up the load term." });
+    const SRC = [
+      { v: "hub", l: "Public model hub over the internet (~0.3 GB/s)", bw: 0.3 },
+      { v: "obj", l: "Object store, parallel ranged reads (~1.5 GB/s)", bw: 1.5 },
+      { v: "nvme", l: "Node-local NVMe cache (~5 GB/s)", bw: 5 },
+      { v: "ram", l: "Host page cache or peer RAM (~12 GB/s)", bw: 12 }
+    ];
+    const P = { gbIdx: 62, src: "obj", load: 8, node: "fresh", tnode: 240, image: "pull", imgGB: 10, stream: "seq", warm: 60, lam: 2 };
+    const toGB = v => { const g = Math.pow(10, Math.log10(2) + (Math.log10(810) - Math.log10(2)) * v / 100); return g < 20 ? Math.round(g) : Math.round(g / 5) * 5; };
+    slider(w.controls, { label: "Weights to load", min: 0, max: 100, step: 1, value: P.gbIdx, fmt: v => toGB(v) + " GB (≈ " + fmtNum(toGB(v) / 2, 0) + "B params in bf16)", onInput: v => { P.gbIdx = v; draw(); } });
+    select(w.controls, { label: "Weights come from", options: SRC.map(s => ({ value: s.v, label: s.l })), value: P.src, onChange: v => { P.src = v; draw(); } });
+    slider(w.controls, { label: "Effective load rate into GPU", min: 1, max: 25, step: 1, value: P.load, fmt: v => v + " GB/s", onInput: v => { P.load = v; draw(); } });
+    ctlSeg(w.controls, "GPU node", [{ value: "fresh", label: "must provision" }, { value: "free", label: "free node ready" }], P.node, v => { P.node = v; draw(); });
+    slider(w.controls, { label: "Node provisioning time", min: 30, max: 900, step: 10, value: P.tnode, fmt: v => v + " s", onInput: v => { P.tnode = v; draw(); } });
+    ctlSeg(w.controls, "Container image", [{ value: "pull", label: "pull" }, { value: "cached", label: "cached on node" }], P.image, v => { P.image = v; draw(); });
+    slider(w.controls, { label: "Image size", min: 2, max: 20, step: 1, value: P.imgGB, fmt: v => v + " GB", onInput: v => { P.imgGB = v; draw(); } });
+    ctlSeg(w.controls, "Weight loader", [{ value: "seq", label: "download, then load" }, { value: "stream", label: "streaming (overlapped)" }], P.stream, v => { P.stream = v; draw(); });
+    slider(w.controls, { label: "Warmup (compile, CUDA graphs)", min: 0, max: 300, step: 5, value: P.warm, fmt: v => v + " s", onInput: v => { P.warm = v; draw(); } });
+    slider(w.controls, { label: "Traffic waiting for this replica", min: 0, max: 20, step: 0.5, value: P.lam, fmt: v => v + " req/s", onInput: v => { P.lam = v; draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 230" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "tot", label: "Cold start" }, { key: "dom", label: "Dominant phase" }, { key: "q", label: "Requests arriving meanwhile" }, { key: "best", label: "With all mitigations" }]);
+    const PH = [["node", "node", palette.gold], ["image", "image pull", palette.plum], ["dl", "download", palette.brick], ["load", "load to GPU", palette.blue], ["warm", "warmup", palette.teal]];
+    function phases(cfg) {
+      const W = cfg.gb, dl = W / cfg.bw, ld = W / cfg.load;
+      return {
+        node: cfg.node === "fresh" ? cfg.tnode : 0,
+        image: cfg.image === "pull" ? cfg.imgGB / 0.25 : 0,
+        dl: dl,
+        load: cfg.stream === "stream" ? Math.max(0, ld - dl) + 2 : ld,
+        warm: cfg.warm
+      };
+    }
+    function draw() {
+      const gb = toGB(P.gbIdx);
+      const src = SRC.find(x => x.v === P.src);
+      const mine = phases({ gb, bw: src.bw, load: P.load, node: P.node, tnode: P.tnode, image: P.image, imgGB: P.imgGB, stream: P.stream, warm: P.warm });
+      const worst = phases({ gb, bw: 0.3, load: P.load, node: "fresh", tnode: P.tnode, image: "pull", imgGB: P.imgGB, stream: "seq", warm: P.warm });
+      const best = phases({ gb, bw: 5, load: P.load, node: "free", tnode: 0, image: "cached", imgGB: P.imgGB, stream: "stream", warm: Math.min(P.warm, 20) });
+      const rows = [["Your configuration", mine], ["Worst: fresh node, hub", worst], ["Best: all mitigations", best]];
+      const tot = o => PH.reduce((a, [k]) => a + o[k], 0);
+      const tmax = Math.max(...rows.map(r => tot(r[1])));
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const x0 = 190, W = 480, sx = t => x0 + t / tmax * W;
+      rows.forEach(([name, o], i) => {
+        const y = 14 + i * 56;
+        s.appendChild(svg("text", { x: x0 - 10, y: y + 20, "text-anchor": "end", "font-size": 12, fill: palette.ink, "font-weight": i === 0 ? 600 : 400, text: name }));
+        if (i === 2) s.appendChild(svg("text", { x: x0 - 10, y: y + 34, "text-anchor": "end", "font-size": 11, fill: palette.muted, text: "warm node, NVMe, streaming" }));
+        let t = 0;
+        PH.forEach(([k, , c]) => {
+          const v = o[k]; if (v <= 0) return;
+          const xa = sx(t), xb = sx(t + v);
+          s.appendChild(svg("rect", { x: xa, y: y + 4, width: Math.max(1, xb - xa - 1), height: 26, rx: 3, fill: c, opacity: i === 0 ? 0.8 : 0.45 }));
+          if (xb - xa > 34) s.appendChild(svg("text", { x: (xa + xb) / 2, y: y + 21, "text-anchor": "middle", "font-size": 10.5, fill: "#fff", class: "mono", text: fmtNum(v, 0) + "s" }));
+          t += v;
+        });
+        s.appendChild(svg("text", { x: sx(t) + 6, y: y + 21, "text-anchor": "start", "font-size": 11, fill: palette.ink, class: "mono", text: fmtS(t) }));
+      });
+      PH.forEach(([, label, c], i) => {
+        const x = x0 + i * 110, y = 200;
+        s.appendChild(svg("rect", { x, y, width: 12, height: 12, rx: 2, fill: c, opacity: 0.8 }));
+        s.appendChild(svg("text", { x: x + 18, y: y + 10, "font-size": 11, fill: palette.muted, text: label }));
+      });
+      const T = tot(mine);
+      let dom = PH[0]; PH.forEach(p => { if (mine[p[0]] > mine[dom[0]]) dom = p; });
+      set("tot", fmtS(T), T < 60 ? "good" : T < 300 ? "warn" : "bad", fmtNum(T / 60, 1) + " min");
+      set("dom", dom[1], null, fmtNum(100 * mine[dom[0]] / T, 0) + "% of the total");
+      set("q", fmtNum(P.lam * T, 0), P.lam * T > 200 ? "bad" : P.lam * T > 20 ? "warn" : "good", "λ × t_cold; they need another replica");
+      set("best", fmtS(tot(best)), "good", "bottom row");
+    }
+    draw();
+  })();
+
+  /* ============================================================ FIG: Kubernetes layout */
+  (function () {
+    const cv = canvas("fig-k8s");
+    const { s, T, box, node, line } = cv;
+    node(20, 24, 170, 110, "Control plane", ["API server", "scheduler", "cluster autoscaler"], { fill: "#fbfcfe", stroke: "rgba(47,93,138,.5)" });
+    box(20, 156, 170, 170, { fill: "rgba(28,27,25,.03)" });
+    T(105, 178, "CPU node pool", { "font-weight": 600 });
+    [["gateway × 3", 196], ["router × 2", 236], ["Prometheus, OTel", 276]].forEach(([t, y]) => { box(36, y, 138, 30, { fill: "#fff", rx: 5 }); T(105, y + 19, t, { "font-size": 11.5 }); });
+    // GPU node
+    box(215, 24, 440, 236, { fill: "rgba(26,122,82,.03)", stroke: "rgba(26,122,82,.45)" });
+    T(230, 44, "GPU node pool · 8 × H100 per node", { "text-anchor": "start", "font-weight": 600 });
+    T(230, 62, "label gpu-type=h100 · taint nvidia.com/gpu=present:NoSchedule", { "text-anchor": "start", "font-size": 11, class: "mono", fill: palette.muted });
+    box(230, 74, 410, 28, { fill: "#fff", rx: 5 });
+    T(435, 92, "kubelet · NVIDIA device plugin → advertises nvidia.com/gpu: 8", { "font-size": 11.5 });
+    const gx = i => 240 + i * 50;
+    // pods behind GPUs
+    s.appendChild(svg("rect", { x: gx(0) - 6, y: 118, width: 4 * 50 + 2, height: 106, rx: 8, fill: "rgba(26,122,82,.14)", stroke: "rgba(26,122,82,.6)" }));
+    T(gx(0) + 97, 214, "pod: llm-70b (TP = 4)", { "font-size": 11, fill: palette.green, "font-weight": 600 });
+    [4, 5].forEach(i => { s.appendChild(svg("rect", { x: gx(i) - 6, y: 118, width: 52, height: 106, rx: 8, fill: "rgba(47,93,138,.12)", stroke: "rgba(47,93,138,.55)" })); T(gx(i) + 20, 214, "llm-8b", { "font-size": 10.5, fill: palette.blue, "font-weight": 600 }); });
+    for (let i = 0; i < 8; i++) {
+      const free = i >= 6;
+      s.appendChild(svg("rect", { x: gx(i), y: 128, width: 40, height: 40, rx: 4, fill: free ? "#fff" : "rgba(28,27,25,.75)", stroke: free ? palette.faint : "none", "stroke-dasharray": free ? "3 3" : null }));
+      T(gx(i) + 20, 152, "GPU" + i, { "font-size": 9.5, fill: free ? palette.faint : "#fff", class: "mono" });
+    }
+    s.appendChild(svg("rect", { x: gx(0), y: 176, width: 8 * 50 - 10, height: 8, rx: 3, fill: "rgba(154,123,34,.5)" }));
+    T(gx(0) + 195, 197, "NVLink / NVSwitch", { "font-size": 10.5, fill: palette.gold, class: "mono" });
+    T(gx(6) + 45, 120, "free", { "font-size": 10, fill: palette.faint });
+    T(435, 248, "TP group stays inside one node so all-reduces use NVLink", { "font-size": 11, fill: palette.muted });
+    // pod spec card
+    box(675, 24, 265, 236, { fill: "#fff" });
+    T(690, 46, "Model-server pod spec", { "text-anchor": "start", "font-weight": 600 });
+    ["resources.limits:", "  nvidia.com/gpu: 4", "tolerations: nvidia.com/gpu", "nodeSelector: gpu-type=h100", "/dev/shm: emptyDir (Memory)", "startup / readiness / liveness", "terminationGracePeriodSeconds", "image pinned by digest"].forEach((t, i) => T(690, 72 + i * 22, t, { "text-anchor": "start", "font-size": 11.5, class: "mono", fill: i === 1 ? palette.green : palette.ink }));
+    line([[675, 100], [452, 128]], { color: "green", dash: "4 3" });
+    // MIG
+    box(215, 284, 350, 132, { fill: "rgba(28,27,25,.02)" });
+    T(230, 304, "MIG: hardware partitions of one GPU", { "text-anchor": "start", "font-weight": 600 });
+    for (let k = 0; k < 7; k++) {
+      s.appendChild(svg("rect", { x: 232 + k * 46, y: 318, width: 42, height: 40, rx: 4, fill: k < 5 ? "rgba(47,93,138,.22)" : "#fff", stroke: "rgba(47,93,138,.6)" }));
+      T(253 + k * 46, 336, "1g", { "font-size": 10.5, class: "mono", fill: palette.blue });
+      T(253 + k * 46, 350, "10gb", { "font-size": 9.5, class: "mono", fill: palette.blue });
+    }
+    T(390, 380, "own memory + SMs per slice: isolated, predictable", { "font-size": 11, fill: palette.green });
+    T(390, 398, "fixed profiles; no borrowing idle compute", { "font-size": 11, fill: palette.muted });
+    // time slicing
+    box(585, 284, 355, 132, { fill: "rgba(28,27,25,.02)" });
+    T(600, 304, "Time-slicing: one GPU advertised as 4", { "text-anchor": "start", "font-weight": 600 });
+    const tc = [palette.green, palette.blue, palette.gold, palette.plum];
+    for (let k = 0; k < 16; k++) s.appendChild(svg("rect", { x: 602 + k * 20.5, y: 318, width: 19, height: 40, rx: 2, fill: tc[k % 4], opacity: 0.55 }));
+    T(762, 380, "pods take turns; memory is shared, not partitioned", { "font-size": 11, fill: palette.brick });
+    T(762, 398, "one pod can OOM or slow all the others", { "font-size": 11, fill: palette.muted });
+    line([[105, 134], [105, 154]], { color: "blue", dash: "4 3" });
+    line([[190, 70], [213, 70]], { color: "blue", dash: "4 3" });
+  })();
+
+  /* ============================================================ WIDGET: token bucket */
+  (function () {
+    const w = widget("w-bucket", { title: "Token-bucket rate limiting for one tenant", kicker: "Simulation", note: "Each request costs prompt tokens + max_tokens (lognormal, median 1,200). Bursty traffic: 15 seconds at 4× the average rate, then 45 seconds idle. Single burst: half the average rate in the background plus 30 seconds' worth of demand arriving at t = 20 s. Rejected requests would get HTTP 429 with a Retry-After header; a gateway could also queue them briefly instead." });
+    const P = { r: 1500, b: 30000, dem: 1800, pat: "bursty" };
+    slider(w.controls, { label: "Refill rate r", min: 200, max: 5000, step: 100, value: P.r, fmt: v => fmtNum(v, 0) + " tok/s (" + fmtNum(v * 60 / 1000, 0) + "K/min)", onInput: v => { P.r = v; draw(); } });
+    slider(w.controls, { label: "Burst b (capacity)", min: 2000, max: 100000, step: 1000, value: P.b, fmt: v => fmtNum(v / 1000, 0) + "K tokens", onInput: v => { P.b = v; draw(); } });
+    slider(w.controls, { label: "Tenant's average demand", min: 200, max: 6000, step: 100, value: P.dem, fmt: v => fmtNum(v, 0) + " tok/s", onInput: v => { P.dem = v; draw(); } });
+    ctlSeg(w.controls, "Traffic pattern", [{ value: "steady", label: "steady (Poisson)" }, { value: "bursty", label: "bursty on/off" }, { value: "spike", label: "single burst" }], P.pat, v => { P.pat = v; draw(); });
+    const wrap1 = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap1);
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "8px" } }); w.body.appendChild(wrap2);
+    const set = stats(w.body, [{ key: "acc", label: "Requests admitted" }, { key: "tps", label: "Admitted tokens/s" }, { key: "rej", label: "Rejected (429)" }, { key: "bound", label: "Bound b + rT, T = 120 s" }]);
+    const TT = 120;
+    let h1 = null, h2 = null;
+    function draw() {
+      const R = rng(5);
+      const meanCost = 1200 * Math.exp(0.245);
+      const lam = P.dem / meanCost;
+      const arr = [];
+      const poisson = (rate, a, b) => { let t = a; while (true) { t += -Math.log(1 - R()) / rate; if (t >= b) break; arr.push(t); } };
+      if (P.pat === "steady") poisson(lam, 0, TT);
+      else if (P.pat === "bursty") { for (let s0 = 0; s0 < TT; s0 += 60) poisson(lam * 4, s0 + 5, Math.min(TT, s0 + 20)); }
+      else { poisson(lam * 0.5, 0, TT); const k = Math.round(lam * 30); for (let i = 0; i < k; i++) arr.push(20 + i * 0.002); }
+      arr.sort((a, b) => a - b);
+      const reqs = arr.map(t => ({ t, c: Math.round(1200 * Math.exp(0.7 * R.normal())) }));
+      let level = P.b, tl = 0, acc = 0, accTok = 0;
+      const lv = [[0, level]], ok = [], no = [];
+      const advance = t => { level = Math.min(P.b, level + P.r * (t - tl)); tl = t; };
+      let gi = 0;
+      for (let g = 0.25; g <= TT + 1e-9; g += 0.25) {
+        while (gi < reqs.length && reqs[gi].t <= g) {
+          const q = reqs[gi++];
+          advance(q.t);
+          lv.push([q.t, level]);
+          if (level >= q.c) { level -= q.c; acc++; accTok += q.c; ok.push([q.t, q.c / 1000]); }
+          else no.push([q.t, q.c / 1000]);
+          lv.push([q.t, level]);
+        }
+        advance(g);
+        lv.push([g, level]);
+      }
+      if (h1) wrap1.removeChild(h1);
+      if (h2) wrap2.removeChild(h2);
+      h1 = el("div"); wrap1.appendChild(h1);
+      h2 = el("div"); wrap2.appendChild(h2);
+      plot(h1, { width: 760, height: 200, x: [0, TT], y: [0, P.b * 1.08], xlabel: "time (s)", ylabel: "tokens in bucket", yfmt: v => fmtNum(v / 1000, 0) + "K" }).draw([
+        { points: lv, color: palette.blue, width: 1.8, area: true, areaOpacity: 0.1, label: "bucket level B(t)" },
+        { hline: P.b, color: palette.muted, label: "capacity b" }
+      ]);
+      const cmax = Math.max(4, ...reqs.map(q => q.c / 1000)) * 1.1;
+      plot(h2, { width: 760, height: 150, x: [0, TT], y: [0, cmax], xlabel: "time (s)", ylabel: "cost (K tok)" }).draw([
+        { points: ok, color: palette.green, dots: true, dotsOnly: true, r: 2.6, label: "admitted" },
+        { points: no, color: palette.brick, dots: true, dotsOnly: true, r: 2.6, label: "rejected" }
+      ]);
+      const n = reqs.length;
+      set("acc", n ? Math.round(100 * acc / n) + "%" : "–", acc / Math.max(n, 1) > 0.95 ? "good" : acc / Math.max(n, 1) > 0.75 ? "warn" : "bad", acc + " of " + n);
+      set("tps", fmtNum(accTok / TT, 0), null, "demand " + fmtNum(reqs.reduce((a, q) => a + q.c, 0) / TT, 0) + " tok/s");
+      set("rej", String(n - acc), n - acc === 0 ? "good" : "bad", "requests");
+      set("bound", fmtNum((P.b + P.r * TT) / 1000, 0) + "K", null, "admitted " + fmtNum(accTok / 1000, 0) + "K tokens");
+    }
+    draw();
+  })();
+
+  /* ============================================================ WIDGET: capacity and cost */
+  (function () {
+    const w = widget("w-cost", { title: "Size a fleet and price a million tokens", kicker: "Calculator", note: "GPU prices and throughputs in the presets are rough placeholders for an ~8B-class model, not benchmarks: replace them with your quotes and your own load-test goodput at SLO. Diurnal traffic peaks at 15:00. Autoscaling here is ideal and hourly (no cold-start lag, minimum 2 replicas). Reserved = 40% off, spot = 65% off plus one spare replica for interruptions; both illustrative. API comparison uses one blended price per 1M tokens at the same volume and ignores quality differences." });
+    const GPUS = [
+      { v: "l4", l: "L4 24 GB (placeholder: $0.80/hr, 800 tok/s)", p: 0.8, t: 800 },
+      { v: "a100", l: "A100 80 GB (placeholder: $1.80/hr, 2,500 tok/s)", p: 1.8, t: 2500 },
+      { v: "h100", l: "H100 80 GB (placeholder: $3.00/hr, 4,000 tok/s)", p: 3.0, t: 4000 },
+      { v: "h200", l: "H200 141 GB (placeholder: $3.80/hr, 5,000 tok/s)", p: 3.8, t: 5000 }
+    ];
+    const P = { price: 3.0, thrIdx: 0, gpus: 1, avgIdx: 0, peak: 2.5, head: 0.3, mode: "auto", pricing: "od", api: 0.6 };
+    const thrOf = v => Math.round(Math.pow(10, 2 + 2.7 * v / 100));
+    const avgOf = v => Math.round(Math.pow(10, 1.7 + 4 * v / 100));
+    const apiOf = v => +Math.pow(10, -1.3 + 2.8 * v / 100).toPrecision(2);
+    const inv = (f, target) => { let best = 0, d = Infinity; for (let v = 0; v <= 100; v++) { const e = Math.abs(Math.log(f(v) / target)); if (e < d) { d = e; best = v; } } return best; };
+    P.thrIdx = inv(thrOf, 4000); P.avgIdx = inv(avgOf, 5000);
+    const apiIdx = inv(apiOf, 0.6);
+    select(w.controls, { label: "GPU preset", options: GPUS.map(g => ({ value: g.v, label: g.l })), value: "h100", onChange: v => { const g = GPUS.find(x => x.v === v); sp.value = g.p; P.price = g.p; st.value = inv(thrOf, g.t); P.thrIdx = st.value; draw(); } });
+    const sp = slider(w.controls, { label: "Price per GPU-hour", min: 0.2, max: 12, step: 0.1, value: P.price, fmt: v => "$" + v.toFixed(2), onInput: v => { P.price = v; draw(); } });
+    const st = slider(w.controls, { label: "Replica goodput at SLO", min: 0, max: 100, step: 1, value: P.thrIdx, fmt: v => fmtNum(thrOf(v), 0) + " tok/s", onInput: v => { P.thrIdx = v; draw(); } });
+    ctlSeg(w.controls, "GPUs per replica", [1, 2, 4, 8].map(n => ({ value: n, label: String(n) })), 1, v => { P.gpus = v; draw(); });
+    slider(w.controls, { label: "Average traffic", min: 0, max: 100, step: 1, value: P.avgIdx, fmt: v => fmtNum(avgOf(v), 0) + " tok/s (" + fmtNum(avgOf(v) * 86400 / 1e9, 2) + "B/day)", onInput: v => { P.avgIdx = v; draw(); } });
+    slider(w.controls, { label: "Peak ÷ average", min: 1, max: 4, step: 0.1, value: P.peak, fmt: v => v.toFixed(1) + "×", onInput: v => { P.peak = v; draw(); } });
+    slider(w.controls, { label: "Headroom", min: 0, max: 0.6, step: 0.05, value: P.head, fmt: v => Math.round(v * 100) + "%", onInput: v => { P.head = v; draw(); } });
+    ctlSeg(w.controls, "Scaling", [{ value: "static", label: "static, sized for peak" }, { value: "auto", label: "autoscale hourly" }], P.mode, v => { P.mode = v; draw(); });
+    ctlSeg(w.controls, "Pricing", [{ value: "od", label: "on-demand" }, { value: "res", label: "reserved" }, { value: "spot", label: "spot" }], P.pricing, v => { P.pricing = v; draw(); });
+    slider(w.controls, { label: "API price to compare (blended)", min: 0, max: 100, step: 1, value: apiIdx, fmt: v => "$" + apiOf(v) + " / 1M tokens", onInput: v => { P.api = apiOf(v); draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const set = stats(w.body, [{ key: "rep", label: "Replicas at peak" }, { key: "avg", label: "Avg replicas running" }, { key: "month", label: "Monthly GPU cost" }, { key: "c1m", label: "Effective $ / 1M tokens" }, { key: "api", label: "API at same volume" }]);
+    let host = null;
+    function draw() {
+      const thr = thrOf(P.thrIdx), avg = avgOf(P.avgIdx);
+      const hv = h => Math.pow((1 + Math.cos(2 * Math.PI * (h - 15) / 24)) / 2, 6);
+      const hrs = Array.from({ length: 24 }, (_, h) => h + 0.5);
+      const raw = hrs.map(hv), m = raw.reduce((a, b) => a + b, 0) / 24;
+      let f = raw.map(v => Math.max(0.05, 1 + (P.peak - 1) * (v - m) / (1 - m)));
+      const fm = f.reduce((a, b) => a + b, 0) / 24; f = f.map(v => v / fm);
+      const dem = f.map(v => avg * v);
+      const need = d => Math.ceil(d * (1 + P.head) / thr - 1e-9);
+      const peakR = Math.max(1, need(Math.max(...dem)));
+      const spare = P.pricing === "spot" ? 1 : 0;
+      const reps = dem.map(d => (P.mode === "static" ? peakR : Math.max(2, need(d))) + spare);
+      const mult = P.pricing === "res" ? 0.6 : P.pricing === "spot" ? 0.35 : 1;
+      const daily = reps.reduce((a, r) => a + r * P.gpus * P.price * mult, 0);
+      const monthly = daily * 30;
+      const tokMonth = avg * 86400 * 30;
+      const c1m = monthly / tokMonth * 1e6;
+      const ideal = P.gpus * P.price * mult / (thr * 3600) * 1e6;
+      const apiMonth = tokMonth / 1e6 * P.api;
+      if (host) wrap.removeChild(host);
+      host = el("div"); wrap.appendChild(host);
+      const ymax = Math.max(...reps) * thr * 1.1;
+      const capPts = []; reps.forEach((r, h) => { capPts.push([h, r * thr]); capPts.push([h + 1, r * thr]); });
+      plot(host, { width: 760, height: 250, x: [0, 24], y: [0, ymax], xlabel: "hour of day", ylabel: "tokens/s", xticks: [0, 3, 6, 9, 12, 15, 18, 21, 24] }).draw([
+        { points: capPts, color: palette.green, width: 2, area: true, areaOpacity: 0.08, label: "provisioned goodput (replicas × goodput)" },
+        { fn: h => avg * Math.max(0.05, 1 + (P.peak - 1) * (hv(h) - m) / (1 - m)) / fm, color: palette.ink, width: 2, label: "demand" },
+        { hline: avg, color: palette.muted, label: "average " + fmtNum(avg, 0) + " tok/s" }
+      ]);
+      const avgR = reps.reduce((a, b) => a + b, 0) / 24;
+      set("rep", String(Math.max(...reps)), null, (P.gpus * Math.max(...reps)) + " GPUs");
+      set("avg", fmtNum(avgR, 1), null, "utilization " + Math.round(100 * avg / (avgR * thr)) + "% of goodput");
+      set("month", money(monthly), null, "30 days");
+      set("c1m", "$" + fmtNum(c1m, c1m < 1 ? 3 : 2), c1m <= P.api ? "good" : "bad", "$" + fmtNum(ideal, ideal < 1 ? 3 : 2) + " if 100% busy");
+      set("api", money(apiMonth), apiMonth >= monthly ? "warn" : "good", apiMonth >= monthly ? "self-hosting is cheaper here" : "API is cheaper here");
+    }
+    draw();
+  })();
+
+  /* ============================================================ FIG: rollouts */
+  (function () {
+    const cv = canvas("fig-rollout");
+    const { s, T, box, node, line } = cv;
+    const titles = [["Rolling update with drain", 20], ["Canary", 330], ["Blue-green", 640]];
+    titles.forEach(([t, x]) => { box(x, 10, 300, 320, { fill: "rgba(28,27,25,.02)" }); T(x + 150, 34, t, { "font-weight": 600, "font-size": 13 }); });
+    // (a) drain timeline for an old pod
+    const x0 = 40, x1 = 300, sx = f => x0 + f * (x1 - x0);
+    T(x0, 62, "old replica: in-flight streams", { "text-anchor": "start", "font-size": 11, fill: palette.muted });
+    const steps = [[0, 6], [0.3, 6], [0.3, 6], [0.45, 4], [0.58, 3], [0.68, 1], [0.8, 0]];
+    let d = "M" + sx(0) + "," + (170 - 6 * 14);
+    for (let i = 1; i < steps.length; i++) { d += " L" + sx(steps[i][0]) + "," + (170 - steps[i - 1][1] * 14) + " L" + sx(steps[i][0]) + "," + (170 - steps[i][1] * 14); }
+    s.appendChild(svg("path", { d, fill: "none", stroke: palette.ink, "stroke-width": 1.8 }));
+    s.appendChild(svg("rect", { x: sx(0), y: 190, width: sx(0.3) - sx(0), height: 18, fill: "rgba(26,122,82,.55)", rx: 3 }));
+    s.appendChild(svg("rect", { x: sx(0.3), y: 190, width: sx(0.8) - sx(0.3), height: 18, fill: "rgba(154,123,34,.5)", rx: 3 }));
+    s.appendChild(svg("rect", { x: sx(0.8), y: 190, width: sx(0.9) - sx(0.8), height: 18, fill: "rgba(176,67,46,.6)", rx: 3 }));
+    T((sx(0) + sx(0.3)) / 2, 203, "serving", { "font-size": 10.5, fill: "#fff" });
+    T((sx(0.3) + sx(0.8)) / 2, 203, "unready: draining", { "font-size": 10.5, fill: "#fff" });
+    [[0.3, "t1: new replica ready,", "old marked unready"], [0.8, "t2: in-flight = 0", "→ SIGTERM, exit"]].forEach(([f, a, b], i) => {
+      s.appendChild(svg("line", { x1: sx(f), x2: sx(f), y1: 80, y2: 218, stroke: palette.muted, "stroke-dasharray": "3 3" }));
+      T(sx(f), 236 + i * 34, a, { "font-size": 10.5, fill: palette.ink });
+      T(sx(f), 249 + i * 34, b, { "font-size": 10.5, fill: palette.ink });
+    });
+    T(170, 316, "new requests stop at t1; old streams finish", { "font-size": 10.5, fill: palette.muted });
+    // (b) canary
+    node(410, 54, 140, 40, "Router", null);
+    node(350, 150, 120, 50, "v1 (stable)", ["95% of traffic"], { fill: "rgba(26,122,82,.06)", stroke: "rgba(26,122,82,.5)" });
+    node(490, 150, 120, 50, "v2 (canary)", ["5% of traffic"], { fill: "rgba(154,123,34,.08)", stroke: "rgba(154,123,34,.6)" });
+    line([[465, 94], [415, 148]], { color: "green", width: 3.2 });
+    line([[495, 94], [545, 148]], { color: "gold", width: 1.2 });
+    T(480, 228, "gates before each step:", { "font-size": 11, "font-weight": 600 });
+    T(480, 245, "p95 TTFT, ITL, error rate,", { "font-size": 11, fill: palette.muted });
+    T(480, 260, "judge scores, refusals, feedback", { "font-size": 11, fill: palette.muted });
+    ["5%", "25%", "50%", "100%"].forEach((t, i) => { box(352 + i * 66, 280, 58, 24, { fill: i === 0 ? "rgba(154,123,34,.2)" : "#fff", rx: 5 }); T(381 + i * 66, 297, t, { "font-size": 11, class: "mono" }); if (i < 3) line([[411 + i * 66, 292], [417 + i * 66, 292]], { color: "muted" }); });
+    // (c) blue-green
+    node(720, 54, 140, 40, "Router", null);
+    node(660, 150, 120, 60, "Blue · v1", ["kept warm", "for rollback"], { fill: "rgba(47,93,138,.06)", stroke: "rgba(47,93,138,.45)", dash: "4 3" });
+    node(800, 150, 120, 60, "Green · v2", ["100% after switch"], { fill: "rgba(26,122,82,.08)", stroke: "rgba(26,122,82,.6)" });
+    line([[775, 94], [745, 148]], { color: "muted", dash: "3 4", width: 1 });
+    line([[805, 94], [855, 148]], { color: "green", width: 3.2 });
+    T(790, 240, "one atomic switch, instant rollback", { "font-size": 11, fill: palette.ink });
+    T(790, 258, "cost: double capacity during the switch,", { "font-size": 11, fill: palette.muted });
+    T(790, 274, "and new fleet sees full load cold", { "font-size": 11, fill: palette.muted });
+    T(790, 300, "(no prefix cache yet)", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ============================================================ FIG: trace waterfall */
+  (function () {
+    const cv = canvas("fig-trace");
+    const { s, T } = cv;
+    const x0 = 210, xb = 640, x1 = 930;
+    const sx = t => t <= 1 ? x0 + t * (xb - x0) : xb + (t - 1) / 10 * (x1 - xb);
+    const rows = [
+      ["gateway.request", 0, 10.62, 0, palette.ink],
+      ["auth + quota", 0.001, 0.004, 1, palette.blue],
+      ["router.route", 0.005, 10.62, 0, palette.ink],
+      ["pick replica", 0.005, 0.006, 1, palette.blue],
+      ["engine.request", 0.007, 10.62, 0, palette.ink],
+      ["queue (waiting for KV)", 0.007, 0.41, 1, palette.gold],
+      ["prefill (300 uncached tok)", 0.41, 0.52, 1, palette.blue],
+      ["decode (400 tokens)", 0.52, 10.62, 1, palette.green]
+    ];
+    rows.forEach(([name, a, b, ind, c], i) => {
+      const y = 22 + i * 28;
+      T(16 + ind * 16, y + 14, name, { "text-anchor": "start", "font-size": 11.5, class: "mono", fill: ind ? palette.muted : palette.ink });
+      s.appendChild(svg("rect", { x: sx(a), y: y + 2, width: Math.max(2, sx(b) - sx(a)), height: 16, rx: 3, fill: c, opacity: ind ? 0.6 : 0.25 }));
+    });
+    const ay = 22 + rows.length * 28 + 8;
+    s.appendChild(svg("line", { x1: x0, x2: x1, y1: ay, y2: ay, stroke: palette.ink }));
+    [0, 0.25, 0.5, 0.75, 1, 3, 5, 7, 9, 11].forEach(t => { s.appendChild(svg("line", { x1: sx(t), x2: sx(t), y1: ay, y2: ay + 5, stroke: palette.ink })); T(sx(t), ay + 18, t + "s", { "font-size": 10.5, class: "mono", fill: palette.muted }); });
+    s.appendChild(svg("path", { d: `M${xb - 4},${ay - 6} l8,12 M${xb + 2},${ay - 6} l8,12`, stroke: palette.ink, "stroke-width": 1 }));
+    T((x0 + xb) / 2, ay + 34, "first second, stretched", { "font-size": 10.5, fill: palette.muted });
+    T((xb + x1) / 2, ay + 34, "1 to 11 s, compressed", { "font-size": 10.5, fill: palette.muted });
+    s.appendChild(svg("line", { x1: sx(0.52), x2: sx(0.52), y1: 16, y2: ay, stroke: palette.brick, "stroke-dasharray": "3 3" }));
+    T(sx(0.52) + 6, 14, "first token: TTFT 0.52 s", { "text-anchor": "start", "font-size": 11, fill: palette.brick, class: "mono" });
+    T(16, 318, "span attributes: model=chat · tenant=t-42 · prompt_tokens=3200 · cached_tokens=2900 · completion_tokens=400 · replica=llm-chat-7f9c", { "text-anchor": "start", "font-size": 10.5, class: "mono", fill: palette.muted });
+  })();
+
+  /* ============================================================ FIG: throughput-latency knee */
+  (function () {
+    const host = document.getElementById("fig-knee");
+    const XMAX = 5800;
+    const lat = r => 0.3 + 0.05 * r / Math.pow(1 - r, 1.5);
+    const curve = []; for (let r = 0.02; r <= 0.965; r += 0.005) curve.push([r * XMAX, lat(r)]);
+    const R = rng(3);
+    const dots = [0.1, 0.25, 0.4, 0.55, 0.68, 0.78, 0.85, 0.9, 0.93, 0.95].map(r => [r * XMAX * (1 + 0.01 * R.normal()), lat(r) * (1 + 0.06 * R.normal())]);
+    let lo = 0.02, hi = 0.96; for (let i = 0; i < 40; i++) { const m = (lo + hi) / 2; if (lat(m) <= 1.5) lo = m; else hi = m; }
+    const Pl = plot(host, { width: 760, height: 300, x: [0, 6000], y: [0, 6], xlabel: "achieved throughput (output tokens/s)", ylabel: "p95 TTFT (s)" });
+    Pl.draw([
+      { band: [lo * XMAX, 6000], color: palette.brick, opacity: 0.05 },
+      { points: curve, color: palette.ink, width: 2 },
+      { points: dots, color: palette.blue, dots: true, dotsOnly: true, r: 4 },
+      { hline: 1.5, color: palette.brick, label: "SLO: p95 TTFT ≤ 1.5 s" },
+      { vline: lo * XMAX, color: palette.green, label: "capacity at SLO ≈ " + fmtNum(lo * XMAX, 0) + " tok/s" },
+      { marker: [0.78 * XMAX, lat(0.78)], color: palette.gold, label: "knee" },
+      { text: [5650, 5.4], label: "max throughput", color: palette.muted, anchor: "end" }
+    ]);
+  })();
+})();
+</script>
+</body>
+</html>

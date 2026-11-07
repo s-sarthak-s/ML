@@ -1,0 +1,1383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · GPUs &amp; accelerators — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+  .pick-table input[type=number]{width:72px;font-family:var(--mono);font-size:12.5px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:var(--paper);color:var(--ink)}
+  .pick-table td{font-size:13px;padding:8px 10px}
+  .pick-table th{padding:8px 10px}
+  .pick-table tr.best td{background:rgba(26,122,82,.07)}
+  .pick-table .why{font-family:var(--mono);font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body data-module="17">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 17 · Inference eng. I</p>
+<h1 class="title">GPUs and accelerators: the <span class="it">machine</span> under the model</h1>
+<p class="lede">An H100 can do close to 10<sup>15</sup> bf16 operations per second, yet a chatbot answering one user on it keeps the arithmetic units busy well under 1% of the time. The rest of the time it waits for memory. This module opens the box: what is on the chip, how code gets mapped onto it, why bytes matter more than FLOPs for LLM decode, and how to choose hardware by doing the arithmetic yourself instead of trusting the spec sheet's headline number.</p>
+<div class="meta"><span class="tag">~4 hours</span><span class="tag n">prereqs: 01, 08, 09</span><span class="tag g">hands-on: PyTorch, CUDA C, MLX, nvidia-smi</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Sketch an H100 from memory (SMs, tensor cores, register file, shared memory, L2, HBM) and give each level's rough capacity and bandwidth.</li>
+    <li>Explain grids, blocks, warps and SIMT, compute a global thread index, and predict when a memory access pattern wastes bandwidth.</li>
+    <li>Work out occupancy from registers and shared memory, and use Little's law to say how much data must be in flight to saturate HBM.</li>
+    <li>Place any matmul on a roofline from its shapes and dtype, and say whether it's compute-bound or memory-bound on a given chip.</li>
+    <li>Compare PCIe, NVLink and InfiniBand transfer times, and size a deployment: memory, GPU count, a tokens/s ceiling and a rough cost per million tokens.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="why">Why GPUs</h2>
+
+<p>A CPU core is built to finish <em>one</em> instruction stream as fast as possible. Most of its transistors go to features that cut latency: deep out-of-order pipelines, branch predictors, prefetchers, and megabytes of cache per core so that a load rarely has to wait for DRAM. A modern server CPU has a few dozen to a couple of hundred such cores.</p>
+<p>A GPU makes the opposite bet. It spends its transistors on arithmetic lanes and very little on cleverness per lane. An H100 has 16,896 FP32 lanes and 528 tensor cores spread over 132 streaming multiprocessors. Instead of avoiding memory stalls, it <strong>hides</strong> them: each SM keeps dozens of thread groups resident and switches to another group on every cycle that one is waiting. That only works if you have tens of thousands of independent pieces of work, and a matrix multiply has millions.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 330" id="fig-cpugpu"></svg>
+<figcaption>Where the silicon goes. A CPU (left) has a few large cores, each with its own control logic and big caches, so a single thread runs fast. A GPU (right) packs many small SIMD lanes grouped into SMs, with thin control and smaller caches per lane, so throughput is high whenever there's enough parallel work to hide memory latency. The bandwidth figures are approximate and vary by product.</figcaption></figure>
+
+<p>LLM inference fits the GPU's bet unusually well. For every generated token, every layer does the same few things: matmuls for the Q/K/V and output projections, three matmuls in the MLP, attention over the KV cache, and some cheap elementwise work (norms, RoPE, activations). The matmuls account for almost all of the FLOPs: about \(2N\) per token for an \(N\)-parameter dense model, so roughly 16 GFLOP per token for an 8B model (Module 07 derives this). The other half of the bill is <em>memory traffic</em>: weights and KV cache have to stream from memory to the arithmetic units. Every chip has two speed limits, and a kernel runs into one of them first.</p>
+
+<div class="formula" data-name="Two speed limits">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{kernel}}} \;\approx\; \max\!\left(\frac{\htmlClass{t2}{F}}{\htmlClass{t3}{P_{\text{peak}}}},\; \frac{\htmlClass{t4}{Q}}{\htmlClass{t5}{BW}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{kernel}}\)</dt><dd>lower bound on how long the kernel takes</dd></div>
+    <div data-t="t2"><dt>\(F\)</dt><dd>floating-point operations it performs (a multiply-add counts as 2)</dd></div>
+    <div data-t="t3"><dt>\(P_{\text{peak}}\)</dt><dd>peak compute, FLOP/s (H100 SXM bf16 dense ≈ 989 TFLOP/s)</dd></div>
+    <div data-t="t4"><dt>\(Q\)</dt><dd>bytes it must move to or from main memory</dd></div>
+    <div data-t="t5"><dt>\(BW\)</dt><dd>main-memory bandwidth (H100 SXM ≈ 3.35 TB/s)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Compute and memory transfers overlap, so the slower one sets the pace. A kernel is <em>memory-bound</em> when the second term is bigger and <em>compute-bound</em> when the first is.</p>
+  <p class="why"><b>Why it matters</b>This one line explains most of inference performance. The rest of the module is about the two denominators (what sets them) and about how close real code gets to them.</p>
+</div>
+
+<details class="think"><summary>Think first: Llama-3-8B decoding one token at batch 1 on an H100. Which term wins, and by how much?</summary>
+<div>Weights: about 15 GB in bf16 (the matmuls touch ≈ 7.5B parameters). Memory time = 15 GB ÷ 3.35 TB/s ≈ 4.5 ms. Compute: ≈ 15 GFLOP ÷ 989 TFLOP/s ≈ 15 µs. Memory wins by a factor of about 300, which is the ridge point you'll compute in the roofline section. The tensor cores sit idle 99.7% of the step.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="anatomy">Anatomy of an H100</h2>
+
+<p>NVIDIA's Hopper die (GH100) is organised as a hierarchy. The chip contains <strong>GPCs</strong> (graphics processing clusters); each GPC contains <strong>TPCs</strong>, each with two <strong>SMs</strong>; each SM has four <strong>sub-partitions</strong> that each issue one warp instruction per clock. The full die has 144 SMs. The H100 SXM product enables 132 of them, so dies with a few defects can still ship. The specs below are approximate and specific to the SXM5 80 GB part; the PCIe card has 114 SMs and about 2 TB/s of HBM2e.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 980 560" id="fig-h100"></svg>
+<figcaption>An H100-class GPU, drawn schematically (positions and proportions are not to scale). Left: the die, with 8 GPCs of 18 SM sites each (grey sites are disabled on H100 SXM, leaving 132), a 50 MB L2 split into two halves, PCIe and NVLink interfaces, and HBM3 stacks on the same package (5 active stacks, 80 GB, about 3.35 TB/s). Right: one SM, with four sub-partitions, each holding a warp scheduler, a 64 KB slice of the register file, 32 FP32 lanes and one tensor core, sharing 256 KB of L1/shared memory.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Component</th><th class="num">H100 SXM (approx.)</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>SMs</td><td class="num">132</td><td>The unit that runs thread blocks. Everything below "L2" in this table is per SM.</td></tr>
+    <tr><td>FP32 lanes ("CUDA cores")</td><td class="num">128 / SM · 16,896 total</td><td>Scalar float math for elementwise ops, reductions, softmax. Not used for big matmuls.</td></tr>
+    <tr><td>Tensor cores</td><td class="num">4 / SM · 528 total</td><td>Matrix-multiply-accumulate units. Where nearly all LLM FLOPs happen.</td></tr>
+    <tr><td>Warp schedulers</td><td class="num">4 / SM</td><td>Each picks one ready warp per clock and issues its next instruction.</td></tr>
+    <tr><td>Register file</td><td class="num">256 KB / SM (65,536 × 32-bit)</td><td>Private per-thread storage. The fastest and, in total, one of the largest memories on the chip.</td></tr>
+    <tr><td>L1 / shared memory</td><td class="num">256 KB / SM, up to 228 KB shared</td><td>One SRAM array split between a hardware cache (L1) and a programmer-managed scratchpad (shared memory).</td></tr>
+    <tr><td>L2 cache</td><td class="num">50 MB</td><td>Shared by all SMs. Every HBM access passes through it.</td></tr>
+    <tr><td>HBM3</td><td class="num">80 GB · ~3.35 TB/s</td><td>Stacked DRAM beside the die on a silicon interposer. "GPU memory" in everyday speech.</td></tr>
+    <tr><td>Resident threads</td><td class="num">2,048 / SM (64 warps)</td><td>How many threads an SM can keep loaded at once to hide latency.</td></tr>
+    <tr><td>Power</td><td class="num">up to ~700 W</td><td>Board power limit. Clocks drop when it's hit.</td></tr>
+  </tbody>
+</table>
+
+<div class="def"><b>Definition · CUDA core vs tensor core</b>
+<p>A "CUDA core" is NVIDIA's name for one FP32 lane: it does one fused multiply-add on one pair of numbers per clock. A <strong>tensor core</strong> does a small <em>matrix</em> multiply-accumulate per instruction, \(D = AB + C\) on tiles of several hundred elements. Per clock, one H100 tensor core does about 512 bf16 multiply-adds, while one FP32 lane does one. That's why NVIDIA's dense bf16 tensor throughput is about fifteen times its FP32 throughput.</p>
+</div>
+
+<div class="formula" data-name="Peak throughput from the parts list">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{peak}}} = \htmlClass{t2}{n_{\text{SM}}} \times \htmlClass{t3}{\text{ops per clock per SM}} \times \htmlClass{t4}{f_{\text{clk}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{peak}}\)</dt><dd>peak operations per second for one number format</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{SM}}\)</dt><dd>enabled SMs (132)</dd></div>
+    <div data-t="t3"><dt>ops/clk/SM</dt><dd>H100 dense bf16 tensor: 4 tensor cores × 1,024 FLOP = 4,096. FP32 lanes: 128 × 2 = 256</dd></div>
+    <div data-t="t4"><dt>\(f_{\text{clk}}\)</dt><dd>clock, roughly 1.8–2 GHz under load (varies with power and temperature)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Count the units, multiply by work per unit per tick, multiply by ticks per second. 132 × 4,096 × ~1.83 GHz ≈ 989 TFLOP/s for bf16 tensor math; 132 × 256 × ~1.98 GHz ≈ 67 TFLOP/s on the FP32 lanes.</p>
+  <p class="why"><b>Why it matters</b>The headline number assumes every tensor core on every SM finishes an MMA every cycle at full clock. Any idle SM, stalled warp, or power-throttled clock comes straight off it, so real GEMMs land below spec and small or oddly shaped ones land far below.</p>
+</div>
+
+<p>Hopper added three features that matter for the kernels in Module 18. The <strong>Tensor Memory Accelerator</strong> (TMA) copies whole tiles from HBM into shared memory asynchronously, so a warp can issue one instruction and go back to math. <strong>Thread block clusters</strong> let neighbouring blocks on different SMs read each other's shared memory. And <strong>warpgroup MMA</strong> (<code>wgmma</code>) lets four warps (128 threads) drive the tensor cores together, reading operands straight from shared memory.</p>
+
+<div class="flag"><b>Spec sheets are per SKU and approximate</b>
+<p>"H100" covers SXM5 (132 SMs, HBM3, 700 W), PCIe (114 SMs, HBM2e, 350 W), and the H100 NVL variant, plus export variants with cut interconnects. Peak numbers are at boost clock; sustained clocks under a heavy GEMM are often lower. Quote the exact part when you compare.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="hierarchy">The memory hierarchy</h2>
+
+<p>Data that the tensor cores consume travels through a ladder of memories. Each step down gives you roughly ten to a thousand times more capacity, several times less bandwidth, and about ten times more latency. Fast kernels are mostly about keeping data on the upper rungs and reusing it there as many times as possible before it's evicted.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 330" id="fig-hier"></svg>
+<figcaption>Capacity (left, log scale) against bandwidth (right, log scale) for each level of an H100 SXM system. Register and shared-memory capacities are summed over all 132 SMs. All figures are order-of-magnitude approximations: register, shared-memory and L2 bandwidths are estimated from per-clock widths and published microbenchmarks, not official specs. Latencies vary with clock and access pattern.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Level</th><th class="num">Capacity</th><th class="num">Bandwidth (approx.)</th><th class="num">Latency (approx.)</th><th>Who manages it</th></tr></thead>
+  <tbody>
+    <tr><td>Registers</td><td class="num">256 KB / SM</td><td class="num">~100s of TB/s total</td><td class="num">~1 cycle</td><td>Compiler (per thread)</td></tr>
+    <tr><td>Shared memory / L1</td><td class="num">256 KB / SM</td><td class="num">~30 TB/s total</td><td class="num">~30 cycles</td><td>You (shared) / hardware (L1)</td></tr>
+    <tr><td>L2</td><td class="num">50 MB</td><td class="num">~5–10 TB/s</td><td class="num">~200+ cycles</td><td>Hardware</td></tr>
+    <tr><td>HBM3</td><td class="num">80 GB</td><td class="num">3.35 TB/s</td><td class="num">~0.5 µs</td><td>You (<code>cudaMalloc</code>, PyTorch allocator)</td></tr>
+    <tr><td>Host DRAM over PCIe Gen5 x16</td><td class="num">0.5–2 TB</td><td class="num">~64 GB/s per direction</td><td class="num">µs + driver overhead</td><td>You (<code>.to("cuda")</code>, pinned memory)</td></tr>
+    <tr><td>NVMe SSD</td><td class="num">TBs</td><td class="num">~7–14 GB/s</td><td class="num">~100 µs</td><td>File system / loader</td></tr>
+  </tbody>
+</table>
+
+<div class="formula" data-name="Moving n bytes through one level">
+  <div class="tex">$$\htmlClass{t1}{t} \;\approx\; \htmlClass{t2}{L} + \frac{\htmlClass{t3}{n}}{\htmlClass{t4}{BW}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t\)</dt><dd>time to get \(n\) bytes from this level to where they're needed</dd></div>
+    <div data-t="t2"><dt>\(L\)</dt><dd>latency of the first byte: cycles for SRAM, about half a microsecond for HBM, microseconds for PCIe</dd></div>
+    <div data-t="t3"><dt>\(n\)</dt><dd>bytes to move</dd></div>
+    <div data-t="t4"><dt>\(BW\)</dt><dd>sustained bandwidth of that level</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Small transfers are dominated by latency, big ones by bandwidth. Reading 16 GB of weights from HBM takes about 4.8 ms; from host RAM over PCIe it takes about 250 ms.</p>
+</div>
+
+<div id="w-move"></div>
+
+<div class="intuition"><b>Intuition</b>
+<p>Registers are the workbench under your hands. Shared memory is the shelf above the bench. L2 is the storeroom down the hall, HBM is the warehouse across the street, and host RAM is a depot across town reached by one narrow road (PCIe). A good kernel makes one trip to the warehouse per crate and then does as much work as possible at the bench.</p>
+</div>
+
+<div class="pitfall"><b>Pitfall · CPU offload looks like it works</b>
+<p>When a model doesn't fit, frameworks will happily keep some layers in host RAM and stream them over PCIe for every forward pass. It runs, but at 64 GB/s, 16 GB of offloaded weights costs about 0.25 s per decode step: about four tokens per second, no matter how fast the GPU is. If decode suddenly drops to single digits, check whether something got offloaded.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="cuda">The CUDA programming model</h2>
+
+<p>A GPU program is a <strong>kernel</strong>: a function that the CPU launches over a <strong>grid</strong> of threads. The programmer chooses two numbers: how many threads go in a <strong>block</strong> (up to 1,024) and how many blocks make up the grid (effectively unlimited). Every thread runs the same function and uses its built-in coordinates (<code>blockIdx</code>, <code>threadIdx</code>) to decide which data to touch.</p>
+
+<div class="code" data-lang="cuda" data-title="vector add: the kernel and its launch"><pre><code>
+__global__ void vadd(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // my element
+    if (i &lt; n) c[i] = a[i] + b[i];                  // guard the ragged last block
+}
+
+int threads = 256;
+int blocks  = (n + threads - 1) / threads;           // ceil(n / threads)
+vadd&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(a, b, c, n);              // asynchronous: returns immediately
+</code></pre></div>
+
+<div class="formula" data-name="Global thread index and grid size">
+  <div class="tex">$$\htmlClass{t1}{i} = \htmlClass{t2}{\texttt{blockIdx.x}} \cdot \htmlClass{t3}{\texttt{blockDim.x}} + \htmlClass{t4}{\texttt{threadIdx.x}}, \qquad \htmlClass{t5}{\texttt{gridDim.x}} = \left\lceil \frac{\htmlClass{t6}{n}}{\htmlClass{t3}{\texttt{blockDim.x}}} \right\rceil$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(i\)</dt><dd>this thread's position in the whole problem (which array element it owns)</dd></div>
+    <div data-t="t2"><dt>blockIdx.x</dt><dd>which block this thread belongs to: 0 … gridDim.x − 1</dd></div>
+    <div data-t="t3"><dt>blockDim.x</dt><dd>threads per block, chosen at launch (commonly 128–512)</dd></div>
+    <div data-t="t4"><dt>threadIdx.x</dt><dd>this thread's index inside its block: 0 … blockDim.x − 1</dd></div>
+    <div data-t="t5"><dt>gridDim.x</dt><dd>number of blocks launched</dd></div>
+    <div data-t="t6"><dt>\(n\)</dt><dd>problem size, e.g. elements in the vector</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Skip past all the earlier blocks, then add your offset within your block. Round the block count up so every element gets a thread, and guard with <code>if (i &lt; n)</code> so the extra threads in the last block do nothing.</p>
+  <p class="why"><b>Why it matters</b>With \(n = 10^6\) and 256 threads per block, you launch 3,907 blocks. The last one has 64 threads with work and 192 that exit at the guard. Forget the guard and those threads write past the end of the array.</p>
+</div>
+
+<h3>Warps and SIMT</h3>
+<p>The hardware doesn't schedule single threads. It groups each block into <strong>warps</strong> of 32 consecutive threads, and a warp issues one instruction at a time for all 32 lanes. NVIDIA calls this <strong>SIMT</strong> (single instruction, multiple threads). It looks like 32 independent threads in your code, since each has its own registers and can take its own branch, but the hardware runs it like a 32-wide vector unit.</p>
+<p>The cost shows up at branches. If some lanes of a warp take the <code>if</code> and others take the <code>else</code>, the warp runs <em>both</em> paths one after the other with the inactive lanes masked off. That's <strong>warp divergence</strong>. <code>if (threadIdx.x % 2)</code> splits every warp in half and doubles the time of the branchy section. <code>if ((threadIdx.x / 32) % 2)</code> gives the same 50/50 split of threads but no divergence, because the condition is uniform within each warp.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 330" id="fig-grid"></svg>
+<figcaption>From code to hardware. A grid of blocks (left) is handed to SMs by the hardware block scheduler (right). An SM can hold several blocks at once if it has room, and a block stays on its SM until it finishes. Inside a block (middle), threads are grouped into warps of 32 that execute in lockstep. Blocks must not depend on each other's ordering, because the hardware can run them in any order.</figcaption></figure>
+
+<h3>Launching, and the tail effect</h3>
+<p>A kernel launch is asynchronous: the CPU enqueues it on a <strong>stream</strong> and returns, and the GPU runs launches from one stream in order. Each launch costs a few microseconds of CPU and driver time. That's negligible for a 5 ms matmul but dominant for the hundreds of tiny kernels in one decode step of a small model, which is why engines capture decode steps as <strong>CUDA graphs</strong> (Module 18).</p>
+<p>Blocks run in <strong>waves</strong>. If each SM can hold one block of your kernel, the first 132 blocks start together and the 133rd waits for a free SM.</p>
+
+<div class="formula" data-name="Waves and the tail effect">
+  <div class="tex">$$\htmlClass{t1}{\text{waves}} = \left\lceil \frac{\htmlClass{t2}{\text{blocks}}}{\htmlClass{t3}{n_{\text{SM}}} \cdot \htmlClass{t4}{b_{\text{SM}}}} \right\rceil, \qquad \htmlClass{t5}{\text{utilization}} = \frac{\htmlClass{t2}{\text{blocks}}}{\htmlClass{t1}{\text{waves}} \cdot \htmlClass{t3}{n_{\text{SM}}} \cdot \htmlClass{t4}{b_{\text{SM}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>waves</dt><dd>rounds of blocks the GPU needs to run them all</dd></div>
+    <div data-t="t2"><dt>blocks</dt><dd>blocks in the grid</dd></div>
+    <div data-t="t3"><dt>\(n_{\text{SM}}\)</dt><dd>SMs on the chip (132)</dd></div>
+    <div data-t="t4"><dt>\(b_{\text{SM}}\)</dt><dd>blocks that fit on one SM at once (the occupancy section computes this)</dd></div>
+    <div data-t="t5"><dt>utilization</dt><dd>fraction of SM-slots doing work, averaged over all waves</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A partial last wave leaves SMs idle. 264 equal blocks at one per SM is two full waves; 133 blocks is also two waves, but the second runs on 1 SM while 131 sit idle, so utilization is about 50%.</p>
+  <p class="why"><b>Why it matters</b>GEMM libraries pick tile sizes partly to avoid bad tails, and "persistent" kernels launch exactly one block per SM and loop over tiles to sidestep the problem. A matmul whose speed jumps oddly as you change one dimension by a few rows is often hitting a wave boundary.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="coalescing">Coalescing and bank conflicts</h2>
+
+<p>HBM doesn't deliver single floats. The memory system moves data in <strong>32-byte sectors</strong> (grouped into 128-byte cache lines), and when a warp issues a load, the hardware works out which sectors its 32 addresses touch and fetches each one once. If the 32 threads read 32 consecutive 4-byte floats, that's 128 bytes in exactly four sectors: a <strong>coalesced</strong> access with no waste. If they read every fourth float, the same 128 useful bytes are spread across sixteen sectors, and 75% of the bytes fetched are thrown away.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 270" id="fig-coal"></svg>
+<figcaption>One warp, two access patterns, the same 32 useful floats. Top: thread \(t\) reads <code>a[t]</code>; the addresses fall in 4 consecutive 32-byte sectors (green), so every fetched byte is used. Bottom: thread \(t\) reads <code>a[4t]</code>; the warp touches 16 sectors (gold), and only one float in four of what comes back is wanted.</figcaption></figure>
+
+<div class="formula" data-name="Effective bandwidth">
+  <div class="tex">$$\htmlClass{t1}{BW_{\text{eff}}} = \frac{\htmlClass{t2}{\text{useful bytes}}}{\htmlClass{t3}{\text{transferred bytes}}} \times \htmlClass{t4}{BW_{\text{peak}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(BW_{\text{eff}}\)</dt><dd>rate at which data your code actually uses arrives</dd></div>
+    <div data-t="t2"><dt>useful bytes</dt><dd>bytes the threads asked for (32 threads × 4 B = 128 B per warp load)</dd></div>
+    <div data-t="t3"><dt>transferred bytes</dt><dd>sectors touched × 32 B</dd></div>
+    <div data-t="t4"><dt>\(BW_{\text{peak}}\)</dt><dd>what the memory system can deliver (3.35 TB/s HBM3)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every wasted byte in a sector still costs bandwidth. A stride of 2 floats halves effective bandwidth; a stride of 8 or more leaves one useful float per 32-byte sector, 12.5%.</p>
+  <p class="why"><b>Why it matters</b>For a memory-bound kernel (most non-matmul ops), effective bandwidth <em>is</em> speed. Layouts are chosen so the innermost, fastest-varying index maps to consecutive threads: structure-of-arrays rather than array-of-structures, and KV caches laid out so a warp reads a contiguous head dimension.</p>
+</div>
+
+<h3>Shared memory banks</h3>
+<p>Shared memory has its own rule. It's split into <strong>32 banks</strong>, each 4 bytes wide, and successive 4-byte words go to successive banks. A warp's 32 accesses complete in one pass if they hit 32 different banks (or the same word, which is broadcast). If several threads hit <em>different</em> words in the same bank, those accesses are serialized: a \(k\)-way <strong>bank conflict</strong> takes \(k\) passes.</p>
+
+<div class="formula" data-name="Which bank a word lives in">
+  <div class="tex">$$\htmlClass{t1}{\text{bank}} = \left\lfloor \frac{\htmlClass{t2}{\text{addr}}}{\htmlClass{t3}{4}} \right\rfloor \bmod \htmlClass{t4}{32}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>bank</dt><dd>which of the 32 banks serves this address</dd></div>
+    <div data-t="t2"><dt>addr</dt><dd>byte address within shared memory</dd></div>
+    <div data-t="t3"><dt>4</dt><dd>bank width in bytes</dd></div>
+    <div data-t="t4"><dt>32</dt><dd>number of banks, matching the warp size</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Word \(w\) lives in bank \(w \bmod 32\). If thread \(t\) reads word \(s\cdot t\), the conflict degree is \(\gcd(s, 32)\): stride 1 or any odd stride is conflict-free, while stride 32 sends every thread to bank 0, a 32-way conflict.</p>
+  <p class="why"><b>Why it matters</b>Reading a column of a 32×32 float tile is exactly stride 32. The classic fix is to declare the tile as <code>float tile[32][33]</code>: one padding column shifts each row by one bank, and the column read becomes stride 33, which is odd and conflict-free.</p>
+</div>
+
+<div id="w-coal"></div>
+
+<div class="pitfall"><b>Pitfall · transposes and permutes aren't free</b>
+<p>In PyTorch, <code>x.transpose(1, 2)</code> only changes strides. The next kernel that reads it may get a strided, uncoalesced pattern, or PyTorch may insert a <code>.contiguous()</code> copy that costs a full read and write of the tensor. In a profiler, unexpected <code>copy_</code> or <code>elementwise_kernel</code> entries right after a reshape are usually this.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="occupancy">Occupancy and latency hiding</h2>
+
+<p>An HBM load takes on the order of 500 ns, roughly a thousand clock cycles. A warp that needs the result stalls for that long. The SM's answer is to keep many warps resident and, on every cycle, let each scheduler issue from any warp that isn't stalled. If there are enough warps with independent work, the arithmetic units never notice the latency. How many warps an SM can keep resident is limited by its fixed pools of registers, shared memory and thread slots.</p>
+
+<div class="formula" data-name="Occupancy">
+  <div class="tex">$$\htmlClass{t1}{\text{occupancy}} = \frac{\htmlClass{t2}{\text{active warps per SM}}}{\htmlClass{t3}{\text{max warps per SM}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>occupancy</dt><dd>how full the SM's warp slots are, 0 to 100%</dd></div>
+    <div data-t="t2"><dt>active warps</dt><dd>resident blocks × warps per block</dd></div>
+    <div data-t="t3"><dt>max warps</dt><dd>64 on H100 (2,048 threads ÷ 32)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The share of the SM's thread capacity your kernel actually fills. More resident warps means more candidates to switch to when one stalls.</p>
+</div>
+
+<div class="formula" data-name="Resident blocks per SM">
+  <div class="tex">$$\htmlClass{t1}{b_{\text{SM}}} = \min\!\left( \left\lfloor \frac{2048}{\htmlClass{t2}{T}} \right\rfloor,\; 32,\; \left\lfloor \frac{65{,}536}{\htmlClass{t3}{R}\cdot \htmlClass{t2}{T}} \right\rfloor,\; \left\lfloor \frac{228\ \text{KB}}{\htmlClass{t4}{S}} \right\rfloor \right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(b_{\text{SM}}\)</dt><dd>blocks of this kernel that fit on one SM at once</dd></div>
+    <div data-t="t2"><dt>\(T\)</dt><dd>threads per block</dd></div>
+    <div data-t="t3"><dt>\(R\)</dt><dd>registers per thread (set by the compiler; max 255)</dd></div>
+    <div data-t="t4"><dt>\(S\)</dt><dd>shared memory per block (plus ~1 KB the system reserves)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Four resources, four ceilings, and the tightest one wins. With 256 threads and 128 registers each, one block needs 32,768 registers, so only 2 blocks fit: 16 warps, 25% occupancy, even though thread slots would allow 8 blocks.</p>
+  <p class="why"><b>Why it matters</b>To fill all 2,048 thread slots you need at most 32 registers per thread. Compilers trade registers against occupancy; <code>__launch_bounds__</code> and Triton's <code>num_warps</code>/<code>num_stages</code> are the knobs.</p>
+</div>
+
+<div id="w-occ"></div>
+
+<p>Why do warps matter so much? Because to keep a memory pipe full, you need enough requests in flight to cover its latency. This is <strong>Little's law</strong> from queueing theory (Little, 1961), applied to bytes.</p>
+
+<div class="formula" data-name="Little's law for memory">
+  <div class="tex">$$\htmlClass{t1}{\text{bytes in flight}} = \htmlClass{t2}{BW} \times \htmlClass{t3}{\text{latency}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>bytes in flight</dt><dd>outstanding requested-but-not-yet-arrived data needed to saturate the link</dd></div>
+    <div data-t="t2"><dt>\(BW\)</dt><dd>bandwidth to sustain (3.35 TB/s)</dd></div>
+    <div data-t="t3"><dt>latency</dt><dd>round-trip time of one request (~500–600 ns for HBM, approximate)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>3.35 TB/s × 600 ns ≈ 2 MB must be requested and not yet delivered at every instant. Spread across 132 SMs, that's about 15 KB per SM, or about 30 warps per SM each waiting on a 16-byte-per-thread load (512 B per warp).</p>
+  <p class="why"><b>Why it matters</b>Occupancy is one way to get bytes in flight; issuing several independent loads per thread (instruction-level parallelism) and asynchronous copies (<code>cp.async</code>, TMA) are the others. A kernel with few warps and one blocking load each cannot reach peak bandwidth, however clean its access pattern.</p>
+</div>
+
+<div class="flag"><b>Higher occupancy isn't always faster</b>
+<p>Volkov (2010) showed matmul kernels beating vendor libraries at <em>lower</em> occupancy by giving each thread more registers and more independent work. Modern GEMMs and FlashAttention routinely run one or two large blocks per SM: they need big register and shared-memory tiles for reuse, and they get their bytes in flight from asynchronous, pipelined copies rather than from many warps. Treat occupancy as a diagnostic, not a target.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="tensorcores">Tensor cores and number formats</h2>
+
+<p>A tensor core takes a small tile of \(A\), a small tile of \(B\), multiplies them, and adds the result to an accumulator tile \(C\), all in one instruction. Input precision varies; the accumulator is usually FP32 (FP16 accumulation is an option on some parts). The same silicon runs several input formats, and the narrower the format, the more multiply-adds it completes per clock.</p>
+
+<table class="t">
+  <thead><tr><th>Format (H100 SXM)</th><th class="num">Dense TFLOP/s (approx.)</th><th class="num">"With sparsity"</th><th class="num">Bytes / element</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>FP64 (tensor)</td><td class="num">~67</td><td class="num">n/a</td><td class="num">8</td><td>HPC. Irrelevant for LLMs.</td></tr>
+    <tr><td>FP32 (CUDA cores, no tensor)</td><td class="num">~67</td><td class="num">n/a</td><td class="num">4</td><td>Softmax, norms, reductions, anything not a matmul.</td></tr>
+    <tr><td>TF32 (tensor)</td><td class="num">~495</td><td class="num">~989</td><td class="num">4 in memory</td><td>fp32 matmuls when <code>allow_tf32</code> is on: 10-bit mantissa inside the tensor core.</td></tr>
+    <tr><td>BF16 / FP16 (tensor)</td><td class="num">~989</td><td class="num">~1,979</td><td class="num">2</td><td>Default training and inference precision.</td></tr>
+    <tr><td>FP8 E4M3 / E5M2 (tensor)</td><td class="num">~1,979</td><td class="num">~3,958</td><td class="num">1</td><td>W8A8 inference, FP8 training.</td></tr>
+    <tr><td>INT8 (tensor)</td><td class="num">~1,979 TOPS</td><td class="num">~3,958 TOPS</td><td class="num">1</td><td>Integer W8A8 (SmoothQuant-style).</td></tr>
+  </tbody>
+</table>
+
+<div class="def"><b>Definition · "With sparsity"</b>
+<p>Since Ampere, tensor cores can skip work when a weight matrix has <strong>2:4 structured sparsity</strong>: in every group of four consecutive weights, at least two are zero. The hardware stores only the non-zeros plus a small index and does half the multiplies, so spec sheets print a number twice the dense one. Real LLM weights aren't 2:4 sparse. Pruning them that way costs accuracy and usually needs retraining, so production LLM inference almost always runs dense. When a spec sheet has an asterisk, halve the number.</p>
+</div>
+
+<h3>Why lower precision is faster</h3>
+<p>Two separate effects. The first is about <em>compute</em>: the area and energy of a multiplier grow roughly with the square of the number of significand bits it has to handle, so a chip of fixed size and power fits many more narrow multipliers than wide ones. The second is about <em>memory</em>: half the bytes per number means half the HBM traffic, twice as many numbers per register and per shared-memory byte, and twice the arithmetic intensity for the same matmul.</p>
+
+<div class="formula" data-name="Multiplier cost (rule of thumb)">
+  <div class="tex">$$\htmlClass{t1}{A_{\text{mult}}} \;\propto\; \htmlClass{t2}{p}^{\,2}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(A_{\text{mult}}\)</dt><dd>silicon area (and roughly energy) of one multiplier</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>significand width in bits, counting the implicit leading 1: FP32 24, TF32 11, BF16 8, FP8 E4M3 4</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>An array multiplier is a grid of \(p \times p\) partial products. FP32 → 576 units of area, BF16 → 64, FP8 E4M3 → 16. Exponent handling and the wide FP32 accumulator add a cost that doesn't shrink, which is one reason FP8 gets 2× BF16's throughput on H100 rather than 4×.</p>
+  <p class="why"><b>Why it matters</b>This is the physics behind every new format: FP8 on Hopper, FP4 on Blackwell. It's also why bf16 (8-bit significand) and not fp16 (11-bit) is roughly as cheap as it gets for training-grade 16-bit math. Module 09 covers the bit layouts and the accuracy side (<a href="09-quantization.html#floats">number formats</a>, <a href="09-quantization.html#formats">weight-only vs W8A8</a>).</p>
+</div>
+
+<div class="flag"><b>FP8 accumulation isn't full FP32</b>
+<p>The DeepSeek-V3 report (DeepSeek-AI, 2024) found that FP8 GEMM accumulation on Hopper tensor cores keeps fewer bits than true FP32, enough to hurt very long reductions. Their fix was to periodically move partial sums to FP32 registers on the CUDA cores. Libraries now handle this, but it explains why "FP8 matmul" in practice means FP8 inputs, careful scaling, and a higher-precision accumulator somewhere.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="roofline">Roofline deep dive</h2>
+
+<p>The two-speed-limit formula becomes a picture once you divide everything by bytes. The <strong>roofline model</strong> (Williams, Waterman and Patterson, 2009) plots attainable FLOP/s against a kernel's arithmetic intensity on log-log axes. Module 08 introduced it for inference (<a href="08-inference.html#roofline">08 · roofline</a>); here we build it from hardware numbers and apply it to arbitrary matmul shapes.</p>
+
+<div class="formula" data-name="Arithmetic intensity">
+  <div class="tex">$$\htmlClass{t1}{AI} = \frac{\htmlClass{t2}{F}}{\htmlClass{t3}{Q}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(AI\)</dt><dd>arithmetic intensity, FLOP per byte</dd></div>
+    <div data-t="t2"><dt>\(F\)</dt><dd>FLOPs the kernel performs</dd></div>
+    <div data-t="t3"><dt>\(Q\)</dt><dd>bytes moved between HBM and the chip (cache hits don't count)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>How much work you get out of each byte fetched. It's a property of the algorithm and its data layout, independent of the hardware.</p>
+</div>
+
+<div class="formula" data-name="Attainable throughput and the ridge point">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{att}}} = \min\!\big(\htmlClass{t2}{P_{\text{peak}}},\; \htmlClass{t3}{AI} \cdot \htmlClass{t4}{BW}\big), \qquad \htmlClass{t5}{AI^{*}} = \frac{\htmlClass{t2}{P_{\text{peak}}}}{\htmlClass{t4}{BW}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{att}}\)</dt><dd>best FLOP/s this kernel can reach on this chip</dd></div>
+    <div data-t="t2"><dt>\(P_{\text{peak}}\)</dt><dd>peak compute for the format in use (bf16, fp8 …)</dd></div>
+    <div data-t="t3"><dt>\(AI\)</dt><dd>the kernel's arithmetic intensity</dd></div>
+    <div data-t="t4"><dt>\(BW\)</dt><dd>HBM bandwidth</dd></div>
+    <div data-t="t5"><dt>\(AI^{*}\)</dt><dd><b>ridge point</b>: intensity where the slanted memory roof meets the flat compute roof</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Left of the ridge, throughput rises linearly with intensity (memory-bound). Right of it, throughput is flat at peak (compute-bound). H100 bf16: 989 ÷ 3.35 ≈ 295 FLOP/B. FP8 doubles the peak without changing the bandwidth, so its ridge is ≈ 590.</p>
+  <p class="why"><b>Why it matters</b>The ridge point is the single most useful number on a spec sheet. Faster compute without faster memory moves the ridge right and makes more workloads memory-bound, which is what has happened with every GPU generation.</p>
+</div>
+
+<table class="t">
+  <thead><tr><th>Device (approx.)</th><th class="num">HBM / memory BW</th><th class="num">BF16 dense</th><th class="num">Ridge (bf16)</th><th class="num">FP8 dense</th><th class="num">Ridge (fp8)</th></tr></thead>
+  <tbody>
+    <tr><td>H100 SXM</td><td class="num">3.35 TB/s</td><td class="num">989</td><td class="num">≈ 295</td><td class="num">1,979</td><td class="num">≈ 590</td></tr>
+    <tr><td>A100 SXM 80 GB</td><td class="num">2.04 TB/s</td><td class="num">312</td><td class="num">≈ 153</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+    <tr><td>MI300X</td><td class="num">5.3 TB/s</td><td class="num">~1,307</td><td class="num">≈ 247</td><td class="num">~2,615</td><td class="num">≈ 493</td></tr>
+    <tr><td>L40S</td><td class="num">0.86 TB/s</td><td class="num">~362</td><td class="num">≈ 420</td><td class="num">~733</td><td class="num">≈ 850</td></tr>
+    <tr><td>RTX 4090</td><td class="num">1.0 TB/s</td><td class="num">~165 (fp32 acc.)</td><td class="num">≈ 165</td><td class="num">~330</td><td class="num">≈ 330</td></tr>
+    <tr><td>M4 Max GPU (rough)</td><td class="num">~0.55 TB/s</td><td class="num">~17</td><td class="num">≈ 30</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+  </tbody>
+</table>
+
+<p>For a matmul \(C_{M\times N} = A_{M\times K}\,B_{K\times N}\), the FLOPs are \(2MNK\), and a well-tiled kernel reads each input once and writes the output once. In an LLM linear layer, \(M\) is the number of tokens in the batch, \(K\) is the input width and \(N\) the output width, so \(B\) is the weight matrix (Module 01 covers the shapes in <a href="01-linear-algebra.html#gpu">why GPUs love matmuls</a>).</p>
+
+<div class="formula" data-name="Matmul arithmetic intensity">
+  <div class="tex">$$\htmlClass{t1}{AI_{\text{mm}}} = \frac{2\,\htmlClass{t2}{M}\,\htmlClass{t3}{N}\,\htmlClass{t4}{K}}{\htmlClass{t5}{b}\,\big(\htmlClass{t2}{M}\htmlClass{t4}{K} + \htmlClass{t4}{K}\htmlClass{t3}{N} + \htmlClass{t2}{M}\htmlClass{t3}{N}\big)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(AI_{\text{mm}}\)</dt><dd>FLOP per byte for the whole matmul, assuming ideal tiling</dd></div>
+    <div data-t="t2"><dt>\(M\)</dt><dd>rows of the activation: tokens processed together</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>output features</dd></div>
+    <div data-t="t4"><dt>\(K\)</dt><dd>input features (the reduction dimension)</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per element: 4 TF32/fp32, 2 bf16, 1 fp8</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>When \(M\) is small, the weight term \(KN\) dominates the bytes and \(AI \approx 2M/b\): one FLOP per byte per token in bf16. When all three dimensions are large, AI grows like the smallest of them.</p>
+  <p class="why"><b>Why it matters</b>Llama-3-8B's MLP up-projection (\(K = 4096\), \(N = 14{,}336\)) at \(M = 1\) has AI ≈ 1.0 and takes about 35 µs on an H100, all of it reading 117 MB of weights. At \(M = 4096\) the AI is ≈ 1,800, and the same weights feed 4,096 tokens in about 0.5 ms of pure compute.</p>
+</div>
+
+<div id="w-roof"></div>
+
+<details class="think"><summary>Think first: a square 4096³ bf16 matmul is compute-bound on an H100. Is it compute-bound on an M4 Max too? And a 256³ one?</summary>
+<div>4096³ in bf16 has AI = 2·4096³ / (2·3·4096²) ≈ 1,365, well past both ridges (295 and ~30), so it's compute-bound on both, at very different absolute speeds. 256³ has AI ≈ 85: memory-bound on the H100 (below 295) but compute-bound on the Mac (above ~30). The same kernel can sit on different sides of the ridge on different chips. In practice a 256³ matmul is also too small to fill 132 SMs and is dominated by launch overhead.</div>
+</details>
+
+<div class="flag"><b>The roofline is a ceiling, not a prediction</b>
+<p>Real kernels sit below their roof: imperfect tiling re-reads data, small grids leave SMs idle, clocks throttle, and the epilogue (bias, activation, write-back) takes time. Good large GEMMs commonly reach 60–80% of the dense peak; memory-bound kernels commonly reach 70–90% of HBM bandwidth. The model also has more roofs than one: separate L2 and shared-memory rooflines exist, and a kernel can be bound by L2 bandwidth even when its HBM intensity looks fine.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="llm-roofline">Prefill and decode on the roofline</h2>
+
+<p>Module 08 explained why decode is memory-bound and how batching helps (<a href="08-inference.html#roofline">roofline</a>, <a href="08-inference.html#batching">batching</a>). With the matmul intensity formula, you can now see exactly where each phase of LLM inference lands, and how much batching it takes to reach the ridge.</p>
+
+<figure class="fig"><div id="fig-llmroof"></div>
+<figcaption>H100 SXM bf16 roofline with the weight matmuls of one 4096×4096 projection at different token counts \(M\), plus decode attention. Prefill of a 2,048-token prompt sits far right, compute-bound. Decode at batch 1 sits near AI ≈ 1. Batching slides decode right along the memory roof, roughly one FLOP/byte per sequence, until about \(B \approx 300\). Decode attention reads each sequence's own KV cache, so its intensity stays near the GQA group size (4 for Llama-3-8B) at any batch size.</figcaption></figure>
+
+<div class="formula" data-name="Batch size where decode turns compute-bound">
+  <div class="tex">$$\htmlClass{t1}{B^{*}} \;\approx\; \frac{\htmlClass{t2}{AI^{*}} \cdot \htmlClass{t3}{b_w}}{2}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(B^{*}\)</dt><dd>decode batch at which the weight matmuls reach the ridge</dd></div>
+    <div data-t="t2"><dt>\(AI^{*}\)</dt><dd>ridge point for the format the math runs in</dd></div>
+    <div data-t="t3"><dt>\(b_w\)</dt><dd>bytes per <em>weight</em> as stored in HBM</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Decode intensity is about \(2B/b_w\); set it equal to the ridge and solve. H100 bf16: \(B^{*} \approx 295\). W4A16 (4-bit weights, bf16 math): \(B^{*} \approx 295 \times 0.5 / 2 \approx 74\). FP8 W8A8: ridge 590, \(b_w = 1\), \(B^{*} \approx 295\) again.</p>
+  <p class="why"><b>Why it matters</b>Below \(B^{*}\), adding sequences to the batch is almost free for the weight matmuls, so throughput rises nearly linearly. Above it you pay compute for every extra sequence. Weight-only quantization reaches the compute roof at a smaller batch, which is why it helps low-batch latency more than high-batch throughput.</p>
+</div>
+
+<div class="mle"><b>MLE angle · What the roofline says about serving design</b>
+<p>Three engine features follow directly from this picture. Large decode batches amortize each weight read (Module 19's continuous batching keeps the batch full). <strong>Chunked prefill</strong> mixes a compute-bound prefill chunk into memory-bound decode steps so both roofs are used in the same step. <strong>Disaggregated serving</strong> (Module 20) goes further and runs prefill and decode on different GPUs, each sized for its own side of the ridge. And because KV-cache reads don't batch, long contexts drag decode back to the left: at 32K tokens the KV bytes per step can exceed the weight bytes.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="others">Other accelerators</h2>
+
+<p>The same two numbers, compute and bandwidth, plus a third, memory <em>capacity</em>, describe every inference chip. Different designs pick different points in that space.</p>
+
+<h3>Apple Silicon: unified memory</h3>
+<p>M-series chips put CPU, GPU and Neural Engine on one die sharing one pool of LPDDR memory. There's no PCIe copy: a tensor the CPU wrote is already visible to the GPU. Bandwidth scales with the chip tier, roughly 100–120 GB/s for base chips, around 150–270 GB/s for Pro, 400–550 GB/s for Max, and about 800 GB/s for Ultra parts (approximate; varies by generation). Capacity goes up to 128 GB on a Max and higher on Ultra configurations. That makes a Mac good at holding large quantized models and decoding at batch 1, since a 4-bit 70B model fits and decodes at a speed set by bandwidth. GPU compute is modest, tens of TFLOP/s at most, so prefill of long prompts is slow: the ridge sits near 30 FLOP/B, and a 4,000-token prompt is firmly compute-bound.</p>
+
+<h3>AMD MI300X</h3>
+<p>The MI300X pairs eight compute chiplets with <strong>192 GB of HBM3 at about 5.3 TB/s</strong> and a 256 MB on-package Infinity Cache, with bf16 dense peak around 1.3 PFLOP/s (approximate). Its main inference selling point is capacity: Llama-3-70B in bf16 (about 141 GB) fits on one GPU, so no tensor parallelism is needed, and there's more room for KV cache. The programming model is ROCm/HIP, closely modelled on CUDA. One difference that matters for kernel writers: AMD's CDNA GPUs schedule <strong>wavefronts of 64</strong> threads, not warps of 32.</p>
+
+<h3>Google TPUs: systolic arrays</h3>
+<p>A TPU's matrix unit (MXU) is a <strong>systolic array</strong> (Kung, 1982; Jouppi et al., 2017): a grid of multiply-accumulate cells, each wired only to its neighbours. Weights are loaded into the cells once; activations flow in from one edge and partial sums flow out the other. Each operand fetched from memory gets used by a whole row or column of cells without going back through a register file or cache.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 330" id="fig-systolic"></svg>
+<figcaption>A 4×4 weight-stationary systolic array computing \(y = xW\). Each cell holds one weight \(w_{ij}\). Activations \(x_i\) enter from the left, staggered by one cycle per row, and move right; partial sums move down and gain \(x_i w_{ij}\) at each cell. Outputs leave the bottom. Real MXUs are 128×128 (256×256 on newer generations), so each activation fetched is reused across up to 128 multiplies.</figcaption></figure>
+
+<p>TPUs are programmed through the XLA compiler (from JAX, or PyTorch/XLA), which plans data movement statically, and chips connect directly to each other through an inter-chip interconnect arranged as a torus. As one data point, a TPU v5e is listed at about 197 TFLOP/s bf16 with 16 GB of HBM at about 819 GB/s (Google's published figures; check current docs, since generations change quickly).</p>
+
+<h3>SRAM-heavy inference chips</h3>
+<p>If decode is bound by memory bandwidth, one radical answer is to drop HBM and keep weights in on-chip SRAM, whose bandwidth is orders of magnitude higher. <strong>Groq's</strong> LPU has a few hundred MB of SRAM per chip and a compiler that schedules every data movement ahead of time, so execution is deterministic. <strong>Cerebras</strong> builds one processor from an entire wafer with tens of GB of on-wafer SRAM. Both companies report very high single-user tokens/s.</p>
+<div class="grid2">
+  <div class="card"><div class="k">What SRAM buys</div><h4>Bandwidth per byte stored</h4><p>On-chip SRAM delivers far more bandwidth than HBM, so batch-1 decode can run far above a GPU's memory roof. Latency is low and predictable.</p></div>
+  <div class="card bad"><div class="k">What it costs</div><h4>Capacity per dollar</h4><p>SRAM is much less dense than DRAM. A 70B model at 8 bits needs about 70 GB, so it's spread over many chips (hundreds, at a few hundred MB each) with every chip-to-chip link in the critical path. KV cache for long contexts competes for the same scarce memory.</p></div>
+</div>
+<p class="small muted">Figures for these chips are vendor-stated and architectures change between generations; treat this as the conceptual trade-off rather than a benchmark.</p>
+
+<!-- ================================================================== -->
+<h2 id="interconnect">Interconnects</h2>
+
+<p>When a model doesn't fit on one GPU, or you need more bandwidth than one GPU has, chips have to talk. The links between them are slower than HBM by one to two orders of magnitude, and that gap shapes every parallelism strategy in Module 20.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 980 400" id="fig-node"></svg>
+<figcaption>Left: an 8-GPU HGX H100 node. Each GPU's 18 NVLink 4 links are spread across four NVSwitch chips, so any GPU can reach any other at the full ~900 GB/s (bidirectional total). PCIe connects GPUs to CPUs, host memory and network cards. Right: a multi-node cluster with a rail-optimized fabric: GPU \(k\) of every node connects through its own 400 Gb/s NIC to leaf switch \(k\), and leaves connect to spine switches. Simplified; real designs vary.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Link</th><th class="num">Bandwidth (approx.)</th><th>Scope</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>PCIe Gen4 x16</td><td class="num">~32 GB/s per direction</td><td>GPU ↔ CPU, GPU ↔ NIC</td><td>A100-era hosts, most consumer boards.</td></tr>
+    <tr><td>PCIe Gen5 x16</td><td class="num">~64 GB/s per direction</td><td>GPU ↔ CPU, GPU ↔ NIC</td><td>H100 hosts. Practical throughput is lower than nominal.</td></tr>
+    <tr><td>NVLink 4 (H100)</td><td class="num">~900 GB/s total (~450 each way)</td><td>GPU ↔ GPU in a node</td><td>18 links × 25 GB/s each direction. About 7× PCIe Gen5.</td></tr>
+    <tr><td>NVSwitch</td><td class="num">full NVLink rate, any pair</td><td>All 8 GPUs of an HGX node</td><td>Non-blocking switch; newer NVL72 racks extend one NVLink domain to 72 GPUs.</td></tr>
+    <tr><td>InfiniBand NDR</td><td class="num">400 Gb/s = 50 GB/s per port</td><td>Node ↔ node</td><td>Typically one NIC per GPU; RDMA with GPUDirect.</td></tr>
+    <tr><td>RoCE (400 GbE)</td><td class="num">~50 GB/s per port</td><td>Node ↔ node</td><td>RDMA over Converged Ethernet; same idea on Ethernet switches.</td></tr>
+  </tbody>
+</table>
+
+<p>Two features matter for how fast data actually moves. <strong>GPUDirect RDMA</strong> lets a NIC read and write GPU memory directly, without staging through host RAM. And NCCL, the collective library every framework uses, picks routes and algorithms based on the topology <code>nvidia-smi topo -m</code> reports. A link's speed for a given message is well described by two parameters.</p>
+
+<div class="formula" data-name="Link transfer time (α–β model)">
+  <div class="tex">$$\htmlClass{t1}{t} = \htmlClass{t2}{\alpha} + \frac{\htmlClass{t3}{n}}{\htmlClass{t4}{\beta}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t\)</dt><dd>time to deliver a message</dd></div>
+    <div data-t="t2"><dt>\(\alpha\)</dt><dd>fixed per-message latency: software, NIC, switch hops (microseconds; illustrative)</dd></div>
+    <div data-t="t3"><dt>\(n\)</dt><dd>message size in bytes</dd></div>
+    <div data-t="t4"><dt>\(\beta\)</dt><dd>link bandwidth in the direction of transfer</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A fixed toll plus a per-byte charge. Moving 16 GB of weights GPU-to-GPU: about 36 ms over NVLink 4 one way, 250 ms over PCIe Gen5, 320 ms over one 400 Gb/s InfiniBand port.</p>
+</div>
+
+<div class="formula" data-name="Half-bandwidth message size">
+  <div class="tex">$$\htmlClass{t1}{n_{1/2}} = \htmlClass{t2}{\alpha} \cdot \htmlClass{t3}{\beta}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(n_{1/2}\)</dt><dd>message size at which you achieve half the link's bandwidth</dd></div>
+    <div data-t="t2"><dt>\(\alpha\)</dt><dd>per-message latency</dd></div>
+    <div data-t="t3"><dt>\(\beta\)</dt><dd>link bandwidth</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Below \(n_{1/2}\) you're paying mostly latency. With α ≈ 3 µs and β ≈ 450 GB/s, \(n_{1/2}\) ≈ 1.35 MB. A tensor-parallel all-reduce of one decode token's hidden state (8,192 × 2 bytes = 16 KB) is far below it, so it's latency-bound, not bandwidth-bound.</p>
+  <p class="why"><b>Why it matters</b>This is why tensor parallelism across nodes hurts decode so much (dozens of tiny latency-bound all-reduces per token), and why engines keep TP inside the NVLink domain.</p>
+</div>
+
+<div id="w-link"></div>
+
+<div class="pitfall"><b>Pitfall · Gb/s, GB/s, and "total"</b>
+<p>Network links are quoted in giga<em>bits</em> per second (400 Gb/s = 50 GB/s). NVLink is quoted as a bidirectional total (900 GB/s = 450 each way). PCIe is usually quoted per direction. Before you compare, convert everything to gigabytes per second in the direction your data moves.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="picking">Power, cost and picking hardware</h2>
+
+<p>Picking hardware for an inference workload is a sizing exercise with four questions: does it <strong>fit</strong>, is it <strong>fast enough per user</strong>, does it have enough <strong>aggregate compute</strong>, and what does it <strong>cost per token</strong>. The table collects approximate specs; prices and availability change monthly, so the widget below lets you type your own.</p>
+
+<table class="t">
+  <thead><tr><th>Accelerator</th><th class="num">Memory</th><th class="num">Bandwidth</th><th class="num">BF16 dense</th><th class="num">FP8 dense</th><th class="num">Power</th><th>Scale-up link</th></tr></thead>
+  <tbody>
+    <tr><td>H100 SXM</td><td class="num">80 GB HBM3</td><td class="num">3.35 TB/s</td><td class="num">989</td><td class="num">1,979</td><td class="num">700 W</td><td>NVLink 4, 900 GB/s</td></tr>
+    <tr><td>A100 SXM 80 GB</td><td class="num">80 GB HBM2e</td><td class="num">2.04 TB/s</td><td class="num">312</td><td class="num">—</td><td class="num">400 W</td><td>NVLink 3, 600 GB/s</td></tr>
+    <tr><td>L40S</td><td class="num">48 GB GDDR6</td><td class="num">0.86 TB/s</td><td class="num">~362</td><td class="num">~733</td><td class="num">350 W</td><td>PCIe Gen4 only</td></tr>
+    <tr><td>RTX 4090</td><td class="num">24 GB GDDR6X</td><td class="num">1.0 TB/s</td><td class="num">~165</td><td class="num">~330</td><td class="num">450 W</td><td>PCIe Gen4 only</td></tr>
+    <tr><td>MI300X</td><td class="num">192 GB HBM3</td><td class="num">5.3 TB/s</td><td class="num">~1,307</td><td class="num">~2,615</td><td class="num">750 W</td><td>Infinity Fabric</td></tr>
+    <tr><td>Mac, M4 Max (rough)</td><td class="num">up to 128 GB unified</td><td class="num">~0.55 TB/s</td><td class="num">~17</td><td class="num">—</td><td class="num">~100 W</td><td>Thunderbolt</td></tr>
+  </tbody>
+</table>
+<p class="small muted">TFLOP/s are dense (no sparsity). Power is the board limit, not typical draw. All numbers approximate; check the current datasheet for the exact SKU.</p>
+
+<div class="formula" data-name="Serving memory">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{total}}} = \htmlClass{t2}{N}\cdot\frac{\htmlClass{t3}{b}}{8} \;+\; \htmlClass{t4}{c}\cdot \htmlClass{t5}{T}\cdot \htmlClass{t6}{kv} \;+\; \htmlClass{t7}{\text{overhead}}$$</div>
+  <dl class="legend">
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameters</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bits per weight including scales (16, 8.5, 4.5 …)</dd></div>
+    <div data-t="t4"><dt>\(c\)</dt><dd>concurrent sequences</dd></div>
+    <div data-t="t5"><dt>\(T\)</dt><dd>context length per sequence, tokens</dd></div>
+    <div data-t="t6"><dt>\(kv\)</dt><dd>KV-cache bytes per token: 2 · layers · KV heads · head dim · bytes (Llama-3-70B bf16: 320 KiB)</dd></div>
+    <div data-t="t7"><dt>overhead</dt><dd>activations, CUDA context, allocator fragmentation: plan on ~10%</dd></div>
+    <div data-t="t1"><dt>\(M_{\text{total}}\)</dt><dd>memory the deployment needs across all its GPUs</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Weights are a fixed cost; KV cache grows with users × context. Llama-3-70B at 4.5 bits is about 40 GB of weights, but 16 users at 8K context add another 43 GB of bf16 KV cache.</p>
+</div>
+
+<div class="formula" data-name="Cost per million tokens">
+  <div class="tex">$$\htmlClass{t1}{\text{cost}/10^6\ \text{tok}} = \frac{\htmlClass{t2}{n_{\text{GPU}}}\cdot \htmlClass{t3}{p_{\text{hr}}}}{3600 \cdot \htmlClass{t4}{\text{tok/s}_{\text{agg}}}} \times 10^6$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>cost/10⁶ tok</dt><dd>what a million generated tokens costs</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{GPU}}\)</dt><dd>GPUs in the deployment</dd></div>
+    <div data-t="t3"><dt>\(p_{\text{hr}}\)</dt><dd>price per GPU-hour (rental or amortized purchase plus power)</dd></div>
+    <div data-t="t4"><dt>tok/s<sub>agg</sub></dt><dd>tokens per second summed over all concurrent users</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Dollars per hour divided by tokens per hour. Doubling batch size at nearly the same step time roughly halves cost per token, which is the economic engine of LLM serving.</p>
+</div>
+
+<div id="w-pick"></div>
+
+<p>Power is the cost people forget. An 8×H100 node can draw over 10 kW once CPUs, networking and cooling are included, and many datacenters are now limited by power delivery rather than by floor space. Energy per token falls with batch size for the same reason cost does: the board draws similar power whether it serves 1 user or 64.</p>
+
+<div class="mle"><b>MLE angle · A sizing procedure</b>
+<p>(1) Compute weight bytes at the precision you'll serve. (2) Add KV cache for your <em>p95</em> concurrency × context, not the average. (3) Pick the smallest power-of-two GPU count that fits, inside one NVLink domain if you can. (4) Check the per-user decode ceiling (aggregate bandwidth ÷ bytes per step) against your latency target, and expect to reach 60–80% of it. (5) Only then compare $/M tokens, and measure: the widget's numbers are ceilings, and real engines spend time on scheduling, sampling and communication.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<h3>1. Measure matmul TFLOP/s across sizes (CUDA or Apple MPS)</h3>
+<p>This runs square matmuls of growing size and decode-shaped ones (\(M\) small, \(K = N = 8192\)). Watch TFLOP/s climb with size until it plateaus below the spec-sheet peak, and watch the decode shapes report <em>GB/s</em> close to your memory bandwidth instead.</p>
+<div class="code" data-lang="python" data-title="bench_matmul.py"><pre><code>
+import time, torch
+
+dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+dtype = torch.bfloat16 if dev == "cuda" else torch.float16 if dev == "mps" else torch.float32
+# torch.backends.cuda.matmul.allow_tf32 = True   # only matters for fp32 inputs on CUDA
+
+def sync():
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    elif dev == "mps":
+        torch.mps.synchronize()
+
+def bench(m, k, n, iters=50):
+    a = torch.randn(m, k, device=dev, dtype=dtype)
+    b = torch.randn(k, n, device=dev, dtype=dtype)
+    for _ in range(5):                      # warm-up: kernel selection, clocks ramp up
+        a @ b
+    sync()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        c = a @ b
+    sync()                                  # kernels are async: wait before stopping the clock
+    dt = (time.perf_counter() - t0) / iters
+    flops = 2 * m * k * n
+    nbytes = a.element_size() * (m * k + k * n + m * n)
+    return dt, flops / dt / 1e12, nbytes / dt / 1e9, flops / nbytes
+
+print(f"device={dev} dtype={dtype}")
+print(f"{'M x K x N':&gt;18} {'time':&gt;10} {'TFLOP/s':&gt;8} {'GB/s':&gt;7} {'AI':&gt;6}")
+for s in (256, 512, 1024, 2048, 4096, 8192):
+    dt, tf, gbs, ai = bench(s, s, s)
+    print(f"{f'{s}x{s}x{s}':&gt;18} {dt*1e6:8.1f}us {tf:8.1f} {gbs:7.0f} {ai:6.0f}")
+for m in (1, 8, 32, 128, 512, 2048):         # decode-shaped: M = batch of tokens
+    dt, tf, gbs, ai = bench(m, 8192, 8192)
+    print(f"{f'{m}x8192x8192':&gt;18} {dt*1e6:8.1f}us {tf:8.1f} {gbs:7.0f} {ai:6.0f}")
+</code></pre></div>
+
+<h3>2. Know your device</h3>
+<div class="code" data-lang="python" data-title="device_props.py"><pre><code>
+import torch
+
+p = torch.cuda.get_device_properties(0)
+print(p.name, f"compute capability {p.major}.{p.minor}")      # 9.0 = Hopper, 8.9 = Ada, 8.0 = A100
+print("SMs:", p.multi_processor_count)
+print("memory:", round(p.total_memory / 2**30, 1), "GiB")
+for field in ("L2_cache_size", "max_threads_per_multi_processor", "regs_per_multiprocessor", "warp_size"):
+    print(field, getattr(p, field, "n/a in this PyTorch version"))
+free, total = torch.cuda.mem_get_info()
+print(f"free {free / 2**30:.1f} of {total / 2**30:.1f} GiB")
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="nvidia-smi"><pre><code>
+nvidia-smi                                   # overview: memory used, utilization, power, processes
+nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw,clocks.sm,clocks.mem,temperature.gpu \
+           --format=csv -l 1                 # one CSV line per second
+nvidia-smi dmon -s pucvmt                    # p: power/temp  u: sm/mem util  c: clocks  v: throttle violations
+                                             # m: framebuffer memory  t: PCIe rx/tx throughput
+nvidia-smi topo -m                           # which GPU pairs talk over NVLink (NV#) vs PCIe (PIX/PXB/SYS)
+nvidia-smi nvlink --status                   # per-link NVLink speed
+</code></pre></div>
+
+<div class="pitfall"><b>Pitfall · "GPU utilization 100%" means less than it says</b>
+<p><code>utilization.gpu</code> (and the <code>sm</code> column in <code>dmon</code>) is the fraction of time <em>at least one kernel</em> was running. A single tiny kernel on one SM counts as 100%. It says nothing about how many SMs were busy or how close you are to peak. Use the throughput numbers from your own benchmark, or a profiler (Nsight Compute, Module 18), to judge efficiency.</p>
+</div>
+
+<h3>3. A complete CUDA C kernel</h3>
+<p>Vector add is the "hello world" of CUDA and is purely memory-bound: 12 bytes moved per FLOP. Its achieved GB/s is a good estimate of your practical HBM bandwidth.</p>
+<div class="code" data-lang="cuda" data-title="vadd.cu · nvcc -O3 -arch=sm_90 vadd.cu -o vadd"><pre><code>
+#include &lt;cstdio&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void vadd(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) c[i] = a[i] + b[i];
+}
+
+__global__ void fill(float* x, float v, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) x[i] = v;
+}
+
+int main() {
+    const int n = 1 &lt;&lt; 26;                         // 67M floats = 256 MiB per array
+    const size_t bytes = size_t(n) * sizeof(float);
+    float *a, *b, *c;
+    cudaMalloc(&amp;a, bytes); cudaMalloc(&amp;b, bytes); cudaMalloc(&amp;c, bytes);
+
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;   // 262,144 blocks
+    fill&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(a, 1.0f, n);
+    fill&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(b, 2.0f, n);
+    vadd&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(a, b, c, n);          // warm-up
+
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&amp;t0); cudaEventCreate(&amp;t1);
+    cudaEventRecord(t0);
+    for (int r = 0; r &lt; 20; ++r) vadd&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(a, b, c, n);
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float ms = 0.f;
+    cudaEventElapsedTime(&amp;ms, t0, t1);
+    ms /= 20;
+
+    float host_c = 0.f;
+    cudaMemcpy(&amp;host_c, c, sizeof(float), cudaMemcpyDeviceToHost);
+    printf("c[0] = %.1f, %.3f ms, %.0f GB/s\n", host_c, ms, 3.0 * bytes / (ms * 1e6));
+    cudaFree(a); cudaFree(b); cudaFree(c);
+    return 0;
+}
+</code></pre></div>
+<p>Use <code>-arch=sm_80</code> for A100 and <code>sm_89</code> for RTX 4090 / L40S. Try changing <code>threads</code> to 32 and 1024, and try making thread \(i\) read <code>a[(i * 32) % n]</code>: the coalescing widget predicts what happens to GB/s.</p>
+
+<h3>4. On a Mac with MLX</h3>
+<div class="code" data-lang="python" data-title="bench_mlx.py"><pre><code>
+import time
+import mlx.core as mx
+
+def bench(m, k, n, iters=50, dtype=mx.float16):
+    a = mx.random.normal((m, k)).astype(dtype)
+    b = mx.random.normal((k, n)).astype(dtype)
+    mx.eval(a, b)
+    for _ in range(5):
+        mx.eval(a @ b)              # MLX is lazy: eval forces the computation
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        mx.eval(a @ b)
+    dt = (time.perf_counter() - t0) / iters
+    flops = 2 * m * k * n
+    nbytes = 2 * (m * k + k * n + m * n)
+    return flops / dt / 1e12, nbytes / dt / 1e9, flops / nbytes
+
+for s in (512, 1024, 2048, 4096, 8192):
+    tf, gbs, ai = bench(s, s, s)
+    print(f"{s:5d}^3   {tf:6.2f} TFLOP/s   AI {ai:6.0f}")
+for m in (1, 16, 128, 1024):
+    tf, gbs, ai = bench(m, 8192, 8192)
+    print(f"M={m:5d}   {tf:6.2f} TFLOP/s   {gbs:6.0f} GB/s   AI {ai:6.1f}")
+</code></pre></div>
+
+<h3>5. Plot your measurements on a roofline</h3>
+<div class="code" data-lang="python" data-title="plot_roofline.py"><pre><code>
+import numpy as np
+import matplotlib.pyplot as plt
+
+peak, bw = 989e12, 3.35e12            # edit: your device's dense peak (FLOP/s) and bandwidth (B/s)
+# paste (ai, tflops) pairs from bench_matmul.py / bench_mlx.py
+measured = [(1.0, 2.9), (8.0, 23.0), (85, 160), (341, 520), (1365, 700)]
+
+ai = np.logspace(-1, 4, 300)
+plt.loglog(ai, np.minimum(peak, ai * bw) / 1e12, "k-", label="roofline")
+plt.axvline(peak / bw, ls="--", c="gray", label=f"ridge = {peak / bw:.0f} FLOP/B")
+x, y = zip(*measured)
+plt.loglog(x, y, "o", c="tab:green", label="measured")
+plt.xlabel("arithmetic intensity (FLOP/byte)")
+plt.ylabel("TFLOP/s")
+plt.legend()
+plt.grid(True, which="both", alpha=0.3)
+plt.savefig("roofline.png", dpi=150)
+</code></pre></div>
+<p class="small muted">The sample <code>measured</code> values are placeholders to show the format, not real results. Replace them with your own.</p>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have (1) a table of achieved TFLOP/s and GB/s for square sizes 256–8192 and decode shapes \(M\) = 1–2048 on your own device; (2) a log-log roofline plot with your device's peak and bandwidth and every measurement on it; (3) the decode-shaped points sitting near the memory roof and the large square points near the compute roof, and a one-sentence explanation for any point that's far below its roof (launch overhead, too few blocks, wrong dtype, throttled clocks); and (4) the measured \(M\) at which decode-shaped matmuls stop getting faster per token, within a factor of 2 of the ridge point prediction. Bonus: run <code>vadd</code> and report achieved GB/s as a fraction of the datasheet bandwidth.</p>
+</div>
+
+<h3>Further reading</h3>
+<ul>
+  <li><a href="https://resources.nvidia.com/en-us-tensor-core/gtc22-whitepaper-hopper">NVIDIA H100 Tensor Core GPU Architecture</a> (whitepaper, 2022): the source for most of the H100 numbers here.</li>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/">CUDA C++ Programming Guide</a>: the thread hierarchy, memory model, and per-architecture limits tables.</li>
+  <li>Williams, Waterman and Patterson (2009), <a href="https://dl.acm.org/doi/10.1145/1498765.1498785">Roofline: an insightful visual performance model</a>.</li>
+  <li>Horace He, <a href="https://horace.io/brrr_intro.html">Making Deep Learning Go Brrrr From First Principles</a>: compute, memory and overhead as the three regimes.</li>
+  <li>Simon Boehm, <a href="https://siboehm.com/articles/22/CUDA-MMM">How to Optimize a CUDA Matmul Kernel</a>: coalescing, shared-memory tiling and occupancy, measured step by step.</li>
+  <li>Austin et al. (2025), <a href="https://jax-ml.github.io/scaling-book/">How to Scale Your Model</a>: rooflines, TPUs and interconnects for LLMs.</li>
+  <li>Jouppi et al. (2017), <a href="https://arxiv.org/abs/1704.04760">In-Datacenter Performance Analysis of a Tensor Processing Unit</a>.</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="17-main" data-title="Check yourself · GPUs &amp; accelerators">
+  <div class="q" data-answer="1"><p>An H100 SXM does about 1,979 TFLOP/s of dense FP8 tensor math with 3.35 TB/s of HBM bandwidth. What is its FP8 ridge point?</p>
+    <ol><li>≈ 295 FLOP/byte</li><li>≈ 590 FLOP/byte</li><li>≈ 1,180 FLOP/byte</li><li>≈ 59 FLOP/byte</li></ol>
+    <div class="explain">1,979 × 10¹² ÷ 3.35 × 10¹² ≈ 590. FP8 doubles peak compute but bandwidth is unchanged, so the ridge doubles from bf16's ≈ 295 and FP8 kernels need twice the intensity to be compute-bound.</div></div>
+  <div class="q" data-answer="0"><p>Decode at batch 1 runs a bf16 matmul with \(M = 1\), \(K = 8192\), \(N = 8192\). What's its arithmetic intensity?</p>
+    <ol><li>≈ 1 FLOP/byte</li><li>≈ 64 FLOP/byte</li><li>≈ 2,730 FLOP/byte</li><li>≈ 295 FLOP/byte</li></ol>
+    <div class="explain">FLOPs = 2·1·8192·8192 ≈ 134M. Bytes = 2·(8192 + 67.1M + 8192) ≈ 134M. Ratio ≈ 1. Every weight is read once and used once. 2,730 is the square 8192³ case; 295 is the H100's ridge, not this kernel's intensity.</div></div>
+  <div class="q" data-answer="3"><p>On an H100-like SM (65,536 registers, 2,048 threads, 32 blocks, 228 KB shared memory), a kernel uses 256 threads per block, 128 registers per thread and 16 KB of shared memory per block. What limits occupancy, and what is it?</p>
+    <ol><li>Thread slots; 100%</li><li>Shared memory; 50%</li><li>The 32-blocks-per-SM cap; 25%</li><li>Registers; 25%</li></ol>
+    <div class="explain">Registers: 128 × 256 = 32,768 per block, so 2 blocks fit. Threads would allow 8 blocks, shared memory about 13, the block cap 32. Registers win: 2 blocks × 8 warps = 16 of 64 warps = 25%.</div></div>
+  <div class="q" data-answer="2"><p>You copy 16 GB of weights from one H100 to another in the same HGX node. Roughly how long over NVLink 4 (~450 GB/s per direction) versus over PCIe Gen5 x16 (~64 GB/s per direction)?</p>
+    <ol><li>~3.5 ms vs ~25 ms</li><li>~36 ms on both, since HBM is the bottleneck</li><li>~36 ms vs ~250 ms</li><li>~0.36 s vs ~2.5 s</li></ol>
+    <div class="explain">16 GB ÷ 450 GB/s ≈ 36 ms; 16 GB ÷ 64 GB/s = 250 ms. Latency (microseconds) is negligible at this size. HBM at 3.35 TB/s isn't the bottleneck for either link. The ~7× gap is why tensor parallelism lives on NVLink.</div></div>
+  <div class="q" data-answer="0"><p>Why does an H100 deliver about twice as many dense FP8 tensor-core FLOP/s as BF16?</p>
+    <ol><li>An FP8 multiplier handles far fewer significand bits, so it's much smaller and cheaper in energy; the same silicon and power do about twice the multiply-adds per clock, and each operand is half the bytes</li><li>FP8 instructions run at a higher clock frequency</li><li>FP8 automatically uses 2:4 structured sparsity</li><li>FP8 matmuls skip the accumulation step</li></ol>
+    <div class="explain">Multiplier area grows roughly with the square of significand width (4 bits for E4M3 vs 8 for bf16). Clocks are the same, the 2× is dense (sparsity would double it again), and accumulation still happens at higher precision.</div></div>
+  <div class="q" data-answer="3"><p>Each thread \(t\) of a warp reads a 4-byte float at index \(2t\). If this pattern dominates a memory-bound kernel on a 3.35 TB/s GPU, roughly what effective bandwidth do you get for useful data?</p>
+    <ol><li>3.35 TB/s: the hardware coalesces any pattern</li><li>~0.42 TB/s</li><li>~0.1 TB/s</li><li>~1.7 TB/s</li></ol>
+    <div class="explain">32 threads span 64 floats = 256 bytes = 8 sectors of 32 bytes, but only 128 bytes are used. Efficiency 50%, so about 1.7 TB/s. 0.42 TB/s (12.5%) is what you'd get at stride 8 or more.</div></div>
+  <div class="q" data-answer="2"><p>HBM latency is about 600 ns and bandwidth 3.35 TB/s. How many bytes must be in flight across the whole GPU to keep HBM saturated?</p>
+    <ol><li>~2 KB</li><li>~200 KB</li><li>~2 MB</li><li>~2 GB</li></ol>
+    <div class="explain">Little's law: 3.35 × 10¹² B/s × 600 × 10⁻⁹ s ≈ 2 × 10⁶ B. Spread over 132 SMs that's about 15 KB per SM, which is why kernels need many warps or asynchronous copies to reach peak bandwidth.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, widget, fmtNum, palette, clamp } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const fmtT = s => {
+    if (!isFinite(s)) return "∞";
+    if (s < 1e-6) return fmtNum(s * 1e9, s * 1e9 < 10 ? 1 : 0) + " ns";
+    if (s < 1e-3) return fmtNum(s * 1e6, s * 1e6 < 10 ? 1 : 0) + " µs";
+    if (s < 1) return fmtNum(s * 1e3, s * 1e3 < 10 ? 1 : 0) + " ms";
+    if (s < 600) return fmtNum(s, s < 10 ? 2 : 1) + " s";
+    return fmtNum(s / 60, 1) + " min";
+  };
+  const fmtB = b => b >= 1e12 ? fmtNum(b / 1e12, b / 1e12 < 10 ? 2 : 0) + " TB" : b >= 1e9 ? fmtNum(b / 1e9, b / 1e9 < 10 ? 1 : 0) + " GB" : b >= 1e6 ? fmtNum(b / 1e6, b / 1e6 < 10 ? 1 : 0) + " MB" : b >= 1e3 ? fmtNum(b / 1e3, b / 1e3 < 10 ? 1 : 0) + " KB" : fmtNum(b, 0) + " B";
+  const fmtBW = x => x >= 1e12 ? fmtNum(x / 1e12, x / 1e12 < 10 ? 2 : 0) + " TB/s" : fmtNum(x / 1e9, x / 1e9 < 10 ? 1 : 0) + " GB/s";
+  const T = (s, x, y, t, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, text: t }, o || {})));
+  const Rc = (s, x, y, w, h, o) => s.appendChild(svg("rect", Object.assign({ x, y, width: w, height: h, rx: 4 }, o || {})));
+  const Ln = (s, x1, y1, x2, y2, o) => s.appendChild(svg("line", Object.assign({ x1, y1, x2, y2, stroke: palette.ink, "stroke-width": 1.2 }, o || {})));
+  const arrowDefs = (s, id, color) => { const d = svg("defs"); d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color || palette.ink }))); s.appendChild(d); };
+  const box = (s, x, y, w, h, label, fill, stroke, fs, sub) => {
+    Rc(s, x, y, w, h, { fill, stroke: stroke || "none", "stroke-width": 1 });
+    T(s, x + w / 2, y + h / 2 + (sub ? -2 : 4), label, { "text-anchor": "middle", "font-size": fs || 11 });
+    if (sub) T(s, x + w / 2, y + h / 2 + 11, sub, { "text-anchor": "middle", "font-size": (fs || 11) - 1.5, fill: palette.muted });
+  };
+  const tint = { green: "rgba(26,122,82,.16)", greenS: "rgba(26,122,82,.5)", brick: "rgba(176,67,46,.16)", brickS: "rgba(176,67,46,.55)", blue: "rgba(47,93,138,.14)", blueS: "rgba(47,93,138,.5)", gold: "rgba(154,123,34,.18)", goldS: "rgba(154,123,34,.55)", plum: "rgba(122,63,110,.14)", plumS: "rgba(122,63,110,.5)", grey: "#ecebe4" };
+
+  /* horizontal log-scale time bars */
+  function logBars(s, rows, o) {
+    while (s.firstChild) s.removeChild(s.firstChild);
+    const W = o.width, lw = o.labelWidth, rh = o.rowH, x0 = lw, x1 = W - 150;
+    const H = rows.length * rh + 30;
+    s.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const lo = Math.log10(o.min), hi = Math.log10(o.max);
+    const sx = t => x0 + (Math.log10(clamp(t, o.min, o.max)) - lo) / (hi - lo) * (x1 - x0);
+    for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) {
+      const x = sx(10 ** e);
+      Ln(s, x, 4, x, rows.length * rh + 6, { stroke: palette.line, "stroke-dasharray": "2 3", "stroke-width": 1 });
+      T(s, x, rows.length * rh + 22, fmtT(10 ** e), { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted, class: "mono" });
+    }
+    rows.forEach((r, i) => {
+      const y = 6 + i * rh;
+      T(s, lw - 10, y + rh / 2 + 2, r.label, { "text-anchor": "end", "font-size": 12, class: "mono" });
+      if (r.t == null) { T(s, x0 + 4, y + rh / 2 + 2, r.note || "", { fill: palette.brick, "font-size": 11.5, class: "mono" }); return; }
+      const w = Math.max(2, sx(r.t) - x0);
+      Rc(s, x0, y + rh * 0.2, w, rh * 0.6, { rx: 3, fill: r.color || palette.green, opacity: 0.85 });
+      T(s, x0 + w + 6, y + rh / 2 + 2, fmtT(r.t) + (r.note ? "  · " + r.note : ""), { "font-size": 11.5, fill: palette.muted, class: "mono" });
+    });
+  }
+
+  const GPUS = [
+    { v: "h100", l: "H100 SXM 80GB", mem: 80, bw: 3.35, tf32: 495, bf16: 989, fp8: 1979, tdp: 700, price: 2.5 },
+    { v: "a100", l: "A100 SXM 80GB", mem: 80, bw: 2.039, tf32: 156, bf16: 312, fp8: null, tdp: 400, price: 1.5 },
+    { v: "l40s", l: "L40S 48GB", mem: 48, bw: 0.864, tf32: 183, bf16: 362, fp8: 733, tdp: 350, price: 1.0 },
+    { v: "4090", l: "RTX 4090 24GB", mem: 24, bw: 1.008, tf32: 82.6, bf16: 165, fp8: 330, tdp: 450, price: 0.4 },
+    { v: "mi300x", l: "MI300X 192GB", mem: 192, bw: 5.3, tf32: 654, bf16: 1307, fp8: 2615, tdp: 750, price: 2.5 },
+    { v: "mac", l: "Mac M4 Max 128GB (rough)", mem: 128, bw: 0.546, tf32: 17, bf16: 17, fp8: null, tdp: 100, price: 0.15, usable: 0.75 }
+  ];
+  const matmulAI = (M, K, N, b) => (2 * M * N * K) / (b * (M * K + K * N + M * N));
+
+  /* ---------------------------------------------------------- fig: CPU vs GPU */
+  (function () {
+    const s = document.getElementById("fig-cpugpu");
+    // CPU
+    T(s, 20, 20, "CPU · latency-optimized", { "font-size": 13.5, "font-weight": 600 });
+    Rc(s, 20, 30, 400, 228, { fill: "#fff", stroke: palette.line, rx: 8 });
+    for (let j = 0; j < 2; j++) for (let i = 0; i < 4; i++) {
+      const x = 32 + i * 97, y = 42 + j * 82;
+      Rc(s, x, y, 88, 74, { fill: "#fbfaf7", stroke: "rgba(28,27,25,.25)", rx: 5 });
+      box(s, x + 4, y + 4, 80, 22, "control / OoO", tint.gold, null, 9.5);
+      box(s, x + 4, y + 29, 80, 18, "ALU + SIMD", tint.green, null, 9.5);
+      box(s, x + 4, y + 50, 80, 20, "L1 / L2", tint.blue, null, 9.5);
+    }
+    box(s, 32, 210, 376, 38, "shared L3 cache (tens to hundreds of MB)", tint.blue, tint.blueS, 11.5);
+    box(s, 20, 268, 400, 26, "DDR5 · ~50–100 GB/s desktop · ~300–600 GB/s server (approx.)", tint.plum, tint.plumS, 11);
+    T(s, 20, 315, "few cores (tens to ~200), each fast on one thread; big caches avoid stalls", { "font-size": 11.5, fill: palette.muted });
+    // GPU
+    T(s, 470, 20, "GPU · throughput-optimized", { "font-size": 13.5, "font-weight": 600 });
+    Rc(s, 470, 30, 410, 228, { fill: "#fff", stroke: palette.line, rx: 8 });
+    for (let r = 0; r < 6; r++) for (let c = 0; c < 12; c++) {
+      const x = 480 + c * 33, y = 40 + r * 28;
+      Rc(s, x, y, 30, 25, { fill: "#fbfaf7", stroke: "rgba(28,27,25,.2)", rx: 2 });
+      Rc(s, x + 2, y + 2, 26, 4, { fill: tint.goldS, rx: 1 });
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 4; b++) Rc(s, x + 2.5 + b * 6.5, y + 8 + a * 5.5, 5, 4, { fill: tint.greenS, rx: 0.8 });
+    }
+    box(s, 480, 212, 390, 36, "L2 cache (50 MB on H100) · thin per-lane control", tint.blue, tint.blueS, 11.5);
+    box(s, 470, 268, 410, 26, "HBM3 · ~3.35 TB/s (H100 SXM)", tint.plum, tint.plumS, 11);
+    T(s, 470, 315, "132 SMs × 128 FP32 lanes = 16,896 lanes + 528 tensor cores; latency hidden by many warps", { "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: H100 anatomy */
+  (function () {
+    const s = document.getElementById("fig-h100");
+    arrowDefs(s, "arr17h", palette.brick);
+    // HBM stacks
+    const hbm = [[18, 80], [18, 230], [18, 380], [498, 80], [498, 230], [498, 380]];
+    hbm.forEach(([x, y], k) => {
+      const off = k === 5;
+      Rc(s, x, y, 44, 120, { fill: off ? "#fff" : tint.plum, stroke: off ? palette.faint : tint.plumS, "stroke-dasharray": off ? "4 3" : null, rx: 5 });
+      T(s, x + 22, y + 52, "HBM3", { "text-anchor": "middle", "font-size": 10.5, "font-weight": 600, fill: off ? palette.faint : palette.ink });
+      T(s, x + 22, y + 68, off ? "unused" : "16 GB", { "text-anchor": "middle", "font-size": 9.5, fill: palette.muted, class: "mono" });
+    });
+    // die
+    Rc(s, 70, 40, 420, 480, { fill: "#fbfaf7", stroke: "rgba(28,27,25,.3)", rx: 8 });
+    T(s, 280, 30, "GH100 die · H100 SXM enables 132 of 144 SMs", { "text-anchor": "middle", "font-size": 12.5, "font-weight": 600 });
+    box(s, 80, 48, 400, 24, "PCIe Gen5 host interface · block scheduler (GigaThread engine)", tint.gold, tint.goldS, 10.5);
+    const dis = [2, 2, 1, 2, 1, 2, 1, 1];
+    for (let g = 0; g < 8; g++) {
+      const gx = 80 + (g % 4) * 101, gy = g < 4 ? 80 : 304;
+      Rc(s, gx, gy, 96, 176, { fill: "#fff", stroke: "rgba(28,27,25,.22)", rx: 5 });
+      T(s, gx + 48, gy + 14, "GPC " + g, { "text-anchor": "middle", "font-size": 10, class: "mono", fill: palette.muted });
+      for (let k = 0; k < 18; k++) {
+        const col = k % 3, row = Math.floor(k / 3);
+        const x = gx + 8 + col * 28, y = gy + 22 + row * 25;
+        const off = k >= 18 - dis[g];
+        const hl = g === 0 && k === 0;
+        Rc(s, x, y, 24, 21, { fill: off ? tint.grey : tint.green, stroke: hl ? palette.brick : off ? palette.faint : tint.greenS, "stroke-width": hl ? 2 : 0.8, "stroke-dasharray": off ? "2 2" : null, rx: 3 });
+        if (!off) T(s, x + 12, y + 14, "SM", { "text-anchor": "middle", "font-size": 7.5, fill: palette.ink, class: "mono" });
+      }
+    }
+    box(s, 80, 262, 400, 36, "L2 cache · 50 MB (two partitions) · memory controllers to HBM", tint.blue, tint.blueS, 11);
+    box(s, 80, 488, 400, 24, "NVLink 4 · 18 links · ~900 GB/s total", tint.gold, tint.goldS, 10.5);
+    // zoom lines
+    Ln(s, 112, 102, 580, 40, { stroke: palette.brick, "stroke-dasharray": "4 3", "stroke-width": 1 });
+    Ln(s, 112, 123, 580, 520, { stroke: palette.brick, "stroke-dasharray": "4 3", "stroke-width": 1 });
+    // SM panel
+    Rc(s, 580, 40, 390, 480, { fill: "#fff", stroke: palette.brick, "stroke-width": 1.4, rx: 8 });
+    T(s, 775, 30, "One SM (streaming multiprocessor)", { "text-anchor": "middle", "font-size": 12.5, "font-weight": 600 });
+    box(s, 588, 48, 374, 22, "L1 instruction cache", tint.gold, null, 10.5);
+    for (let p = 0; p < 4; p++) {
+      const x = 588 + (p % 2) * 192, y = 76 + Math.floor(p / 2) * 186;
+      Rc(s, x, y, 182, 178, { fill: "#fbfaf7", stroke: "rgba(28,27,25,.22)", rx: 5 });
+      box(s, x + 6, y + 6, 170, 22, "warp scheduler + dispatch", tint.gold, null, 10);
+      box(s, x + 6, y + 32, 170, 24, "register file · 64 KB", tint.plum, tint.plumS, 10.5);
+      box(s, x + 6, y + 60, 82, 46, "FP32 ×32", tint.green, tint.greenS, 10.5);
+      box(s, x + 92, y + 60, 40, 46, "INT32", tint.green, null, 9, "×16");
+      box(s, x + 136, y + 60, 40, 46, "FP64", tint.green, null, 9, "×16");
+      box(s, x + 6, y + 110, 170, 30, "Tensor core (4th gen)", tint.brick, tint.brickS, 11);
+      box(s, x + 6, y + 144, 170, 26, "LD/ST ×8 · SFU ×4", tint.blue, null, 10);
+    }
+    box(s, 588, 450, 374, 32, "L1 data cache / shared memory · 256 KB (up to 228 KB shared)", tint.blue, tint.blueS, 11);
+    box(s, 588, 488, 182, 24, "TMA (async tile copies)", tint.gold, null, 10);
+    box(s, 780, 488, 182, 24, "4 × texture units", tint.grey, null, 10);
+  })();
+
+  /* ---------------------------------------------------------- fig: memory hierarchy butterfly */
+  (function () {
+    const s = document.getElementById("fig-hier");
+    const lv = [
+      ["Registers", 33e6, 300e12, "~1 cycle"],
+      ["Shared mem / L1", 33e6, 30e12, "~30 cycles"],
+      ["L2 cache", 50e6, 7e12, "~200+ cycles"],
+      ["HBM3", 80e9, 3.35e12, "~0.5 µs"],
+      ["Host DRAM via PCIe 5", 1e12, 64e9, "µs"],
+      ["NVMe SSD", 8e12, 7e9, "~100 µs"]
+    ];
+    const cx0 = 360, cx1 = 540, rh = 44, y0 = 46;
+    const capX = c => cx0 - (Math.log10(c) - 6) / 7 * 330;   // 1 MB .. 10 TB
+    const bwX = b => cx1 + (Math.log10(b) - 9) / 6 * 330;     // 1 GB/s .. 1 PB/s
+    T(s, cx0, 24, "← capacity (log scale)", { "text-anchor": "end", "font-size": 12, fill: palette.blue, "font-weight": 600 });
+    T(s, cx1, 24, "bandwidth (log scale) →", { "font-size": 12, fill: palette.green, "font-weight": 600 });
+    T(s, 450, 24, "level · latency", { "text-anchor": "middle", "font-size": 11, fill: palette.muted });
+    lv.forEach(([n, cap, bw, lat], i) => {
+      const y = y0 + i * rh;
+      const xc = capX(cap);
+      Rc(s, xc, y + 6, cx0 - xc, rh - 14, { fill: tint.blue, stroke: tint.blueS, rx: 3 });
+      T(s, xc - 6, y + rh / 2 + 3, fmtB(cap), { "text-anchor": "end", "font-size": 11, class: "mono", fill: palette.blue });
+      const xb = bwX(bw);
+      Rc(s, cx1, y + 6, xb - cx1, rh - 14, { fill: tint.green, stroke: tint.greenS, rx: 3 });
+      T(s, xb + 6, y + rh / 2 + 3, "~" + fmtBW(bw), { "font-size": 11, class: "mono", fill: palette.green });
+      T(s, 450, y + rh / 2 - 1, n, { "text-anchor": "middle", "font-size": 12, "font-weight": 600 });
+      T(s, 450, y + rh / 2 + 12, lat, { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted, class: "mono" });
+    });
+    T(s, 450, y0 + lv.length * rh + 14, "Faster levels are smaller. Register and SMEM capacity summed over 132 SMs. Order-of-magnitude, approximate.", { "text-anchor": "middle", "font-size": 11, fill: palette.faint });
+  })();
+
+  /* ---------------------------------------------------------- fig: grid → blocks → warps → SMs */
+  (function () {
+    const s = document.getElementById("fig-grid");
+    arrowDefs(s, "arr17g", palette.muted);
+    T(s, 20, 24, "Grid · gridDim.x = 8", { "font-size": 12.5, "font-weight": 600 });
+    Rc(s, 20, 34, 236, 120, { fill: "#fff", stroke: palette.line, rx: 6 });
+    for (let k = 0; k < 8; k++) {
+      const x = 30 + (k % 4) * 56, y = 46 + Math.floor(k / 4) * 52;
+      box(s, x, y, 48, 42, "B" + k, k === 2 ? tint.brick : tint.green, k === 2 ? tint.brickS : tint.greenS, 12);
+    }
+    T(s, 20, 176, "Each block: same kernel, its own blockIdx.x.", { "font-size": 11, fill: palette.muted });
+    T(s, 20, 192, "Blocks are independent: any order, any SM.", { "font-size": 11, fill: palette.muted });
+    // block expanded
+    T(s, 290, 24, "Block B2 · blockDim.x = 256 = 8 warps", { "font-size": 12.5, "font-weight": 600 });
+    Rc(s, 290, 34, 280, 180, { fill: "#fff", stroke: tint.brickS, rx: 6 });
+    for (let w = 0; w < 8; w++) {
+      const y = 44 + w * 20;
+      Rc(s, 300, y, 260, 16, { fill: w === 0 ? tint.gold : tint.grey, stroke: w === 0 ? tint.goldS : "none", rx: 3 });
+      T(s, 306, y + 12, `warp ${w} · threads ${w * 32}–${w * 32 + 31}`, { "font-size": 10, class: "mono" });
+    }
+    Ln(s, 154, 67, 290, 60, { stroke: palette.brick, "stroke-dasharray": "4 3", "stroke-width": 1 });
+    // warp 0 lanes
+    T(s, 290, 240, "warp 0: 32 lanes run one instruction together (SIMT)", { "font-size": 11, fill: palette.ink });
+    for (let t = 0; t < 32; t++) Rc(s, 290 + t * 8.6, 250, 7.4, 18, { fill: t % 2 ? tint.goldS : tint.gold, rx: 1.5 });
+    T(s, 290, 286, "if (threadIdx.x % 2) → both paths run, half the lanes masked", { "font-size": 10.5, fill: palette.brick, class: "mono" });
+    T(s, 290, 302, "if ((threadIdx.x / 32) % 2) → uniform per warp, no divergence", { "font-size": 10.5, fill: palette.green, class: "mono" });
+    // SMs
+    T(s, 610, 24, "SMs (4 of 132 shown)", { "font-size": 12.5, "font-weight": 600 });
+    for (let m = 0; m < 4; m++) {
+      const x = 610 + (m % 2) * 140, y = 34 + Math.floor(m / 2) * 120;
+      Rc(s, x, y, 130, 108, { fill: "#fbfaf7", stroke: "rgba(28,27,25,.25)", rx: 6 });
+      T(s, x + 8, y + 16, "SM " + m, { "font-size": 10.5, class: "mono", fill: palette.muted });
+      [m, m + 4].forEach((b, j) => box(s, x + 10 + j * 58, y + 28, 50, 36, "B" + b, b === 2 ? tint.brick : tint.green, b === 2 ? tint.brickS : tint.greenS, 11.5));
+      T(s, x + 65, y + 88, "registers · SMEM shared", { "text-anchor": "middle", "font-size": 9.5, fill: palette.muted });
+    }
+    s.appendChild(svg("path", { d: "M256,94 C 420,10 520,10 606,60", fill: "none", stroke: palette.muted, "stroke-width": 1.3, "marker-end": "url(#arr17g)" }));
+    T(s, 610, 300, "Blocks stay on their SM until they finish;", { "font-size": 11, fill: palette.muted });
+    T(s, 610, 316, "an SM holds as many as its resources allow.", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: coalesced vs strided */
+  (function () {
+    const s = document.getElementById("fig-coal");
+    const x0 = 66, ww = 6;  // 128 words of 4 bytes
+    function row(yLab, yT, yM, stride, label, col, colS) {
+      T(s, 20, yLab, label, { "font-size": 12, "font-weight": 600 });
+      const used = new Set(); for (let t = 0; t < 32; t++) used.add(t * stride);
+      const sectors = new Set([...used].map(w => Math.floor(w / 8)));
+      for (let sc = 0; sc < 16; sc++) Rc(s, x0 + sc * 8 * ww, yM - 3, 8 * ww - 1, 22, { fill: sectors.has(sc) ? col : "#fff", stroke: sectors.has(sc) ? colS : palette.line, rx: 2 });
+      for (let w = 0; w < 128; w++) if (used.has(w)) Rc(s, x0 + w * ww + 0.5, yM, ww - 1.5, 16, { fill: palette.ink, opacity: 0.75, rx: 0.5 });
+      for (let t = 0; t < 32; t++) {
+        const tx = x0 + t * 24 + 12;
+        s.appendChild(svg("circle", { cx: tx, cy: yT, r: 4, fill: palette.blue }));
+        Ln(s, tx, yT + 4, x0 + t * stride * ww + ww / 2, yM - 3, { stroke: palette.blue, "stroke-width": 0.7, opacity: 0.6 });
+      }
+      T(s, 20, yT + 4, "threads", { "font-size": 10, fill: palette.muted, class: "mono" });
+      T(s, 20, yM + 12, "memory", { "font-size": 10, fill: palette.muted, class: "mono" });
+      return sectors.size;
+    }
+    row(18, 38, 94, 1, "Coalesced · thread t reads a[t] → 4 sectors, 128 B moved, 128 B used (100%)", tint.green, tint.greenS);
+    row(148, 168, 224, 4, "Stride 4 · thread t reads a[4t] → 16 sectors, 512 B moved, 128 B used (25%)", tint.gold, tint.goldS);
+    for (let sc = 0; sc <= 16; sc += 4) T(s, x0 + sc * 48, 262, (sc * 32) + " B", { "text-anchor": "middle", "font-size": 10, fill: palette.muted, class: "mono" });
+  })();
+
+  /* ---------------------------------------------------------- fig: systolic array */
+  (function () {
+    const s = document.getElementById("fig-systolic");
+    arrowDefs(s, "arr17s", palette.green);
+    arrowDefs(s, "arr17s2", palette.blue);
+    const gx = 260, gy = 50, cw = 84, ch = 60;
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+      const x = gx + j * cw, y = gy + i * ch;
+      box(s, x, y, 58, 40, `w${i}${j}`, tint.gold, tint.goldS, 12);
+      if (j < 3) s.appendChild(svg("path", { d: `M${x + 60},${y + 20} L${x + cw - 4},${y + 20}`, stroke: palette.green, "stroke-width": 1.4, "marker-end": "url(#arr17s)" }));
+      if (i < 3) s.appendChild(svg("path", { d: `M${x + 29},${y + 42} L${x + 29},${y + ch - 4}`, stroke: palette.blue, "stroke-width": 1.4, "marker-end": "url(#arr17s2)" }));
+    }
+    for (let i = 0; i < 4; i++) {
+      const y = gy + i * ch + 20;
+      for (let k = 0; k <= i; k++) {
+        const x = gx - 40 - k * 34;
+        if (k === 0) T(s, x, y + 4, "x" + i, { "text-anchor": "middle", "font-size": 12, fill: palette.green, class: "mono", "font-weight": 600 });
+        else T(s, x, y + 4, "·", { "text-anchor": "middle", "font-size": 14, fill: palette.faint });
+      }
+      s.appendChild(svg("path", { d: `M${gx - 26},${y} L${gx - 4},${y}`, stroke: palette.green, "stroke-width": 1.4, "marker-end": "url(#arr17s)" }));
+    }
+    T(s, gx - 100, gy - 18, "activations in (skewed by one cycle per row)", { "font-size": 11, fill: palette.green, "text-anchor": "middle" });
+    for (let j = 0; j < 4; j++) {
+      const x = gx + j * cw + 29;
+      s.appendChild(svg("path", { d: `M${x},${gy + 3 * ch + 42} L${x},${gy + 4 * ch + 4}`, stroke: palette.blue, "stroke-width": 1.4, "marker-end": "url(#arr17s2)" }));
+      T(s, x, gy + 4 * ch + 22, "y" + j, { "text-anchor": "middle", "font-size": 12, fill: palette.blue, class: "mono", "font-weight": 600 });
+    }
+    T(s, gx + 160, gy + 4 * ch + 42, "partial sums flow down; y_j = Σ_i x_i · w_ij leaves the bottom", { "text-anchor": "middle", "font-size": 11, fill: palette.blue });
+    const tx = 620;
+    Rc(s, tx, 50, 260, 210, { fill: "#fbfaf7", stroke: palette.line, rx: 8 });
+    [["Each cell, every cycle:", 600], ["  psum_out = psum_in + x · w", 400], ["  pass x to the right neighbour", 400], ["  pass psum_out down", 400], ["", 400], ["Weights loaded once, reused", 600], ["for every activation that flows", 400], ["past. No register-file or cache", 400], ["traffic per multiply-add.", 400], ["", 400], ["TPU MXU: 128×128 cells", 600], ["(256×256 on newer chips).", 400]].forEach(([t, wgt], i) =>
+      T(s, tx + 14, 72 + i * 16, t, { "font-size": 11.5, "font-weight": wgt, class: t.startsWith("  ") ? "mono" : null }));
+  })();
+
+  /* ---------------------------------------------------------- fig: 8-GPU node + cluster */
+  (function () {
+    const s = document.getElementById("fig-node");
+    T(s, 20, 22, "One HGX H100 node · 8 GPUs", { "font-size": 13, "font-weight": 600 });
+    Rc(s, 20, 32, 500, 356, { fill: "#fff", stroke: palette.line, rx: 8 });
+    const gpus = [];
+    for (let i = 0; i < 8; i++) {
+      const x = 36 + (i % 4) * 120, y = i < 4 ? 46 : 268;
+      gpus.push([x + 50, i < 4 ? y + 44 : y]);
+      box(s, x, y, 100, 44, "GPU " + i, tint.green, tint.greenS, 11.5, "H100 · 80 GB");
+    }
+    const sw = [];
+    for (let k = 0; k < 4; k++) { const x = 50 + k * 120; sw.push([x + 36, 162, 198]); }
+    gpus.forEach(([gx, gy]) => sw.forEach(([sx, yt, yb]) => Ln(s, gx, gy, sx, gy < 160 ? yt : yb, { stroke: palette.green, "stroke-width": 0.7, opacity: 0.55 })));
+    for (let k = 0; k < 4; k++) box(s, 50 + k * 120, 162, 72, 36, "NVSwitch", tint.gold, tint.goldS, 11);
+    T(s, 270, 224, "18 NVLink 4 links per GPU · ~900 GB/s total · any-to-any", { "text-anchor": "middle", "font-size": 11, fill: palette.green });
+    box(s, 36, 326, 460, 50, "PCIe Gen5 switches · 2 CPUs + host DRAM", tint.blue, tint.blueS, 11, "8 × 400 Gb/s NICs (one per GPU) to the cluster fabric");
+    // cluster
+    T(s, 560, 22, "Cluster · rail-optimized fabric", { "font-size": 13, "font-weight": 600 });
+    Rc(s, 560, 32, 400, 356, { fill: "#fff", stroke: palette.line, rx: 8 });
+    const spines = [[640, 54], [800, 54]];
+    const leaves = [600, 690, 780, 870].map(x => [x, 150]);
+    leaves.forEach(([lx, ly]) => spines.forEach(([sx, sy]) => Ln(s, lx + 32, ly, sx + 40, sy + 32, { stroke: palette.gold, "stroke-width": 1, opacity: 0.8 })));
+    spines.forEach(([x, y]) => box(s, x, y, 80, 32, "spine", tint.gold, tint.goldS, 11));
+    leaves.forEach(([x, y], k) => box(s, x, y, 64, 32, "leaf " + k, tint.blue, tint.blueS, 10.5));
+    const nodes = [580, 676, 772, 868];
+    nodes.forEach((nx, n) => {
+      Rc(s, nx, 276, 80, 60, { fill: "#fbfaf7", stroke: "rgba(28,27,25,.25)", rx: 5 });
+      T(s, nx + 40, 350, "node " + n, { "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted });
+      for (let g = 0; g < 8; g++) Rc(s, nx + 6 + (g % 4) * 18, 284 + Math.floor(g / 4) * 24, 14, 18, { fill: tint.green, stroke: tint.greenS, rx: 2 });
+      leaves.forEach(([lx, ly]) => Ln(s, nx + 40, 276, lx + 32, ly + 32, { stroke: palette.blue, "stroke-width": 0.8, opacity: 0.5 }));
+    });
+    T(s, 760, 230, "GPU k of every node → leaf k (simplified)", { "text-anchor": "middle", "font-size": 11, fill: palette.blue });
+    T(s, 760, 372, "InfiniBand NDR or RoCE · ~50 GB/s per GPU, ~9× below NVLink", { "text-anchor": "middle", "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: LLM phases on the roofline */
+  (function () {
+    const host = document.getElementById("fig-llmroof");
+    const peak = 989, bw = 3.35;
+    const P = plot(host, { width: 760, height: 340, x: [0.3, 1e4], y: [0.5, 3000], logx: true, logy: true, xlabel: "arithmetic intensity (FLOP / byte, log)", ylabel: "attainable TFLOP/s (log)", margin: { l: 60, b: 44 } });
+    const att = ai => Math.min(peak, ai * bw);
+    const pts = [
+      ["decode B=1", matmulAI(1, 4096, 4096, 2), palette.brick],
+      ["B=16", matmulAI(16, 4096, 4096, 2), palette.gold],
+      ["B=64", matmulAI(64, 4096, 4096, 2), palette.gold],
+      ["B=256", matmulAI(256, 4096, 4096, 2), palette.gold],
+      ["prefill 2,048 tok", matmulAI(2048, 4096, 4096, 2), palette.green]
+    ];
+    const layers = [
+      { fn: att, color: palette.ink, width: 2.2 },
+      { vline: peak / bw, color: palette.muted, label: "ridge ≈ 295" },
+      { text: [0.45, 1.3], label: "memory-bound", color: palette.brick },
+      { text: [1200, 1500], label: "compute-bound", color: palette.green }
+    ];
+    pts.forEach(([l, ai, c]) => layers.push({ marker: [ai, att(ai)], color: c, label: l }));
+    layers.push({ marker: [4, att(4)], color: palette.plum, label: "decode attention (GQA r=4)" });
+    P.draw(layers);
+  })();
+
+  /* ---------------------------------------------------------- widget: how long to move X bytes */
+  (function () {
+    const w = widget("w-move", { title: "How long does it take to move X bytes?", kicker: "Calculator", note: "t ≈ latency + bytes ÷ bandwidth, H100 SXM system, order-of-magnitude values: registers ~300 TB/s, shared/L1 ~30 TB/s, L2 ~7 TB/s (estimates, not specs), HBM3 3.35 TB/s, NVLink 4 450 GB/s one way, PCIe Gen5 x16 64 GB/s, NVMe 7 GB/s. A level whose total capacity is smaller than X can't hold it all at once; the bar shows the streaming time anyway, greyed." });
+    const LV = [
+      { n: "Registers", cap: 33e6, bw: 300e12, lat: 0.5e-9 },
+      { n: "Shared mem / L1", cap: 33e6, bw: 30e12, lat: 15e-9 },
+      { n: "L2 cache", cap: 50e6, bw: 7e12, lat: 120e-9 },
+      { n: "HBM3", cap: 80e9, bw: 3.35e12, lat: 500e-9 },
+      { n: "Peer GPU · NVLink 4", cap: 80e9, bw: 450e9, lat: 3e-6 },
+      { n: "Host RAM · PCIe 5", cap: 2e12, bw: 64e9, lat: 5e-6 },
+      { n: "NVMe SSD", cap: 8e12, bw: 7e9, lat: 100e-6 }
+    ];
+    const sz = slider(w.controls, { label: "Bytes to move", min: 3, max: 11.2, step: 0.02, value: Math.log10(16e9), fmt: v => fmtB(10 ** v), onInput: draw });
+    const presets = el("div", { class: "btnrow" });
+    [["128×128 bf16 tile", 32768], ["4096×14336 bf16 weight", 117.4e6], ["8B KV @ 8K ctx", 1.07e9], ["8B bf16 weights", 16e9], ["70B bf16 weights", 141e9]].forEach(([l, b]) =>
+      presets.appendChild(el("button", { class: "btn", text: l, onclick: () => { sz.value = Math.log10(b); draw(); } })));
+    w.controls.appendChild(el("div", { class: "ctl", style: { gridColumn: "1 / -1" } }, [el("label", null, el("span", { text: "Presets" })), presets]));
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 280" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "hbm", label: "From HBM" }, { key: "pcie", label: "From host over PCIe" }, { key: "ratio", label: "PCIe ÷ HBM" }, { key: "tps", label: "If read once per token" }]);
+    function draw() {
+      const n = 10 ** sz.value;
+      const rows = LV.map(l => ({ label: l.n, t: l.lat + n / l.bw, color: n > l.cap ? palette.faint : (l.bw >= 3e12 ? palette.green : l.bw >= 4e11 ? palette.gold : palette.brick), note: n > l.cap ? "exceeds " + fmtB(l.cap) : "" }));
+      logBars(s, rows, { width: 760, labelWidth: 150, rowH: 34, min: 1e-9, max: 100 });
+      const th = rows[3].t, tp = rows[5].t;
+      set("hbm", fmtT(th), null, fmtB(n) + " at 3.35 TB/s");
+      set("pcie", fmtT(tp), tp > 0.05 ? "bad" : null, "64 GB/s per direction");
+      set("ratio", fmtNum(tp / th, 0) + "×", null, "why offload hurts");
+      set("tps", fmtNum(1 / th, 1 / th < 10 ? 1 : 0) + " tok/s", 1 / th > 30 ? "good" : "warn", "HBM-bound decode ceiling");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: coalescing and bank conflicts */
+  (function () {
+    const w = widget("w-coal", { title: "One warp, one load: sectors and banks", kicker: "Interactive", note: "Thread t (0–31) reads element offset + t·stride. Top: which 32-byte global-memory sectors the warp touches; colour is the fraction of each sector actually used. Bottom: how many distinct shared-memory words land in each of the 32 banks (the tallest column is the conflict degree). Simplified model: real hardware also has 128-byte line effects and caches." });
+    let esize = 4;
+    const st = slider(w.controls, { label: "Stride (elements)", min: 1, max: 33, step: 1, value: 1, fmt: v => String(v), onInput: draw });
+    const of = slider(w.controls, { label: "Offset (elements)", min: 0, max: 31, step: 1, value: 0, fmt: v => String(v), onInput: draw });
+    const cs = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Element size" })));
+    seg(cs, { options: [{ value: 4, label: "4 B (fp32)" }, { value: 2, label: "2 B (bf16)" }], value: 4, onChange: v => { esize = v; draw(); } });
+    w.controls.appendChild(cs);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 300" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "sec", label: "Sectors fetched" }, { key: "eff", label: "Useful / moved" }, { key: "bw", label: "Effective HBM BW" }, { key: "bank", label: "Bank conflict" }]);
+    function draw() {
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const stride = st.value, off = of.value;
+      const addrs = Array.from({ length: 32 }, (_, t) => (off + t * stride) * esize);
+      const secMap = new Map();
+      addrs.forEach(a => { const k = Math.floor(a / 32); secMap.set(k, (secMap.get(k) || 0) + esize); });
+      const nSec = secMap.size, moved = nSec * 32, useful = 32 * esize, eff = useful / moved;
+      // sector grid: up to 160 sectors (20 per row)
+      T(s, 10, 16, "global memory, 32-byte sectors (first " + 160 * 32 + " B)", { "font-size": 11, fill: palette.muted });
+      for (let k = 0; k < 160; k++) {
+        const x = 10 + (k % 40) * 18.5, y = 24 + Math.floor(k / 40) * 22;
+        const u = secMap.get(k) || 0;
+        Rc(s, x, y, 16, 18, { fill: u ? C.heat(0.25 + 0.75 * u / 32, "green") : "#fff", stroke: u ? tint.greenS : palette.line, rx: 2 });
+      }
+      // banks
+      const words = addrs.map(a => Math.floor(a / 4));
+      const perBank = Array.from({ length: 32 }, () => new Set());
+      words.forEach(wd => perBank[wd % 32].add(wd));
+      const deg = Math.max(...perBank.map(b => b.size));
+      T(s, 10, 136, "shared memory: distinct words per bank (32 banks × 4 B)", { "font-size": 11, fill: palette.muted });
+      const by = 280, unit = Math.min(14, 120 / Math.max(deg, 1));
+      perBank.forEach((b, i) => {
+        const x = 10 + i * 23.3;
+        for (let k = 0; k < b.size; k++) Rc(s, x, by - (k + 1) * unit, 20, unit - 1.5, { fill: b.size === deg && deg > 1 ? palette.brick : palette.green, opacity: 0.8, rx: 1.5 });
+        T(s, x + 10, by + 14, String(i), { "text-anchor": "middle", "font-size": 9, fill: palette.muted, class: "mono" });
+      });
+      Ln(s, 10, by, 755, by, { stroke: palette.ink, "stroke-width": 1 });
+      set("sec", String(nSec), nSec <= Math.ceil(useful / 32) ? "good" : nSec <= 2 * Math.ceil(useful / 32) ? "warn" : "bad", fmtNum(moved, 0) + " B moved for " + useful + " B");
+      set("eff", fmtNum(eff * 100, 0) + "%", eff > 0.9 ? "good" : eff > 0.4 ? "warn" : "bad", "of fetched bytes are used");
+      set("bw", fmtBW(eff * 3.35e12), eff > 0.9 ? "good" : eff > 0.4 ? "warn" : "bad", "of 3.35 TB/s peak");
+      set("bank", deg === 1 ? "none" : deg + "-way", deg === 1 ? "good" : deg <= 2 ? "warn" : "bad", deg === 1 ? "one pass" : deg + " serialized passes");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: occupancy calculator */
+  (function () {
+    const w = widget("w-occ", { title: "Occupancy calculator (H100-like SM)", kicker: "Interactive", note: "Approximate H100 limits: 65,536 registers, 2,048 threads (64 warps), 32 blocks and 228 KB shared memory per SM; 227 KB max per block, ~1 KB reserved per block. Registers are rounded up to a multiple of 8 per thread to mimic allocation granularity. NVIDIA's own occupancy calculator models granularity more exactly." });
+    let T_ = 256;
+    const ct = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Threads per block" })));
+    seg(ct, { options: [64, 128, 256, 512, 1024].map(v => ({ value: v, label: String(v) })), value: 256, onChange: v => { T_ = v; draw(); } });
+    w.controls.appendChild(ct);
+    const rg = slider(w.controls, { label: "Registers per thread", min: 16, max: 255, step: 1, value: 64, fmt: v => String(v), onInput: draw });
+    const sm = slider(w.controls, { label: "Shared memory per block", min: 0, max: 227, step: 1, value: 0, fmt: v => v + " KB", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 150, horizontal: true, labelWidth: 170 });
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const P = plot(wrap2, { width: 760, height: 220, x: [16, 255], y: [0, 100], xlabel: "registers per thread", ylabel: "occupancy %", margin: { l: 52, b: 40 } });
+    const set = stats(w.body, [{ key: "blocks", label: "Blocks per SM" }, { key: "warps", label: "Active warps" }, { key: "occ", label: "Occupancy" }, { key: "lim", label: "Limiting resource" }]);
+    function calc(regs, Tn, smemKB) {
+      const rr = Math.ceil(regs / 8) * 8;
+      const lim = {
+        "thread slots (2048)": Math.floor(2048 / Tn),
+        "block cap (32)": 32,
+        "registers (65,536)": Math.floor(65536 / (rr * Tn)),
+        "shared memory (228 KB)": smemKB > 0 ? Math.floor(228 / (smemKB + 1)) : 32
+      };
+      const blocks = Math.min(...Object.values(lim));
+      return { lim, blocks, warps: blocks * Tn / 32, occ: blocks * Tn / 32 / 64 };
+    }
+    function draw() {
+      const r = calc(rg.value, T_, sm.value);
+      const names = Object.keys(r.lim), vals = names.map(n => r.lim[n]);
+      B.draw(names, vals.map(v => Math.min(v, 32)), { max: 32, colors: vals.map(v => v === r.blocks ? palette.brick : palette.green), fmt: v => fmtNum(v, 0) + " blocks" });
+      const curve = []; for (let x = 16; x <= 255; x++) curve.push([x, calc(x, T_, sm.value).occ * 100]);
+      P.draw([{ points: curve, color: palette.blue, width: 2 }, { marker: [rg.value, r.occ * 100], color: palette.brick, label: fmtNum(r.occ * 100, 0) + "%" }]);
+      const limiting = names.filter(n => r.lim[n] === r.blocks).join(" + ");
+      if (r.blocks === 0) {
+        set("blocks", "0", "bad", "kernel fails to launch");
+        set("warps", "0", "bad", "too many resources requested");
+        set("occ", "0%", "bad");
+        set("lim", limiting.split(" (")[0], "bad", "reduce regs or threads");
+        return;
+      }
+      set("blocks", String(r.blocks), null, `${T_ / 32} warps each`);
+      set("warps", `${r.warps} / 64`, null, `${r.warps * 32} threads resident`);
+      set("occ", fmtNum(r.occ * 100, 0) + "%", r.occ >= 0.5 ? "good" : r.occ >= 0.25 ? "warn" : "bad", "of max warps");
+      set("lim", limiting.replace(/ \([^)]*\)/g, ""), null, "tightest ceiling");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: matmul roofline */
+  (function () {
+    const w = widget("w-roof", { title: "Put a matmul on the roofline", kicker: "Interactive", note: "Ideal-tiling model: each of A (M×K), B (K×N) and C (M×N) crosses HBM once. Time = max(FLOPs ÷ peak, bytes ÷ bandwidth); real kernels land below the roof. Peaks are approximate dense tensor-core numbers. On chips without FP8 tensor cores, FP8 storage is assumed to be upcast and multiplied at bf16 speed. Mac figures are rough." });
+    const MS = Array.from({ length: 15 }, (_, i) => 2 ** i);
+    const KS = [512, 1024, 2048, 4096, 5120, 8192, 14336, 16384, 28672, 32768];
+    let dt = "bf16", gpu = GPUS[0];
+    const ms = slider(w.controls, { label: "M (tokens in batch)", min: 0, max: MS.length - 1, step: 1, value: 0, fmt: i => fmtNum(MS[i], 0), onInput: draw });
+    const ks = slider(w.controls, { label: "K (input features)", min: 0, max: KS.length - 1, step: 1, value: 3, fmt: i => fmtNum(KS[i], 0), onInput: draw });
+    const ns = slider(w.controls, { label: "N (output features)", min: 0, max: KS.length - 1, step: 1, value: 6, fmt: i => fmtNum(KS[i], 0), onInput: draw });
+    const cd = el("div", { class: "ctl" }, el("label", null, el("span", { text: "dtype" })));
+    seg(cd, { options: [{ value: "tf32", label: "TF32" }, { value: "bf16", label: "BF16" }, { value: "fp8", label: "FP8" }], value: "bf16", onChange: v => { dt = v; draw(); } });
+    w.controls.appendChild(cd);
+    select(w.controls, { label: "GPU", options: GPUS.map(g => ({ value: g.v, label: g.l })), value: "h100", onChange: v => { gpu = GPUS.find(g => g.v === v); draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 330, x: [0.1, 1e4], y: [0.1, 5000], logx: true, logy: true, xlabel: "arithmetic intensity (FLOP / byte)", ylabel: "TFLOP/s", margin: { l: 60, b: 44 } });
+    const set = stats(w.body, [{ key: "ai", label: "Arithmetic intensity" }, { key: "reg", label: "Regime" }, { key: "att", label: "Attainable" }, { key: "time", label: "Time per matmul" }, { key: "ridge", label: "Ridge point" }]);
+    const bytesOf = { tf32: 4, bf16: 2, fp8: 1 };
+    function draw() {
+      const M = MS[ms.value], K = KS[ks.value], N = KS[ns.value], b = bytesOf[dt];
+      const peak = (dt === "fp8" ? (gpu.fp8 || gpu.bf16) : gpu[dt]) * 1e12;
+      const bw = gpu.bw * 1e12;
+      const F = 2 * M * N * K, Q = b * (M * K + K * N + M * N), ai = F / Q;
+      const att = Math.min(peak, ai * bw), ridge = peak / bw;
+      const tC = F / peak, tM = Q / bw, t = Math.max(tC, tM);
+      const sweep = MS.map(m => { const a = matmulAI(m, K, N, b); return [a, Math.min(peak, a * bw) / 1e12]; });
+      const layers = [
+        { fn: x => Math.min(peak, x * bw) / 1e12, color: palette.ink, width: 2.2, label: `${gpu.l} · ${dt.toUpperCase()}${dt === "fp8" && !gpu.fp8 ? " (no FP8 cores)" : ""}` },
+        { fn: x => Math.min(gpu.bf16 * 1e12, x * bw) / 1e12, color: palette.faint, width: 1, dash: "4 3" },
+        { vline: ridge, color: palette.muted, label: "ridge " + fmtNum(ridge, 0) },
+        { points: sweep, color: palette.blue, width: 1, dots: true, r: 2.5, dash: "2 3" },
+        { marker: [ai, att / 1e12], color: ai < ridge ? palette.brick : palette.green, r: 6, label: `M=${fmtNum(M, 0)}` }
+      ];
+      P.draw(layers);
+      set("ai", fmtNum(ai, ai < 10 ? 2 : 0) + " FLOP/B", null, `${fmtNum(F / 1e9, F < 1e10 ? 2 : 0)} GFLOP · ${fmtB(Q)}`);
+      set("reg", ai < ridge ? "memory-bound" : "compute-bound", ai < ridge ? "bad" : "good", ai < ridge ? `need ${fmtNum(ridge / ai, 1)}× more intensity` : `${fmtNum(ai / ridge, 1)}× past the ridge`);
+      set("att", fmtNum(att / 1e12, att < 1e13 ? 1 : 0) + " TFLOP/s", null, fmtNum(100 * att / peak, 0) + "% of peak");
+      set("time", fmtT(t), null, `compute ${fmtT(tC)} · memory ${fmtT(tM)}`);
+      set("ridge", fmtNum(ridge, 0) + " FLOP/B", null, `${fmtNum(peak / 1e12, 0)} TFLOP/s ÷ ${fmtBW(bw)}`);
+    }
+    draw();
+    w.body.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 0" }, html: "Blue dots: the same K×N weight at M = 1, 2, 4 … 16,384. Grey dashed line: the BF16 roof, for comparison when TF32 or FP8 is selected." }));
+  })();
+
+  /* ---------------------------------------------------------- widget: interconnect transfer time */
+  (function () {
+    const w = widget("w-link", { title: "Move weights or KV cache over each link", kicker: "Calculator", note: "t = α + n ÷ β with nominal one-direction bandwidths; real transfers usually reach 70–90% of nominal. Latencies α are illustrative (including software). The '8× NDR' row assumes the transfer is split evenly over a node's 8 NICs." });
+    const LINKS = [
+      { n: "HBM3 (local copy, ref.)", bw: 3.35e12, a: 1e-6 },
+      { n: "NVLink 4 (one way)", bw: 450e9, a: 3e-6 },
+      { n: "8× IB NDR (whole node)", bw: 400e9, a: 5e-6 },
+      { n: "PCIe Gen5 x16", bw: 64e9, a: 5e-6 },
+      { n: "IB NDR 400 Gb/s (1 port)", bw: 50e9, a: 5e-6 },
+      { n: "PCIe Gen4 x16", bw: 32e9, a: 5e-6 },
+      { n: "100 GbE (TCP)", bw: 12.5e9, a: 30e-6 },
+      { n: "NVMe Gen4 SSD", bw: 7e9, a: 100e-6 }
+    ];
+    const sz = slider(w.controls, { label: "Payload", min: 3, max: 12, step: 0.02, value: Math.log10(16e9), fmt: v => fmtB(10 ** v), onInput: draw });
+    const presets = el("div", { class: "btnrow" });
+    [["decode all-reduce (16 KB)", 16384], ["TP all-reduce, 8K tok prefill (134 MB)", 134e6], ["8B KV, one 4K request (537 MB)", 537e6], ["70B KV, 32K tok (10.7 GB)", 10.7e9], ["8B bf16 weights (16 GB)", 16e9], ["70B bf16 weights (141 GB)", 141e9]].forEach(([l, b]) =>
+      presets.appendChild(el("button", { class: "btn", text: l, onclick: () => { sz.value = Math.log10(b); draw(); } })));
+    w.controls.appendChild(el("div", { class: "ctl", style: { gridColumn: "1 / -1" } }, [el("label", null, el("span", { text: "Presets" })), presets]));
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 300" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "nv", label: "NVLink 4" }, { key: "pcie", label: "PCIe Gen5" }, { key: "ib", label: "1 × IB NDR" }, { key: "half", label: "NVLink n½" }]);
+    function draw() {
+      const n = 10 ** sz.value;
+      const rows = LINKS.map(l => ({ label: l.n, t: l.a + n / l.bw, color: l.bw >= 1e12 ? palette.faint : l.bw >= 3e11 ? palette.green : l.bw >= 3e10 ? palette.gold : palette.brick }));
+      logBars(s, rows, { width: 760, labelWidth: 190, rowH: 32, min: 1e-6, max: 1e3 });
+      const tn = rows[1].t, tp = rows[3].t, ti = rows[4].t;
+      const latShare = LINKS[1].a / tn;
+      set("nv", fmtT(tn), null, latShare > 0.5 ? "mostly latency" : "mostly bandwidth");
+      set("pcie", fmtT(tp), null, fmtNum(tp / tn, 1) + "× NVLink");
+      set("ib", fmtT(ti), null, fmtNum(ti / tn, 1) + "× NVLink");
+      set("half", fmtB(LINKS[1].a * LINKS[1].bw), n < LINKS[1].a * LINKS[1].bw ? "warn" : "good", n < LINKS[1].a * LINKS[1].bw ? "payload is latency-bound" : "payload is bandwidth-bound");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: which GPU? */
+  (function () {
+    const w = widget("w-pick", { title: "Which GPU? Size a deployment", kicker: "Calculator", note: "Ceilings, not benchmarks. GPU count is the smallest of 1, 2, 4, 8, then multiples of 8, that satisfies memory (90% usable; 75% on a Mac), the per-user bandwidth target, and compute (40% of dense peak; FP8 peak used for 8-bit weights where supported). Per-user ceiling = n × bandwidth ÷ (weights + all KV caches), ignoring communication. Dense models only: a mixture-of-experts model reads only its active experts per token. Prices are illustrative placeholders; type your own." });
+    const MODELS = [
+      { v: "3b", l: "Llama-3.2-3B · 3.2B · 112 KiB KV/tok", N: 3.2e9, kv: 112 * 1024 },
+      { v: "8b", l: "Llama-3.1-8B · 8.0B · 128 KiB KV/tok", N: 8.0e9, kv: 128 * 1024 },
+      { v: "32b", l: "Qwen2.5-32B · 32.8B · 256 KiB KV/tok", N: 32.8e9, kv: 256 * 1024 },
+      { v: "70b", l: "Llama-3.1-70B · 70.6B · 320 KiB KV/tok", N: 70.6e9, kv: 320 * 1024 },
+      { v: "405b", l: "Llama-3.1-405B · 406B · 504 KiB KV/tok", N: 405.9e9, kv: 504 * 1024 }
+    ];
+    const CTX = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+    const CONC = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+    let model = MODELS[3], bits = 4.5, kvB = 2;
+    const prices = {}; GPUS.forEach(g => prices[g.v] = g.price);
+    select(w.controls, { label: "Model (bf16 KV per token)", options: MODELS.map(m => ({ value: m.v, label: m.l })), value: "70b", onChange: v => { model = MODELS.find(m => m.v === v); draw(); } });
+    const cb = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Bits per weight" })));
+    seg(cb, { options: [{ value: 16, label: "16 (bf16)" }, { value: 8.5, label: "8 (fp8/int8)" }, { value: 4.5, label: "4.5 (int4+scales)" }], value: 4.5, onChange: v => { bits = v; draw(); } });
+    w.controls.appendChild(cb);
+    const ck = el("div", { class: "ctl" }, el("label", null, el("span", { text: "KV cache dtype" })));
+    seg(ck, { options: [{ value: 2, label: "bf16" }, { value: 1, label: "fp8" }], value: 2, onChange: v => { kvB = v; draw(); } });
+    w.controls.appendChild(ck);
+    const cx = slider(w.controls, { label: "Context per sequence", min: 0, max: CTX.length - 1, step: 1, value: 4, fmt: i => fmtNum(CTX[i], 0) + " tok", onInput: draw });
+    const cc = slider(w.controls, { label: "Concurrent sequences", min: 0, max: CONC.length - 1, step: 1, value: 4, fmt: i => String(CONC[i]), onInput: draw });
+    const tg = slider(w.controls, { label: "Target tok/s per user", min: 5, max: 150, step: 5, value: 30, fmt: v => v + " tok/s", onInput: draw });
+    const set = stats(w.body, [{ key: "w", label: "Weights" }, { key: "kv", label: "KV cache (all users)" }, { key: "tot", label: "Total to hold" }, { key: "fl", label: "Compute needed" }]);
+    const tbl = el("table", { class: "t pick-table", style: { margin: "14px 0 0" } });
+    tbl.appendChild(el("thead", null, el("tr", null, ["Accelerator", "GPUs", "Per-user ceiling", "Aggregate", "$/GPU-hr", "$/hr", "$ / M tok", "J / tok"].map((h, i) => el("th", { class: i > 0 ? "num" : "", text: h })))));
+    const tb = el("tbody"); tbl.appendChild(tb);
+    const cells = {};
+    GPUS.forEach(g => {
+      const inp = el("input", { type: "number", min: 0, step: 0.05, value: g.price });
+      inp.addEventListener("input", () => { const v = parseFloat(inp.value); prices[g.v] = isFinite(v) && v >= 0 ? v : 0; draw(); });
+      const c = { tr: null, n: el("td", { class: "num" }), pu: el("td", { class: "num" }), ag: el("td", { class: "num" }), pr: el("td", { class: "num" }, inp), hr: el("td", { class: "num" }), pm: el("td", { class: "num" }), j: el("td", { class: "num" }) };
+      c.tr = el("tr", null, [el("td", null, [el("div", { text: g.l }), el("div", { class: "why", text: `${g.mem} GB · ${fmtBW(g.bw * 1e12)} · ${g.bf16} TF bf16` })]), c.n, c.pu, c.ag, c.pr, c.hr, c.pm, c.j]);
+      tb.appendChild(c.tr); cells[g.v] = c;
+    });
+    w.body.appendChild(el("div", { style: { overflowX: "auto" } }, tbl));
+    const roundTP = n => n <= 1 ? 1 : n <= 2 ? 2 : n <= 4 ? 4 : n <= 8 ? 8 : Math.ceil(n / 8) * 8;
+    function draw() {
+      const ctx = CTX[cx.value], conc = CONC[cc.value], target = tg.value;
+      const W = model.N * bits / 8;
+      const KV = model.kv * (kvB / 2) * ctx * conc;
+      const total = W + KV;
+      const flopsNeed = 2 * model.N * conc * target;
+      set("w", fmtB(W), null, `${fmtNum(model.N / 1e9, 1)}B × ${bits} bits`);
+      set("kv", fmtB(KV), KV > W ? "warn" : null, `${conc} × ${fmtNum(ctx, 0)} tok`);
+      set("tot", fmtB(total * 1.0), null, "read every decode step");
+      set("fl", fmtNum(flopsNeed / 1e12, flopsNeed < 1e13 ? 1 : 0) + " TFLOP/s", null, "2 · N · users · tok/s");
+      let best = null;
+      GPUS.forEach(g => {
+        const c = cells[g.v];
+        const usable = (g.usable || 0.9) * g.mem * 1e9;
+        const peak = (bits <= 8.5 && g.fp8 ? g.fp8 : g.bf16) * 1e12 * 0.4;
+        const nMem = Math.ceil(total / usable);
+        const nBw = Math.ceil(total * target / (g.bw * 1e12));
+        const nCmp = Math.ceil(flopsNeed / peak);
+        const n = roundTP(Math.max(nMem, nBw, nCmp, 1));
+        const why = nMem >= nBw && nMem >= nCmp ? "memory" : nBw >= nCmp ? "bandwidth" : "compute";
+        const perUser = Math.min(n * g.bw * 1e12 / total, n * peak / (2 * model.N * conc));
+        const agg = perUser * conc;
+        const hr = n * prices[g.v];
+        const perM = hr / (agg * 3600) * 1e6;
+        const jt = n * g.tdp / agg;
+        const odd = (g.v === "mac" && n > 1) || ((g.v === "4090" || g.v === "l40s") && n > 8);
+        c.n.innerHTML = `<b>${n}</b><div class="why">${odd ? (g.v === "mac" ? "multi-Mac cluster" : "beyond one PCIe box") : "set by " + why}</div>`;
+        c.n.style.color = odd ? palette.brick : "";
+        c.pu.textContent = fmtNum(perUser, perUser < 10 ? 1 : 0) + " tok/s";
+        c.pu.style.color = perUser >= target ? palette.green : palette.brick;
+        c.ag.textContent = fmtNum(agg, agg < 10 ? 1 : 0) + " tok/s";
+        c.hr.textContent = "$" + fmtNum(hr, 2);
+        c.pm.textContent = "$" + fmtNum(perM, perM < 1 ? 3 : 2);
+        c.j.textContent = fmtNum(jt, jt < 1 ? 2 : 1);
+        c.tr.classList.remove("best");
+        if (!odd && perUser >= target && (best == null || perM < best.perM)) best = { v: g.v, perM };
+      });
+      if (best) cells[best.v].tr.classList.add("best");
+    }
+    draw();
+    w.body.appendChild(el("p", { class: "small muted", style: { margin: "10px 0 0" }, html: "Green row: cheapest $/M tokens among options that meet the per-user target without exotic setups. Mac price is a rough amortization of a ~$4,000 machine over three years; edit it." }));
+  })();
+})();
+</script>
+</body>
+</html>

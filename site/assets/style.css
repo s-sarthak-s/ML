@@ -74,13 +74,13 @@ main.content{padding:56px clamp(20px,5vw,72px) 120px;min-width:0}
 .side-toc a:hover,.side-toc a.on{color:var(--green-deep)}
 
 /* ---------- module header ---------- */
-.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--green-deep);font-weight:600;margin:0 0 14px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--green-deep);font-weight:600;margin:0 auto 14px}
 .eyebrow.br{color:var(--brick)}
-h1.title{font-family:var(--serif);font-weight:500;font-size:clamp(38px,5.4vw,62px);line-height:1.03;letter-spacing:-.015em;margin:0 0 18px}
+h1.title{font-family:var(--serif);font-weight:500;font-size:clamp(38px,5.4vw,62px);line-height:1.03;letter-spacing:-.015em;margin:0 auto 18px}
 .it{font-style:italic;color:var(--green-deep)}
 .br-it{font-style:italic;color:var(--brick)}
-.lede{font-size:clamp(17px,1.6vw,20px);color:var(--ink-soft);line-height:1.55;margin:0 0 26px}
-.meta{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 30px}
+.lede{font-size:clamp(17px,1.6vw,20px);color:var(--ink-soft);line-height:1.55;margin:0 auto 26px}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin:0 auto 30px}
 .tag{font-family:var(--mono);font-size:11px;letter-spacing:.04em;padding:4px 9px;border-radius:999px;background:var(--green-tint);color:var(--green-deep)}
 .tag.g{background:var(--gold-tint);color:var(--gold)}
 .tag.b{background:var(--brick-tint);color:var(--brick)}

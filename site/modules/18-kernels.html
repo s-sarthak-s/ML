@@ -1,0 +1,1403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Kernels, compilers &amp; profiling — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+</head>
+<body data-module="18">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 18 · Inference engineering I</p>
+<h1 class="title">Kernels, compilers &amp; <span class="it">profiling</span></h1>
+<p class="lede">A model is a list of GPU kernels. How many there are, how many bytes each one moves, and how long the CPU takes to launch them decide most of what you see as "speed". This module opens up that list: why fusing ops helps, how a matmul reuses data, how to write a Triton kernel, what FlashAttention does inside, how torch.compile and CUDA graphs remove overhead, and how to read a profiler trace and say what's wrong.</p>
+<div class="meta"><span class="tag">~4 hours</span><span class="tag n">prereqs: 06, 08, 09, 17</span><span class="tag g">hands-on: Triton, torch.compile, CUDA graphs, Nsight</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Estimate a kernel's time from its FLOPs and bytes, and say when the CPU launching it is the real bottleneck.</li>
+    <li>Compute the memory traffic saved by fusion, and the data reuse a matmul gets from tiling.</li>
+    <li>Read and write a Triton kernel: <code>program_id</code>, blocks, masks, <code>tl.load</code>/<code>tl.store</code>, autotuning.</li>
+    <li>Derive the online softmax and use it to explain FlashAttention's loop, its IO complexity, and split-KV decoding.</li>
+    <li>Use torch.compile and CUDA graphs deliberately, and explain graph breaks, recompiles, and per-batch-size graph capture.</li>
+    <li>Compute MFU and MBU from a measurement, then find the cause in a PyTorch profiler or Nsight trace.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="kernels">What a kernel is, and what eager PyTorch does per op</h2>
+
+<p>A <strong>kernel</strong> is a function that runs on the GPU. You launch it over a <em>grid</em> of thread blocks; each block lands on one streaming multiprocessor (SM), and its threads work on a slice of the data. Module 17 covers the hardware side: SMs, warps, the small fast on-chip SRAM, and the large slower HBM. Here the question is software: what turns <code>y = torch.relu(x @ W)</code> into work on that hardware, and what does each step cost?</p>
+
+<p>In <strong>eager mode</strong>, the default way PyTorch runs, each op you call is executed right away. The Python call goes through a C++ binding into the <strong>dispatcher</strong>, which looks at the tensors' <em>dispatch keys</em> (does this need autograd? is autocast on? which device?) and routes the call layer by layer until it reaches a backend implementation in ATen, PyTorch's C++ op library. That implementation picks a kernel (a cuBLAS GEMM for the matmul, a generated elementwise kernel for the ReLU), computes a grid size, and calls <code>cudaLaunchKernel</code>. The launch puts the kernel on a <strong>CUDA stream</strong>, a FIFO queue the GPU drains in order, and returns. Python moves on before the GPU has started.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 330" id="fig-dispatch"></svg>
+<figcaption>Top: the path of one eager op. Everything in the upper row runs on the CPU and costs a few microseconds per op (approximate; it depends on the CPU, the op, and the PyTorch version). The launch only enqueues work; the GPU picks it up from the stream. Bottom: an illustrative timeline. On the left, kernels take 2 µs but each launch takes about 5 µs of CPU time, so the GPU sits idle most of the time. On the right, kernels are longer than the launch cost, so the CPU runs ahead, the queue fills, and launch overhead disappears from the wall-clock time.</figcaption></figure>
+
+<div class="def"><b>Definition · Launch overhead</b>
+<p>The CPU time spent per op before the GPU can start it: Python, argument parsing, dispatch, allocator, and the driver call. For eager PyTorch it is typically in the range of a few to around ten microseconds per op on a modern server CPU (a rough, version-dependent figure; measure yours). The raw <code>cudaLaunchKernel</code> call is a few microseconds of that. On the GPU side, a kernel also has a small fixed start-up and tail cost of roughly a microsecond or two, even when it does almost nothing.</p>
+</div>
+
+<div class="formula" data-name="Time for one kernel (GPU side)">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{kernel}}} \approx \max\!\left(\frac{\htmlClass{t2}{F}}{\htmlClass{t3}{P_{\text{peak}}}},\ \frac{\htmlClass{t4}{Q}}{\htmlClass{t5}{BW}}\right) + \htmlClass{t6}{t_{\text{fixed}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{kernel}}\)</dt><dd>time from kernel start to kernel end on the GPU</dd></div>
+    <div data-t="t2"><dt>\(F\)</dt><dd>floating-point operations the kernel performs</dd></div>
+    <div data-t="t3"><dt>\(P_{\text{peak}}\)</dt><dd>peak compute for the dtype used (H100 SXM bf16 dense: 989 TFLOP/s)</dd></div>
+    <div data-t="t4"><dt>\(Q\)</dt><dd>bytes moved to and from HBM</dd></div>
+    <div data-t="t5"><dt>\(BW\)</dt><dd>HBM bandwidth (H100 SXM: 3.35 TB/s)</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{fixed}}\)</dt><dd>fixed start-up and tail cost, around 1–2 µs (approximate)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A kernel is limited by whichever runs out first, the math units or the memory bus, plus a small constant. This is the roofline from <a href="08-inference.html#roofline">Module 08</a>, applied to one kernel instead of a whole model.</p>
+  <p class="why"><b>Why it matters</b>A ReLU over 1M bf16 elements moves 4 MB: 4 MB ÷ 3.35 TB/s ≈ 1.2 µs, so the fixed cost is as large as the work. Below a few million elements, the per-kernel constants dominate, and the CPU's launch cost can be larger still.</p>
+</div>
+
+<p>Now a worked example that shows up in every LLM serving stack. Decoding one token of Llama-3-8B at batch 1 on an H100 reads about 15 GB of bf16 weights, which takes at least 15 GB ÷ 3.35 TB/s ≈ 4.5 ms (<a href="08-inference.html#roofline">Module 08</a>). A straightforward eager implementation issues a lot of kernels per step: each of the 32 layers has its projections, but also an RMSNorm written as several elementwise ops, rotary embeddings as several more, cache updates, residual adds, and the SwiGLU multiply. A rough count: about 1,000 kernels per token. At ~5 µs of CPU time each, that is ~5 ms of launching, more than the 4.5 ms the GPU needs. The GPU is waiting on Python.</p>
+
+<div class="pitfall"><b>Pitfall · timing asynchronous code</b>
+<p><code>t0 = time.time(); y = model(x); print(time.time() - t0)</code> measures how long it took to <em>enqueue</em> the work, not to do it. Call <code>torch.cuda.synchronize()</code> before reading the clock, or use CUDA events or <code>triton.testing.do_bench</code>, which do this for you and also handle warm-up.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="fusion">Why fusion matters</h2>
+
+<p>Take a chain of elementwise ops, say <code>y = gelu(x * scale + bias)</code>. In eager mode each op is its own kernel, and each kernel reads its input from HBM and writes its output back to HBM, because that's the only place tensors live between kernels. The intermediate results go out to main memory and come straight back. A <strong>fused</strong> kernel does all the arithmetic on each element while it sits in registers, so it reads the input once and writes the output once.</p>
+
+<div class="formula" data-name="Memory traffic of an elementwise chain">
+  <div class="tex">$$\htmlClass{t1}{Q_{\text{unfused}}} = (2\htmlClass{t2}{k} + \htmlClass{t3}{r})\,\htmlClass{t4}{N}\,\htmlClass{t5}{b}, \qquad \htmlClass{t6}{Q_{\text{fused}}} = (2 + \htmlClass{t3}{r})\,\htmlClass{t4}{N}\,\htmlClass{t5}{b}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(Q_{\text{unfused}}\)</dt><dd>HBM bytes when each op is its own kernel</dd></div>
+    <div data-t="t2"><dt>\(k\)</dt><dd>ops in the chain. There are \(k+1\) full-size tensors (input, \(k-1\) intermediates, output); each intermediate is written once and read once, so \(2k\) passes in total</dd></div>
+    <div data-t="t3"><dt>\(r\)</dt><dd>extra full-size inputs somewhere in the chain (a residual, a gate tensor). Both versions must read them</dd></div>
+    <div data-t="t4"><dt>\(N\)</dt><dd>elements per tensor</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per element (2 for bf16)</dd></div>
+    <div data-t="t6"><dt>\(Q_{\text{fused}}\)</dt><dd>HBM bytes for one fused kernel: one read, one write, plus the extra inputs</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every kernel boundary in a chain costs a round trip to main memory. Fusing \(k\) ops removes \(k-1\) round trips and \(k-1\) launches.</p>
+  <p class="why"><b>Why it matters</b>Elementwise ops do a handful of FLOPs per element, far below any GPU's ridge point, so their time <em>is</em> their traffic. Speedup from fusion is about \((2k+r)/(2+r)\) in the bandwidth regime, and about \(k\) when launches dominate.</p>
+</div>
+
+<div id="w-fusion"></div>
+
+<p>This is why the important "small" ops in LLMs get hand-fused kernels: RMSNorm (square, mean, rsqrt, multiply, multiply by weight), RoPE, SwiGLU's <code>silu(gate) * up</code>, residual-add-plus-norm, and the sampler's temperature-softmax-top-p chain. It is also most of what torch.compile does for you (<a href="#compile">below</a>).</p>
+
+<div class="intuition"><b>Intuition</b>
+<p>Unfused code is a kitchen where the cook puts every ingredient back in the walk-in fridge after each step: chop, back in the fridge; fetch, season, back in the fridge. Fusion keeps the bowl on the counter. The cooking takes the same time; the walking disappears.</p>
+</div>
+
+<div class="flag"><b>Fusion has limits</b>
+<p>You can't fuse freely across a <em>reduction</em> that needs all elements before anyone can continue (a softmax needs the row max first), or across a matmul without changing the matmul kernel itself. Fusing a matmul with what follows it (bias, activation, quantize) is done in the GEMM's <strong>epilogue</strong>, the code that runs on the output tile while it is still in registers. Fusing what comes <em>before</em> a matmul (a norm, a dequantize) goes into its <strong>prologue</strong> and is harder, because the GEMM loads its inputs many times (next section).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="tiling">Tiling and data reuse in matmul</h2>
+
+<p>An elementwise op touches each byte once, so there is nothing to reuse. A matmul is the opposite: in \(C = AB\) with \(A\) of size \(M \times K\) and \(B\) of size \(K \times N\), each element of \(A\) is used \(N\) times (once per column of \(C\)). If every use fetched it from HBM again, a matmul would be as memory-bound as a ReLU. <strong>Tiling</strong> is how a GEMM kernel avoids that.</p>
+
+<p>Each thread block owns one \(B_M \times B_N\) tile of the output. It walks along the shared \(K\) dimension in steps of \(B_K\). At each step it copies a \(B_M \times B_K\) tile of \(A\) and a \(B_K \times B_N\) tile of \(B\) into shared memory (the programmer-managed part of on-chip SRAM), and the threads multiply them into an accumulator that lives in registers. Every element of the \(A\) tile is now reused \(B_N\) times from SRAM instead of being fetched \(B_N\) times from HBM. When the \(K\) loop finishes, the block writes its output tile once.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 340" id="fig-tiles"></svg>
+<figcaption>One thread block computing the output tile \(C_{1,2}\). It needs the whole row strip of \(A\) and the whole column strip of \(B\), but only one pair of \(B_K\)-wide tiles is in shared memory at a time. Real kernels keep two to four pairs in flight (software pipelining, "stages") so the next tiles are loading while the current ones are being multiplied. The fp32 accumulator stays in registers for the whole loop.</figcaption></figure>
+
+<div class="formula" data-name="Global-memory loads in a tiled matmul">
+  <div class="tex">$$\htmlClass{t1}{L_A} = \htmlClass{t2}{M}\,\htmlClass{t3}{K}\cdot\frac{\htmlClass{t4}{N}}{\htmlClass{t5}{B_N}}, \qquad \htmlClass{t6}{L_B} = \htmlClass{t3}{K}\,\htmlClass{t4}{N}\cdot\frac{\htmlClass{t2}{M}}{\htmlClass{t7}{B_M}} \qquad \xrightarrow{\ M=N=K,\ B_M=B_N=T\ } \qquad L_A + L_B = \frac{2N^3}{T}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(L_A\)</dt><dd>elements of \(A\) loaded from global memory in total</dd></div>
+    <div data-t="t2"><dt>\(M\)</dt><dd>rows of \(A\) and \(C\) (tokens, in an LLM layer)</dd></div>
+    <div data-t="t3"><dt>\(K\)</dt><dd>shared inner dimension (the hidden size)</dd></div>
+    <div data-t="t4"><dt>\(N\)</dt><dd>columns of \(B\) and \(C\) (output features)</dd></div>
+    <div data-t="t5"><dt>\(B_N\)</dt><dd>output-tile width: each \(A\) element is loaded once per column of tiles, \(N/B_N\) times</dd></div>
+    <div data-t="t6"><dt>\(L_B\)</dt><dd>elements of \(B\) loaded in total</dd></div>
+    <div data-t="t7"><dt>\(B_M\)</dt><dd>output-tile height: each \(B\) element is loaded \(M/B_M\) times</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Without tiling, each element is fetched \(N\) times. With tile size \(T\), it's fetched \(N/T\) times. The reuse factor is \(T\).</p>
+  <p class="why"><b>Why it matters</b>For an 8192-square bf16 matmul with 128-wide tiles, each element is fetched 64 times instead of 8192. The ideal lower bound is reading \(A\) and \(B\) once and writing \(C\) once.</p>
+</div>
+
+<div class="formula" data-name="Arithmetic intensity of one tile step">
+  <div class="tex">$$\htmlClass{t1}{\text{AI}_{\text{tile}}} = \frac{2\,\htmlClass{t2}{B_M}\,\htmlClass{t3}{B_N}\,\htmlClass{t4}{B_K}}{(\htmlClass{t2}{B_M}+\htmlClass{t3}{B_N})\,\htmlClass{t4}{B_K}\,\htmlClass{t5}{b}} = \frac{2\,\htmlClass{t2}{B_M}\,\htmlClass{t3}{B_N}}{(\htmlClass{t2}{B_M}+\htmlClass{t3}{B_N})\,\htmlClass{t5}{b}} \qquad \xrightarrow{\ B_M=B_N=T\ } \qquad \frac{T}{b}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\text{AI}_{\text{tile}}\)</dt><dd>FLOPs per byte loaded from global memory, per \(K\) step</dd></div>
+    <div data-t="t2"><dt>\(B_M\)</dt><dd>tile rows</dd></div>
+    <div data-t="t3"><dt>\(B_N\)</dt><dd>tile columns</dd></div>
+    <div data-t="t4"><dt>\(B_K\)</dt><dd>depth of each step. It cancels: deeper steps don't add reuse, they only cut loop overhead</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per element (2 for bf16, 1 for fp8)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A bigger output tile does more math per byte fetched. Square is best for a fixed tile area.</p>
+  <p class="why"><b>Why it matters</b>Tiles can't grow forever. The input tiles must fit in shared memory (up to about 227 KB per block on H100) times the number of pipeline stages, and the fp32 accumulator must fit in registers (256 KB per SM on H100). That's why production GEMMs use tiles like 128×128 or 128×256, not 1024×1024.</p>
+</div>
+
+<div id="w-tile"></div>
+
+<div class="flag"><b>Where the L2 cache comes in</b>
+<p>The \(T/b\) intensity counts loads from <em>global memory</em>, which includes the L2 cache. With 128-wide bf16 tiles that's 64 FLOP/B, well below the H100's HBM ridge point of ~295. GEMMs still reach a large fraction of peak because neighbouring thread blocks read the same \(A\) and \(B\) tiles at nearly the same time, and the second read hits the 50 MB L2 instead of HBM. Kernels launch blocks in a "grouped" or "swizzled" order precisely to raise that hit rate. So actual HBM traffic sits between the tile-level number and the compulsory minimum.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="triton">Triton: writing kernels in Python</h2>
+
+<p>Writing CUDA C++ means thinking about individual threads, warps, shared-memory bank conflicts, and tensor-core instruction shapes. <strong>Triton</strong> (Tillet, Kung &amp; Cox, 2019; developed at OpenAI) raises the level by one notch: you write a <em>program</em> that handles a whole <strong>block</strong> of elements as if it were a small array, and the compiler decides how to spread that block across threads, when to use shared memory, and how to vectorize loads. It's the language TorchInductor generates, and many open-source LLM kernels (in vLLM, SGLang, and Liger-Kernel, for example) are written in it.</p>
+
+<div class="def"><b>Definition · The Triton programming model</b>
+<p>You launch a <strong>grid</strong> of program instances. Each instance asks <code>tl.program_id(axis)</code> which one it is, builds a vector of offsets with <code>tl.arange(0, BLOCK)</code>, loads that block with <code>tl.load(ptr + offsets, mask=...)</code>, computes on it with array ops (<code>+</code>, <code>tl.exp</code>, <code>tl.max</code>, <code>tl.dot</code>), and writes with <code>tl.store</code>. The <strong>mask</strong> turns off lanes that fall past the end of the data. <code>BLOCK</code> must be a compile-time constant (<code>tl.constexpr</code>) and, for <code>tl.arange</code>, a power of two.</p>
+</div>
+
+<div class="formula" data-name="Launch grid and masking">
+  <div class="tex">$$\htmlClass{t1}{G} = \left\lceil \frac{\htmlClass{t2}{n}}{\htmlClass{t3}{\text{BLOCK}}} \right\rceil, \qquad \htmlClass{t4}{\text{offs}}_{\htmlClass{t5}{p}} = \htmlClass{t5}{p}\cdot\htmlClass{t3}{\text{BLOCK}} + [0, 1, \ldots, \htmlClass{t3}{\text{BLOCK}}-1], \qquad \htmlClass{t6}{\text{mask}}_{\htmlClass{t5}{p}} = \htmlClass{t4}{\text{offs}}_{\htmlClass{t5}{p}} \lt \htmlClass{t2}{n}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(G\)</dt><dd>number of program instances to launch (<code>triton.cdiv(n, BLOCK)</code>)</dd></div>
+    <div data-t="t2"><dt>\(n\)</dt><dd>number of elements in the tensor</dd></div>
+    <div data-t="t3"><dt>BLOCK</dt><dd>elements handled by one program instance</dd></div>
+    <div data-t="t4"><dt>offs</dt><dd>the element indices this instance touches</dd></div>
+    <div data-t="t5"><dt>\(p\)</dt><dd>the instance's <code>program_id</code>, from 0 to \(G-1\)</dd></div>
+    <div data-t="t6"><dt>mask</dt><dd>which lanes are in bounds. Only the last instance has any lanes switched off</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Chop the tensor into equal blocks, give each block to one program, and switch off the lanes that hang over the end.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 860 230" id="fig-triton"></svg>
+<figcaption>A vector add over \(n = 2600\) elements with <code>BLOCK = 1024</code> launches three programs. Programs 0 and 1 are full. Program 2 covers offsets 2048–3071; the mask is true for 2048–2599 and false for the last 472 lanes, which neither load nor store. Each program runs on one SM as a group of warps the compiler chooses (<code>num_warps</code>).</figcaption></figure>
+
+<h3>Kernel 1: vector add, line by line</h3>
+<div class="code" data-lang="python" data-title="add.py"><pre><code>
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)                  # which block am I?
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)   # vector of BLOCK_SIZE indices
+    mask = offsets &lt; n_elements                 # lanes past the end are off
+    x = tl.load(x_ptr + offsets, mask=mask)       # one coalesced, vectorized load
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+
+def add(x: torch.Tensor, y: torch.Tensor) -&gt; torch.Tensor:
+    out = torch.empty_like(x)
+    n = out.numel()
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)   # G = ceil(n / BLOCK)
+    add_kernel[grid](x, y, out, n, BLOCK_SIZE=1024)
+    return out
+</code></pre></div>
+<ul>
+  <li><code>@triton.jit</code> compiles the function the first time it's called with a given set of argument types and constexpr values, then caches the binary.</li>
+  <li>Tensor arguments arrive as <strong>pointers</strong> to their first element. <code>x_ptr + offsets</code> is a vector of addresses, one per lane.</li>
+  <li>Adjacent lanes read adjacent addresses, so the hardware merges the loads into a few wide memory transactions (<em>coalescing</em>). This is what lets a simple kernel reach most of peak bandwidth.</li>
+  <li><code>kernel[grid](...)</code> is the launch. <code>grid</code> can be a tuple or a function of the meta-parameters, which matters once the block size is autotuned.</li>
+</ul>
+
+<h3>Kernel 2: fused row-wise softmax</h3>
+<p>Softmax over the last dimension needs a reduction (max, then sum) before it can write anything. If a whole row fits in one block, one program can load the row once, do every step in registers, and write once: 2 passes over memory instead of the ~8 that a naive eager version makes (<code>max</code>, subtract, <code>exp</code>, <code>sum</code>, divide, each reading and most writing a full tensor).</p>
+<div class="code" data-lang="python" data-title="softmax_triton.py"><pre><code>
+@triton.jit
+def softmax_kernel(out_ptr, in_ptr, in_row_stride, out_row_stride, n_cols,
+                   BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)                               # one program per row
+    cols = tl.arange(0, BLOCK_SIZE)                      # BLOCK_SIZE >= n_cols
+    mask = cols &lt; n_cols
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask,
+                other=-float("inf"))                     # padded lanes: -inf, so exp() = 0
+    x = x.to(tl.float32)                                 # do the math in fp32
+    x = x - tl.max(x, axis=0)                            # numerically stable (next section)
+    num = tl.exp(x)
+    den = tl.sum(num, axis=0)
+    tl.store(out_ptr + row * out_row_stride + cols, num / den, mask=mask)   # cast to out dtype
+
+def softmax(x: torch.Tensor) -&gt; torch.Tensor:
+    n_rows, n_cols = x.shape
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    num_warps = 4 if BLOCK_SIZE &lt;= 2048 else (8 if BLOCK_SIZE &lt;= 8192 else 16)
+    out = torch.empty_like(x)
+    softmax_kernel[(n_rows,)](out, x, x.stride(0), out.stride(0), n_cols,
+                              BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps)
+    return out
+</code></pre></div>
+<ul>
+  <li><code>other=-float("inf")</code> fills masked lanes with \(-\infty\). They can't win the max, and \(e^{-\infty} = 0\) adds nothing to the sum. Using 0 instead would be a real bug for rows of negative logits.</li>
+  <li><code>tl.max(x, axis=0)</code> and <code>tl.sum</code> are block-wide reductions. Triton generates the warp shuffles and shared-memory exchanges for you.</li>
+  <li><code>in_row_stride</code> lets the kernel handle non-contiguous rows (a slice of a bigger tensor). Strides are in elements, not bytes.</li>
+  <li>This design holds the whole row in registers, so it works up to tens of thousands of columns. Past that, registers spill and you switch to a loop over column chunks using the <a href="#softmax">online softmax</a>.</li>
+</ul>
+
+<h3>Autotuning</h3>
+<p>The best <code>BLOCK_SIZE</code>, <code>num_warps</code>, and (for loops) <code>num_stages</code> depend on the GPU and the problem size. <code>@triton.autotune</code> takes a list of configs and a <code>key</code>. The first time it sees a new value of the key arguments, it benchmarks every config and caches the fastest for that key.</p>
+<div class="code" data-lang="python" data-title="autotune"><pre><code>
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 256},  num_warps=2),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8),
+    ],
+    key=["n_elements"],          # re-tune when this argument changes
+)
+@triton.jit
+def add_kernel_tuned(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    ...                          # same body as add_kernel
+
+# launch without passing BLOCK_SIZE; the grid lambda reads the chosen value
+grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+add_kernel_tuned[grid](x, y, out, n)
+</code></pre></div>
+
+<div class="pitfall"><b>Pitfall · autotuning in production</b>
+<p>The first call for each new key value runs every config, which can take seconds. If the key is something that varies per request (like the exact sequence length), every new length triggers a tuning run. Key on bucketed sizes, or tune ahead of time and pin the configs.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="softmax">Softmax and reductions on GPUs</h2>
+
+<p>Softmax (<a href="03-probability.html#softmax">Module 03</a>) shows up in every attention layer and every sampler, and it is a reduction.</p>
+
+<div class="formula" data-name="Numerically stable softmax">
+  <div class="tex">$$\text{softmax}(\htmlClass{t1}{x})_j = \frac{e^{\htmlClass{t1}{x_j} - \htmlClass{t2}{m}}}{\htmlClass{t4}{d}}, \qquad \htmlClass{t4}{d} = \sum_{k=1}^{\htmlClass{t3}{n}} e^{\htmlClass{t1}{x_k} - \htmlClass{t2}{m}}, \qquad \htmlClass{t2}{m} = \max_k \htmlClass{t1}{x_k}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(x\)</dt><dd>the row of logits or attention scores</dd></div>
+    <div data-t="t2"><dt>\(m\)</dt><dd>the row maximum. Subtracting it changes nothing mathematically (it cancels between numerator and denominator)</dd></div>
+    <div data-t="t3"><dt>\(n\)</dt><dd>row length</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>the normalizer (denominator)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Shift the row so its largest value is 0, exponentiate, divide by the total.</p>
+  <p class="why"><b>Why it matters</b>\(e^{89}\) already overflows fp32. After the shift every exponent is \(\le 0\), so every term is in \((0, 1]\) and the sum is between 1 and \(n\). The cost: a naive implementation now needs three passes over the data (find max, sum, normalize).</p>
+</div>
+
+<p>For a kernel that streams a row it can't hold all at once, three passes means reading it from HBM three times. Milakov &amp; Gimelshein (2018) noticed that the max and the sum can be computed together in one pass, as long as you fix up the running sum whenever the max changes.</p>
+
+<div class="formula" data-name="Online softmax recurrence">
+  <div class="tex">$$\htmlClass{t1}{m_i} = \max(\htmlClass{t1}{m_{i-1}},\, \htmlClass{t2}{x_i}), \qquad \htmlClass{t3}{d_i} = \htmlClass{t3}{d_{i-1}}\cdot \htmlClass{t4}{e^{m_{i-1} - m_i}} + e^{\htmlClass{t2}{x_i} - \htmlClass{t1}{m_i}}, \qquad m_0 = -\infty,\ d_0 = 0$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(m_i\)</dt><dd>running maximum after seeing \(x_1 \ldots x_i\)</dd></div>
+    <div data-t="t2"><dt>\(x_i\)</dt><dd>the next element (or the max of the next chunk, in a blocked kernel)</dd></div>
+    <div data-t="t3"><dt>\(d_i\)</dt><dd>running normalizer, always equal to \(\sum_{j \le i} e^{x_j - m_i}\)</dd></div>
+    <div data-t="t4"><dt>\(e^{m_{i-1}-m_i}\)</dt><dd>rescale factor: 1 if the max didn't change, less than 1 if it grew</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Keep a running sum measured relative to the biggest value seen so far. When a bigger value shows up, shrink the old sum to the new reference point and keep going.</p>
+  <p class="why"><b>Why it matters</b>Two passes instead of three for a plain softmax. More importantly, when the softmax feeds a weighted sum (as in attention), the output can be rescaled the same way, so the whole thing becomes <em>one</em> pass. That single idea is FlashAttention.</p>
+</div>
+
+<div id="w-online"></div>
+
+<details class="think"><summary>Think first: can two GPU blocks each compute (m, d) for half a row and then combine?</summary>
+<div>Yes. Given \((m_a, d_a)\) and \((m_b, d_b)\), the combined pair is \(m = \max(m_a, m_b)\), \(d = d_a e^{m_a - m} + d_b e^{m_b - m}\). The operation is associative, so it works as a tree reduction across warps, across blocks, or across GPUs. Split-KV decoding (<a href="#decode">below</a>) is exactly this applied to attention.</div>
+</details>
+
+<div class="mle"><b>MLE angle · reductions and precision</b>
+<p>Accumulate reductions in fp32 even when inputs are bf16; bf16 keeps only 7 mantissa bits (about 2–3 significant decimal digits), so a long running sum in bf16 stops absorbing small terms once it has grown large (<a href="09-quantization.html#floats">Module 09</a>). The order of a parallel reduction also changes the rounding, which is one reason GPU results differ in the last bits between batch sizes and between kernels. If you need bit-exact reproducibility across batch sizes, you need kernels designed for it.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="flash">FlashAttention internals</h2>
+
+<p><a href="08-inference.html#flash">Module 08</a> introduced FlashAttention (Dao et al., 2022) as "exact attention without the \(T \times T\) matrix" and gave the per-row online-softmax update. Here is how the kernel is organized, why it moves fewer bytes, and what the second and third versions changed.</p>
+
+<h3>The loop structure</h3>
+<p>Split \(Q\) into row blocks \(Q_i\) of \(B_r\) rows, and \(K\), \(V\) into blocks \(K_j\), \(V_j\) of \(B_c\) rows. In FlashAttention-2's ordering, each thread block owns one \(Q_i\) (for one batch element and head). It loads \(Q_i\) into SRAM once, then streams \(K_j, V_j\) pairs past it. For each pair it computes a \(B_r \times B_c\) score tile in SRAM, updates running statistics, and accumulates into an output tile that stays on chip. After the last \(K_j\), it normalizes and writes \(O_i\) once.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 360" id="fig-faloop"></svg>
+<figcaption>The FlashAttention-2 loop for one (batch, head). The outer loop over query blocks \(i\) runs in parallel, one thread block each. The inner loop over key/value blocks \(j\) is sequential inside the thread block. Only one \(B_r \times B_c\) tile of the score matrix exists at a time, in SRAM. With a causal mask, tiles entirely above the diagonal are skipped, which halves the work; tiles on the diagonal apply the mask element-wise.</figcaption></figure>
+
+<div class="formula" data-name="FlashAttention block update (FA-2 form)">
+  <div class="tex">$$\htmlClass{t2}{S_{ij}} = \frac{Q_i K_j^{\top}}{\sqrt{d}}, \quad \htmlClass{t1}{m_i^{(j)}} = \max\!\big(\htmlClass{t1}{m_i^{(j-1)}},\ \mathrm{rowmax}(\htmlClass{t2}{S_{ij}})\big), \quad \htmlClass{t3}{\tilde P_{ij}} = e^{\htmlClass{t2}{S_{ij}} - \htmlClass{t1}{m_i^{(j)}}}, \quad \htmlClass{t4}{\ell_i^{(j)}} = e^{\htmlClass{t1}{m_i^{(j-1)}} - \htmlClass{t1}{m_i^{(j)}}}\,\htmlClass{t4}{\ell_i^{(j-1)}} + \mathrm{rowsum}(\htmlClass{t3}{\tilde P_{ij}})$$
+  $$\htmlClass{t5}{O_i^{(j)}} = \mathrm{diag}\!\big(e^{\htmlClass{t1}{m_i^{(j-1)}} - \htmlClass{t1}{m_i^{(j)}}}\big)\,\htmlClass{t5}{O_i^{(j-1)}} + \htmlClass{t3}{\tilde P_{ij}}\,\htmlClass{t6}{V_j}, \qquad O_i = \mathrm{diag}\big(\htmlClass{t4}{\ell_i}\big)^{-1}\,\htmlClass{t5}{O_i^{(\text{last})}}, \qquad \htmlClass{t7}{L_i} = \htmlClass{t1}{m_i} + \log \htmlClass{t4}{\ell_i}$$</div>
+  <dl class="legend">
+    <div data-t="t2"><dt>\(S_{ij}\)</dt><dd>\(B_r \times B_c\) score tile: queries in block \(i\) against keys in block \(j\). Lives only in SRAM/registers</dd></div>
+    <div data-t="t1"><dt>\(m_i^{(j)}\)</dt><dd>per-row running max after \(j\) key blocks (a vector of length \(B_r\))</dd></div>
+    <div data-t="t3"><dt>\(\tilde P_{ij}\)</dt><dd>un-normalized probabilities for this tile</dd></div>
+    <div data-t="t4"><dt>\(\ell_i\)</dt><dd>per-row running softmax denominator</dd></div>
+    <div data-t="t5"><dt>\(O_i\)</dt><dd>\(B_r \times d\) output accumulator, rescaled whenever a row's max grows</dd></div>
+    <div data-t="t6"><dt>\(V_j\)</dt><dd>value block \(j\)</dd></div>
+    <div data-t="t7"><dt>\(L_i\)</dt><dd>per-row log-sum-exp, saved for the backward pass (\(N\) numbers per head, not \(N^2\))</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The per-row recurrence from the previous section, done for a whole tile of rows at once, with two matmuls (\(Q_iK_j^\top\) and \(\tilde P_{ij}V_j\)) that run on tensor cores. Division by \(\ell\) is delayed until the very end.</p>
+  <p class="why"><b>Why it matters</b>The backward pass doesn't store \(P\) either. It recomputes each \(S_{ij}\) tile from \(Q\), \(K\), and the saved \(L_i\). That costs extra FLOPs but saves \(O(N^2)\) memory, which is the trade that made long-context training practical.</p>
+</div>
+
+<h3>Why it moves fewer bytes</h3>
+<p>Standard attention writes \(S\) to HBM, reads it for the softmax, writes \(P\), and reads \(P\) for the \(PV\) matmul: four passes over an \(N \times N\) matrix per head. FlashAttention reads \(Q\) and writes \(O\) once, and reads \(K\), \(V\) once per query block.</p>
+
+<div class="formula" data-name="IO complexity (Dao et al., 2022)">
+  <div class="tex">$$\htmlClass{t1}{Q_{\text{std}}} = \Theta\!\left(\htmlClass{t3}{N}\htmlClass{t4}{d} + \htmlClass{t3}{N}^2\right), \qquad \htmlClass{t2}{Q_{\text{flash}}} = \Theta\!\left(\frac{\htmlClass{t3}{N}^2\,\htmlClass{t4}{d}^2}{\htmlClass{t5}{M}}\right) \quad \text{for } \htmlClass{t4}{d} \le \htmlClass{t5}{M} \le \htmlClass{t3}{N}\htmlClass{t4}{d}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(Q_{\text{std}}\)</dt><dd>HBM accesses (in elements) for standard attention, per head</dd></div>
+    <div data-t="t2"><dt>\(Q_{\text{flash}}\)</dt><dd>HBM accesses for FlashAttention, per head</dd></div>
+    <div data-t="t3"><dt>\(N\)</dt><dd>sequence length</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>head dimension (64–256 in practice)</dd></div>
+    <div data-t="t5"><dt>\(M\)</dt><dd>on-chip SRAM size, in elements</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Blocks are about \(M/d\) rows tall, so \(K\) and \(V\) (size \(Nd\)) are re-read \(N \div (M/d)\) times: \(Nd \cdot Nd/M\). Standard attention pays \(N^2\) regardless. FlashAttention wins whenever \(d^2\) is well below \(M\).</p>
+  <p class="why"><b>Why it matters</b>With \(d = 128\) and roughly 100K elements of SRAM, \(d^2/M \approx 0.16\): several times fewer accesses, and no \(N^2\) buffer at all. The paper also proves no exact attention algorithm can do asymptotically better across the whole range of \(M\).</p>
+</div>
+
+<div id="w-flash"></div>
+
+<h3>FlashAttention-2 and -3</h3>
+<p><strong>FlashAttention-2</strong> (Dao, 2023) kept the algorithm and reorganized the work. It parallelizes over query blocks, not just batch and heads, so long sequences with small batches still fill the GPU. It swaps the loop order so each thread block owns its \(O_i\) and never has to write partial outputs back. It splits work across warps so they don't need to exchange partial results through shared memory, and it trims non-matmul FLOPs (the delayed division above), because on A100 a non-matmul FLOP costs roughly 16 times more than a tensor-core FLOP (19.5 vs 312 TFLOP/s). The paper reports roughly 2× over the first version and 50–73% of A100 peak in the forward pass.</p>
+<p><strong>FlashAttention-3</strong> (Shah et al., 2024) targets Hopper (H100) specifically. In outline, the paper's main ideas are: use the Tensor Memory Accelerator (TMA) to copy tiles asynchronously, with some warps acting as producers that only load data and others as consumers that only compute ("warp specialization"); overlap the softmax of one tile with the matmuls of another so the slow exponentials hide behind tensor-core work; and support FP8 with block-wise scaling and an incoherent-processing trick (a random orthogonal transform that spreads outliers) to limit quantization error. The paper reports up to roughly 1.5–2× over FlashAttention-2 on H100 in fp16. Check the current release notes for supported GPUs and features; they change often.</p>
+
+<div class="pitfall"><b>Pitfall · "Flash" is not a different model</b>
+<p>FlashAttention computes the same function as standard attention, up to floating-point rounding. Swapping it in should change logits only in the last few bits. If your eval moves meaningfully after switching attention backends, look for a bug: a mask, a scale factor, or a dtype mismatch.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="decode">Decode attention kernels</h2>
+
+<p>During decode each sequence brings one query token per step. FlashAttention's parallelism comes from batch × heads × query blocks, and with one query token there's only one query block. At batch 1 with 8 KV heads, that's 8 thread blocks on a GPU with 132 SMs: about 6% of the machine streams the whole KV cache while the rest waits. At long context this attention step can take longer than reading the weights.</p>
+
+<p><strong>Flash-Decoding</strong> (Dao, Haziza, Massa &amp; Sizov, 2023) adds a parallel dimension: split the KV sequence into chunks. Each chunk gets its own thread block, which computes a partial output \(O_s\) together with its own max \(m_s\) and normalizer \(\ell_s\). A small second kernel combines them with the associative rule from the online softmax.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 300" id="fig-splitkv"></svg>
+<figcaption>Left: one query token, 8 KV heads, no split. Only 8 of 132 SMs have work (illustrative H100 count). Right: the KV cache for one head is split into chunks. Each chunk produces a partial result \((O_s, m_s, \ell_s)\) on its own SM, and a reduction combines them exactly. With 16 chunks per head, 128 SMs are busy.</figcaption></figure>
+
+<div class="formula" data-name="Merging split-KV partials">
+  <div class="tex">$$\htmlClass{t1}{m} = \max_s \htmlClass{t2}{m_s}, \qquad \htmlClass{t3}{O} = \frac{\sum_s e^{\htmlClass{t2}{m_s} - \htmlClass{t1}{m}}\,\htmlClass{t4}{\ell_s}\,\htmlClass{t5}{O_s}}{\sum_s e^{\htmlClass{t2}{m_s} - \htmlClass{t1}{m}}\,\htmlClass{t4}{\ell_s}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(m\)</dt><dd>global max over all chunks</dd></div>
+    <div data-t="t2"><dt>\(m_s\)</dt><dd>max score within chunk \(s\)</dd></div>
+    <div data-t="t3"><dt>\(O\)</dt><dd>final attention output, identical to unsplit attention</dd></div>
+    <div data-t="t4"><dt>\(\ell_s\)</dt><dd>softmax denominator within chunk \(s\), relative to \(m_s\)</dd></div>
+    <div data-t="t5"><dt>\(O_s\)</dt><dd>chunk's own normalized output: softmax over its keys times its values</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each chunk did a correct softmax over its own keys. Weight each chunk's answer by how much probability mass it holds, after putting all the chunks on a common scale.</p>
+  <p class="why"><b>Why it matters</b>The merge reads only \(s \times d\) numbers per head, tiny next to the KV cache. In practice, kernels often store \(\log \ell_s + m_s\) (one log-sum-exp per chunk) instead of the pair.</p>
+</div>
+
+<div id="w-splitkv"></div>
+
+<h3>Paged attention kernels</h3>
+<p>Serving engines store the KV cache in fixed-size blocks with a per-sequence <strong>block table</strong> (<a href="08-inference.html#paged">Module 08 · PagedAttention</a>). The attention kernel then can't assume one contiguous tensor per sequence. Inside the KV loop, for logical block \(j\) it reads <code>phys = block_table[seq, j]</code> and computes the address as <code>kv_base + phys * block_stride + offset</code>. With blocks of 16 tokens × 8 heads × 128 dims in bf16, each block is 32 KB per layer for K, the same for V, which is plenty to keep loads wide and coalesced. The cost is an extra indirect load per block and less freedom to prefetch. Several FlashAttention-style kernels and libraries (vLLM's own kernels, FlashInfer, and FlashAttention's KV-cache entry point) accept a block table directly; names and arguments differ by version.</p>
+
+<div class="mle"><b>MLE angle · GQA changes the arithmetic</b>
+<p>With grouped-query attention (<a href="08-inference.html#gqa">Module 08</a>), 4 query heads share each KV head in Llama-3-8B. A good decode kernel loads each K/V tile once and uses it for all 4 query heads, turning a matrix–vector product into a skinny matrix–matrix product with 4× the intensity. Kernels that loop over query heads separately read the cache 4 times. This is one of the first things to check when a decode attention kernel benchmarks slowly.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="qgemm">Quantized GEMM kernels</h2>
+
+<p><a href="09-quantization.html#formats">Module 09</a> covered the formats. Here's what the kernel does with them. Two very different designs cover most of practice.</p>
+
+<h3>Weight-only (W4A16): dequantize in registers</h3>
+<p>The weights sit in HBM as packed 4-bit integers plus a scale (and maybe a zero point) per group of 64–128. The kernel loads the packed weights, which is a quarter of the bf16 bytes. It unpacks and dequantizes them <em>in registers</em> (\(\hat w = s \cdot (q - z)\)), and feeds the bf16/fp16 values to ordinary tensor-core instructions. Dequantized weights never touch HBM. Because decode is bandwidth-bound, a step reads about 4× fewer bytes and runs up to about 4× faster (<a href="09-quantization.html#why">Module 09's decode ceiling</a>).</p>
+<p>Doing this at full speed is fiddly. The Marlin kernel (Frantar et al., 2024) is the one to read. In outline (see the paper for the exact scheme): weights are reshuffled offline into the exact order the tensor-core fragments want, so each thread can load 128 bits with one instruction and use them without moving data between threads; the int4 → fp16 conversion uses bit tricks (merging the 4-bit value into an fp16 bit pattern, then one subtraction) instead of slow conversion instructions; and loads are pipelined asynchronously so memory stays busy. The paper reports close to the ideal ~4× over fp16 for batch sizes up to about 16–32 on Ampere-class GPUs. As the batch grows, the GEMM becomes compute-bound, the dequant arithmetic stops being free, and the advantage shrinks toward zero.</p>
+
+<h3>FP8 GEMMs: low-precision math, not just storage</h3>
+<p>On Hopper and newer GPUs, tensor cores multiply FP8 (E4M3 or E5M2) inputs directly, at about twice the bf16 rate, and accumulate in higher precision. Now both operands are quantized (W8A8), so you need scales for both, and the question is where the scales apply.</p>
+
+<div class="formula" data-name="Block-scaled low-precision GEMM">
+  <div class="tex">$$\htmlClass{t1}{Y_{ij}} = \sum_{\htmlClass{t2}{g}} \htmlClass{t3}{s^{X}_{i,g}}\; \htmlClass{t4}{s^{W}_{g,j}} \sum_{k \in \htmlClass{t2}{g}} \htmlClass{t5}{X^{q}_{ik}}\; \htmlClass{t6}{W^{q}_{kj}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(Y_{ij}\)</dt><dd>output element, accumulated in fp32</dd></div>
+    <div data-t="t2"><dt>\(g\)</dt><dd>a block of the \(K\) dimension (e.g. 128 wide) that shares scales</dd></div>
+    <div data-t="t3"><dt>\(s^X_{i,g}\)</dt><dd>activation scale for row \(i\), block \(g\). Computed on the fly per token</dd></div>
+    <div data-t="t4"><dt>\(s^W_{g,j}\)</dt><dd>weight scale for block \(g\), column block \(j\). Computed offline</dd></div>
+    <div data-t="t5"><dt>\(X^q\)</dt><dd>fp8 activations</dd></div>
+    <div data-t="t6"><dt>\(W^q\)</dt><dd>fp8 weights</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Multiply fp8 numbers on tensor cores for one block of \(K\) at a time, then multiply the partial sum by that block's two scales and add it to an fp32 total.</p>
+  <p class="why"><b>Why it matters</b>With <b>per-tensor</b> scales, both \(s\)'s are constants: pull them out of the sum and apply them once in the epilogue, for free. With <b>per-block</b> scales, the kernel has to stop every block to rescale and add into fp32, which costs some speed but contains outliers. DeepSeek-V3's report describes this design (1×128 activation tiles, 128×128 weight blocks), partly because Hopper's fp8 accumulation was not precise enough on its own. Blackwell adds hardware support for block scales ("microscaling" formats such as MXFP8 and MXFP4), which makes this cheaper.</p>
+</div>
+
+<div class="grid2">
+  <div class="card"><div class="k">Decode · small batch</div><h4>Weight-only wins</h4><p>Time ≈ weight bytes ÷ bandwidth. Halving or quartering the weight bytes is a direct speedup. Activations are tiny, so quantizing them buys nothing. W4A16 or W8A16 kernels.</p></div>
+  <div class="card blue"><div class="k">Prefill · large batch</div><h4>Low-precision math wins</h4><p>Time ≈ FLOPs ÷ peak. W4A16 still multiplies in bf16, so it can't help and may lose to dequant overhead. FP8 W8A8 doubles the peak. Many deployments run FP8 for exactly this reason.</p></div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="compile">Compilers: torch.compile and friends</h2>
+
+<p>Writing a fused kernel for every pattern doesn't scale. A <strong>graph compiler</strong> looks at a whole sequence of ops, fuses what it can, and generates the kernels. <code>torch.compile</code> (introduced with PyTorch 2.0; described in Ansel et al., 2024) is the PyTorch-native one, and it has three stages.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 860 260" id="fig-compile"></svg>
+<figcaption>The torch.compile pipeline. TorchDynamo captures a graph from Python bytecode and records guards, the assumptions the graph depends on. AOTAutograd produces forward and backward graphs ahead of time. TorchInductor fuses and generates code: Triton for GPUs, C++/OpenMP for CPUs, with large matmuls usually left to vendor libraries unless max-autotune finds a faster Triton template. On every call, guards are checked; a failed guard triggers a recompile.</figcaption></figure>
+
+<ul>
+  <li><strong>TorchDynamo</strong> hooks into CPython's frame evaluation and reads your function's bytecode as it runs. It records tensor ops into an FX graph and records <strong>guards</strong>: checks on input shapes, dtypes, devices, and any Python values the trace depended on.</li>
+  <li><strong>AOTAutograd</strong> traces the backward pass at compile time, decomposes ops into a smaller core set, and decides which activations to save and which to recompute.</li>
+  <li><strong>TorchInductor</strong> lowers the graph to a loop-level IR, groups compatible loops into fused kernels, and emits Triton source you can actually read (set <code>TORCH_LOGS="output_code"</code>).</li>
+</ul>
+
+<h3>Graph breaks and recompiles</h3>
+<p>When Dynamo hits something it can't put in a graph, it inserts a <strong>graph break</strong>: it compiles what it has so far, runs the troublesome code in plain Python, and starts a new graph afterwards. Common causes: calling <code>.item()</code> or <code>.tolist()</code>, <code>if</code> on a tensor's value, <code>print</code>, unsupported third-party calls, and some in-place tricks. Each break costs a return to Python and blocks fusion across the boundary. <code>torch._dynamo.explain(fn)(x)</code> or <code>TORCH_LOGS="graph_breaks"</code> lists them, with reasons.</p>
+<p>When a guard fails, say a new input shape, Dynamo <strong>recompiles</strong>. By default, after a dimension changes once, it tries to recompile with that dimension symbolic so later sizes reuse the same code ("automatic dynamic shapes"). Past a per-function recompile limit (8 by default in recent releases), it gives up and runs that function eagerly, with a warning that's easy to miss. <code>TORCH_LOGS="recompiles"</code> tells you which guard failed.</p>
+
+<table class="t">
+  <thead><tr><th>Mode</th><th>What it adds</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><code>"default"</code></td><td>Fusion and codegen. Moderate compile time.</td><td>Training and general use. Start here.</td></tr>
+    <tr><td><code>"reduce-overhead"</code></td><td>Wraps compiled graphs in CUDA graphs (next section). Needs static shapes to pay off; uses extra memory for static buffers.</td><td>Small batches where launch overhead dominates, such as decode.</td></tr>
+    <tr><td><code>"max-autotune"</code></td><td>Benchmarks Triton GEMM and conv templates against vendor libraries and picks the fastest; also uses CUDA graphs on GPU. Compile can take minutes.</td><td>Long-running inference with fixed shapes.</td></tr>
+    <tr><td><code>"max-autotune-no-cudagraphs"</code></td><td>Autotuning without CUDA graphs.</td><td>Dynamic shapes, or when graphs cost too much memory.</td></tr>
+  </tbody>
+</table>
+
+<h3>Other compilers you'll meet</h3>
+<p><strong>TensorRT</strong> is NVIDIA's ahead-of-time inference compiler. It takes a whole network, fuses layers, picks the fastest kernel for each layer and shape by benchmarking ("tactics"), and builds an engine for one specific GPU. TensorRT-LLM builds on it with LLM-specific kernels and serving features. <strong>XLA</strong> is the compiler behind JAX and TensorFlow (and PyTorch/XLA); it compiles whole programs to fused kernels and is the standard path to TPUs. All three make the same trade: more ahead-of-time compilation, faster kernels, less room for dynamic shapes and Python control flow.</p>
+
+<div class="pitfall"><b>Pitfall · benchmarking the compile</b>
+<p>The first call to a compiled function includes compilation, which can take from seconds to minutes. Time steady-state calls only, after warm-up, and run warm-up with the same shapes you'll benchmark. Otherwise you're timing the compiler, or a recompile.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="graphs">CUDA graphs</h2>
+
+<p>Fusion reduces the number of kernels. A <strong>CUDA graph</strong> removes the per-kernel CPU cost of the ones that remain. You run the step once in <em>capture</em> mode: kernels aren't executed, they're recorded, with their exact arguments and memory addresses, into a graph. Afterwards one <code>replay()</code> call submits the whole recorded sequence with a single launch, and the GPU runs the kernels back to back without the CPU touching each one.</p>
+
+<div class="formula" data-name="Step time with and without CUDA graphs">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{eager}}} \approx \max\!\Big(\htmlClass{t2}{n}\cdot\htmlClass{t3}{t_{\text{launch}}},\ \sum_{i=1}^{\htmlClass{t2}{n}} \htmlClass{t4}{t_i}\Big), \qquad \htmlClass{t5}{t_{\text{graph}}} \approx \htmlClass{t6}{t_{\text{replay}}} + \sum_{i=1}^{\htmlClass{t2}{n}} \htmlClass{t4}{t_i}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{eager}}\)</dt><dd>step time when every kernel is launched from Python</dd></div>
+    <div data-t="t2"><dt>\(n\)</dt><dd>kernels per step</dd></div>
+    <div data-t="t3"><dt>\(t_{\text{launch}}\)</dt><dd>CPU cost per eager op (several µs, approximate)</dd></div>
+    <div data-t="t4"><dt>\(t_i\)</dt><dd>GPU time of kernel \(i\)</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{graph}}\)</dt><dd>step time when the step is replayed as one graph</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{replay}}\)</dt><dd>one-off cost of launching the graph (around 10 µs here, illustrative)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Eager mode overlaps CPU launching with GPU work, so the slower of the two sets the pace. With a graph, the CPU cost is nearly gone and the GPU's own work sets the pace.</p>
+  <p class="why"><b>Why it matters</b>Graphs help exactly when \(n \cdot t_{\text{launch}} \gt \sum t_i\): many small kernels, which is small-batch decode. For prefill, where kernels are long, they change almost nothing.</p>
+</div>
+
+<div id="w-graphs"></div>
+
+<h3>What a graph requires</h3>
+<ul>
+  <li><strong>Static shapes.</strong> The kernels, grid sizes, and arguments are frozen at capture. A different batch size needs a different graph.</li>
+  <li><strong>Static memory addresses.</strong> The graph reads and writes the same buffers on every replay. You copy new inputs <em>into</em> the captured input tensors and read outputs <em>from</em> the captured output tensors.</li>
+  <li><strong>No CPU work inside.</strong> No host syncs, no <code>.item()</code>, no Python branches on tensor values, no new allocations from the CPU during capture. Whatever the CPU did during capture is not replayed.</li>
+</ul>
+<p>That's why serving engines capture a set of graphs, one per <strong>batch-size bucket</strong> (for example 1, 2, 4, 8, then steps of 8 or 16 up to a few hundred), during start-up. At run time the batch is padded up to the nearest captured size, and the padding rows are wasted work. Very large batches fall back to eager or piecewise execution, where launch overhead no longer matters. Capture is part of why engine start-up takes a while and why graphs reserve some memory. vLLM exposes the capture sizes and an <code>--enforce-eager</code> switch to turn graphs off when debugging.</p>
+
+<details class="think"><summary>Think first: a captured graph contains attention over a KV cache that grows every step. How can a static graph handle a growing context?</summary>
+<div>The graph's shapes are static but the <em>values</em> in its buffers aren't. The attention kernel reads the current sequence lengths and block tables from device tensors that the engine updates before each replay, and it loops over however many KV blocks those tensors say. The grid is sized for the maximum, and blocks with nothing to do exit early. Kernels written for graph capture take their dynamic quantities from device memory, not from CPU-side launch arguments.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="mfu">Measuring efficiency: MFU and MBU</h2>
+
+<p>"Is this fast?" needs a reference. The two standard ones compare what you achieved to what the hardware could do, in the resource that should be the bottleneck.</p>
+
+<div class="formula" data-name="Model FLOPs utilization (MFU)">
+  <div class="tex">$$\htmlClass{t1}{\text{MFU}} = \frac{\htmlClass{t2}{c}\cdot\htmlClass{t3}{N_{\text{params}}}\cdot\htmlClass{t4}{\text{tokens/s}}}{\htmlClass{t5}{P_{\text{peak}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>MFU</dt><dd>fraction of peak compute spent on the model's own math</dd></div>
+    <div data-t="t2"><dt>\(c\)</dt><dd>FLOPs per parameter per token: 6 for training (forward + backward), 2 for inference</dd></div>
+    <div data-t="t3"><dt>\(N_{\text{params}}\)</dt><dd>parameters (active parameters for a mixture-of-experts model)</dd></div>
+    <div data-t="t4"><dt>tokens/s</dt><dd>measured throughput per GPU</dd></div>
+    <div data-t="t5"><dt>\(P_{\text{peak}}\)</dt><dd>dense peak for the dtype (H100 bf16: 989 TFLOP/s)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Count only the FLOPs the model mathematically requires, not recomputation or padding, and divide by what the chip could do in that time.</p>
+  <p class="why"><b>Why it matters</b>Introduced in the PaLM paper (Chowdhery et al., 2022) so different setups could be compared fairly. Illustrative: an 8B model training at 8,000 tokens/s per H100 is \(6 \times 8\times10^9 \times 8000 \approx 3.8\times10^{14}\) FLOP/s, about 39% MFU. The formula leaves out attention FLOPs, which matter at long context; some reports add them, so check which convention a number uses.</p>
+</div>
+
+<div class="formula" data-name="Model bandwidth utilization (MBU), batch 1 decode">
+  <div class="tex">$$\htmlClass{t1}{\text{MBU}} = \frac{\big(\htmlClass{t2}{M_W} + \htmlClass{t3}{M_{KV}}\big)\cdot \htmlClass{t4}{\text{tokens/s}}}{\htmlClass{t5}{BW_{\text{peak}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>MBU</dt><dd>fraction of peak memory bandwidth spent on bytes the model has to read</dd></div>
+    <div data-t="t2"><dt>\(M_W\)</dt><dd>weight bytes read per token (all weights for a dense model)</dd></div>
+    <div data-t="t3"><dt>\(M_{KV}\)</dt><dd>KV-cache bytes read per token: bytes per cached token × current context</dd></div>
+    <div data-t="t4"><dt>tokens/s</dt><dd>measured decode speed for one sequence</dd></div>
+    <div data-t="t5"><dt>\(BW_{\text{peak}}\)</dt><dd>spec-sheet memory bandwidth</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>At batch 1, every token requires reading the whole model. Multiply those bytes by tokens per second to get the bandwidth you achieved, then compare with the spec sheet.</p>
+  <p class="why"><b>Why it matters</b>Decode at small batch is bandwidth-bound, so MFU is meaningless there (it will read 1%). MBU tells you how close you are to the decode speed ceiling from <a href="09-quantization.html#why">Module 09</a>. For batch \(B\), use bytes read per step (weights once, plus every sequence's KV) × steps per second.</p>
+</div>
+
+<div id="w-mbu"></div>
+
+<div class="flag"><b>Interpreting the number</b>
+<p>Rough bands, from experience rather than a standard: well-optimized engines reach roughly 60–85% MBU at batch 1 on large GPUs. Something like 30–60% suggests overhead such as launches, syncs, or a slow attention kernel. Under 30% usually means the GPU is idle much of the time, typically launch-bound eager code. Over 100% means the formula doesn't match what's running: a mixture-of-experts model (use active parameters), speculative decoding (several tokens per weight read), batch above 1, or a wrong bit width.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="profiling">Profiling: finding where the time goes</h2>
+
+<p>MFU and MBU tell you <em>whether</em> you're slow. A trace tells you <em>why</em>. Three tools cover nearly everything, from coarse to fine.</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">PyTorch profiler</div><h4>Which ops, which kernels</h4><p><code>torch.profiler</code> records CPU ops and the CUDA kernels they launched, with shapes and Python stacks. Exports a trace you open in a trace viewer (Perfetto or <code>chrome://tracing</code>). Start here.</p></div>
+  <div class="card blue"><div class="k">Nsight Systems</div><h4>The whole timeline</h4><p><code>nsys</code> shows CPU threads, CUDA API calls, kernels, memory copies, and NVTX ranges on one timeline, with low overhead. Best for gaps, launch-bound regions, syncs, and multi-GPU communication.</p></div>
+  <div class="card warn"><div class="k">Nsight Compute</div><h4>Inside one kernel</h4><p><code>ncu</code> replays a single kernel many times to collect hardware counters: achieved memory throughput, compute throughput, occupancy, cache hit rates, and a roofline chart. Use it once you know <em>which</em> kernel is slow.</p></div>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 860 345" id="fig-trace"></svg>
+<figcaption>Three illustrative traces, the patterns you learn to spot. Top: launch-bound. The CPU row is solid and the GPU row is mostly empty, because each kernel finishes before the next launch arrives. Middle: a host sync. The CPU blocks in <code>cudaStreamSynchronize</code> (a <code>.item()</code> call), the GPU drains its queue, then sits idle while the CPU decides what to do and launches again. Bottom: healthy. One graph launch, then kernels back to back; the CPU is free to prepare the next step.</figcaption></figure>
+
+<div class="formula" data-name="GPU busy fraction">
+  <div class="tex">$$\htmlClass{t1}{u} = \frac{\sum_i \htmlClass{t2}{t_i}}{\htmlClass{t3}{T_{\text{wall}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(u\)</dt><dd>fraction of wall-clock time the GPU is running at least one kernel</dd></div>
+    <div data-t="t2"><dt>\(t_i\)</dt><dd>duration of kernel \(i\) in the trace window (merge overlapping kernels on different streams)</dd></div>
+    <div data-t="t3"><dt>\(T_{\text{wall}}\)</dt><dd>length of the window, e.g. one decode step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Add up how long kernels ran, divide by how long the step took. The remainder is time the GPU spent waiting for you.</p>
+  <p class="why"><b>Why it matters</b>Check this first. If \(u\) is 40%, no kernel optimization can give more than 2.5× until you fix the gaps. If \(u\) is 98%, the gaps don't matter and you go kernel by kernel. Note that "GPU utilization" in <code>nvidia-smi</code> is this kind of number, not how hard the SMs are working: a single tiny kernel running all the time shows 100%.</p>
+</div>
+
+<h3>Common pathologies</h3>
+<table class="t">
+  <thead><tr><th>What the trace shows</th><th>Likely cause</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>Thin kernels with gaps between them; CPU row solid with <code>cudaLaunchKernel</code></td><td>CPU launch-bound: many small ops, Python overhead</td><td>CUDA graphs, torch.compile, fused kernels, larger batch</td></tr>
+    <tr><td><code>cudaStreamSynchronize</code> or <code>cudaMemcpy DtoH</code> mid-step; GPU idle right after</td><td>Host-device sync: <code>.item()</code>, <code>.cpu()</code>, <code>print(t)</code>, <code>if t.any():</code>, boolean-mask indexing with data-dependent output size</td><td>Keep decisions on the GPU, move syncs to the end of the step, <code>non_blocking=True</code> copies from pinned memory</td></tr>
+    <tr><td>Hundreds of elementwise kernels under 5 µs each</td><td>Unfused norms, RoPE, activations, casts</td><td>torch.compile or hand-fused kernels</td></tr>
+    <tr><td>A memory-bound kernel well under peak bandwidth; ncu reports uncoalesced accesses or many sectors per request</td><td>Strided or transposed reads, non-contiguous tensors, misaligned rows</td><td>Make the layout contiguous along the fast dimension, <code>.contiguous()</code> once upstream, vectorized loads</td></tr>
+    <tr><td>Step time spikes now and then; compile activity on the CPU row; recompile warnings</td><td>Recompilation storm: shapes or Python values change and guards fail</td><td><code>TORCH_LOGS="recompiles"</code>, pad to buckets, <code>torch._dynamo.mark_dynamic</code></td></tr>
+    <tr><td>Few, long kernels with low achieved occupancy; ncu shows a grid smaller than the SM count</td><td>Not enough parallel work (small batch, wave quantization)</td><td>Split-K or split-KV, smaller tiles, batch more work</td></tr>
+    <tr><td><code>cudaMalloc</code> or <code>cudaFree</code> inside steady-state steps</td><td>Caching allocator missing or fragmenting due to varying shapes</td><td>Preallocate, bucket shapes, check <code>PYTORCH_CUDA_ALLOC_CONF</code> options such as <code>expandable_segments:True</code></td></tr>
+  </tbody>
+</table>
+
+<div class="mle"><b>MLE angle · a profiling routine</b>
+<p>1. Measure the step and compute MBU or MFU. 2. Take one PyTorch profiler trace of a few steady-state steps and compute the GPU busy fraction. 3. If it's low, look at the CPU row for syncs and launch-bound regions. 4. If it's high, sort kernels by total time; the top three usually account for most of it. 5. Run <code>ncu</code> on those kernels only and compare achieved throughput with the roofline. Change one thing, then re-measure.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<div class="flag"><b>Hardware</b>
+<p>Triton needs a recent NVIDIA GPU (or an AMD GPU with ROCm); it doesn't run on Apple silicon. An hourly cloud GPU is enough for everything here: an L4 or A10G is cheap, and an H100 shows the Hopper-specific behaviour. Nsight Systems and Nsight Compute come with the CUDA toolkit; <code>ncu</code> needs permission to read GPU performance counters, which some cloud containers block. On a Mac, see the MLX alternative at the end.</p>
+</div>
+
+<h3>1. Triton softmax vs torch, measured in GB/s</h3>
+<div class="code" data-lang="python" data-title="bench_softmax.py"><pre><code>
+import torch
+import triton
+import triton.language as tl
+from triton.testing import do_bench
+
+@triton.jit
+def softmax_kernel(out_ptr, in_ptr, in_row_stride, out_row_stride, n_cols,
+                   BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols &lt; n_cols
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=-float("inf")).to(tl.float32)
+    x = x - tl.max(x, axis=0)
+    num = tl.exp(x)
+    tl.store(out_ptr + row * out_row_stride + cols, num / tl.sum(num, axis=0), mask=mask)
+
+def triton_softmax(x):
+    n_rows, n_cols = x.shape
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    num_warps = 4 if BLOCK_SIZE &lt;= 2048 else (8 if BLOCK_SIZE &lt;= 8192 else 16)
+    out = torch.empty_like(x)
+    softmax_kernel[(n_rows,)](out, x, x.stride(0), out.stride(0), n_cols,
+                              BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps)
+    return out
+
+def naive_softmax(x):
+    # five eager kernels, ~8 full passes over memory
+    x_max = x.max(dim=1, keepdim=True).values
+    z = x - x_max
+    num = torch.exp(z)
+    den = num.sum(dim=1, keepdim=True)
+    return num / den
+
+PEAK_GBPS = 3350          # set to your GPU's spec-sheet bandwidth (H100 SXM shown)
+torch.manual_seed(0)
+for n_cols in (1024, 4096, 16384, 32768):
+    x = torch.randn(4096, n_cols, device="cuda", dtype=torch.float32)
+    ref = torch.softmax(x, dim=1)
+    err = (triton_softmax(x) - ref).abs().max().item()
+    assert err &lt; 1e-3, err
+    bytes_moved = 2 * x.numel() * x.element_size()   # one read + one write: the ideal
+    for name, fn in [("naive", naive_softmax),
+                     ("torch", lambda t: torch.softmax(t, dim=1)),
+                     ("triton", triton_softmax)]:
+        ms = do_bench(lambda: fn(x))
+        gbps = bytes_moved / (ms * 1e-3) / 1e9
+        print(f"cols={n_cols:6d} {name:7s} {ms * 1e3:9.1f} us {gbps:7.0f} GB/s ({100 * gbps / PEAK_GBPS:4.1f}% of peak)")
+</code></pre></div>
+<p>Predict before running: the naive version makes about four times as many passes as the fused ones, so it should run at about a quarter of their effective GB/s on large inputs. <code>torch.softmax</code> is already a single fused kernel, so matching it is a good result; beating it on some shapes is possible. Note that GB/s here counts the <em>ideal</em> bytes (one read, one write), so the naive version's "GB/s" is an effective number, not its real bus traffic.</p>
+
+<h3>2. Vector add bandwidth</h3>
+<div class="code" data-lang="python" data-title="bench_add.py"><pre><code>
+# uses add() from the Triton section above
+for n in (2**16, 2**20, 2**24, 2**28):
+    x = torch.randn(n, device="cuda"); y = torch.randn(n, device="cuda")
+    assert torch.allclose(add(x, y), x + y)
+    ms_t = do_bench(lambda: add(x, y))
+    ms_e = do_bench(lambda: x + y)
+    gbps = lambda ms: 3 * n * 4 / (ms * 1e-3) / 1e9      # read x, read y, write out
+    print(f"n=2^{n.bit_length() - 1:2d} triton {gbps(ms_t):6.0f} GB/s   torch {gbps(ms_e):6.0f} GB/s")
+</code></pre></div>
+<p>At \(2^{16}\) elements both will report a small fraction of peak: the kernel is a microsecond or two of fixed cost. That's the first formula of this module, measured.</p>
+
+<h3>3. torch.compile on an MLP block</h3>
+<div class="code" data-lang="python" data-title="compile_mlp.py"><pre><code>
+import torch, torch.nn as nn, torch.nn.functional as F
+from triton.testing import do_bench
+
+class SwiGLU(nn.Module):
+    def __init__(self, d=4096, h=14336):
+        super().__init__()
+        self.gate = nn.Linear(d, h, bias=False)
+        self.up = nn.Linear(d, h, bias=False)
+        self.down = nn.Linear(h, d, bias=False)
+        self.norm = nn.RMSNorm(d)
+    def forward(self, x):
+        y = self.norm(x)
+        return x + self.down(F.silu(self.gate(y)) * self.up(y))
+
+m = SwiGLU().cuda().to(torch.bfloat16).eval()
+mc = torch.compile(m, mode="max-autotune")        # compiles lazily, on first call
+for batch in (1, 8, 2048):
+    x = torch.randn(batch, 4096, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        eager = do_bench(lambda: m(x))
+        mc(x); mc(x)                               # new shape: (re)compile, then warm up
+        comp = do_bench(lambda: mc(x))
+    print(f"batch={batch:5d} eager {eager * 1e3:8.1f} us   compiled {comp * 1e3:8.1f} us")
+
+# see what it generated and why it broke or recompiled:
+#   TORCH_LOGS="output_code,graph_breaks,recompiles" python compile_mlp.py
+</code></pre></div>
+<p>Predict first. At batch 1 and 8 the three GEMMs are weight-bandwidth-bound (about 350 MB of bf16 weights), and compile can only fuse the norm and the <code>silu * up</code>, so expect a modest gain. At batch 2048 the GEMMs are compute-bound; the gain depends on autotuning beating cuBLAS, which it usually doesn't on these shapes. Each new batch size triggers a recompile, which the log will show.</p>
+
+<h3>4. CUDA graph capture by hand</h3>
+<div class="code" data-lang="python" data-title="cuda_graph.py"><pre><code>
+import torch, torch.nn as nn
+from triton.testing import do_bench
+
+# 32 small blocks: ~160 short kernels per call, a launch-bound shape like batch-1 decode
+model = nn.Sequential(*[nn.Sequential(nn.Linear(1024, 2816), nn.SiLU(), nn.Linear(2816, 1024))
+                        for _ in range(32)]).cuda().to(torch.bfloat16).eval()
+static_x = torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16)
+
+with torch.no_grad():
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):                 # warm up on a side stream before capture
+        for _ in range(3):
+            model(static_x)
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):                  # record, don't run
+        static_y = model(static_x)
+
+    def graph_step(new_x):
+        static_x.copy_(new_x)                  # write into the captured input buffer
+        g.replay()                             # one launch for the whole sequence
+        return static_y                        # captured output buffer (clone it to keep it)
+
+    x = torch.randn_like(static_x)
+    assert torch.allclose(graph_step(x), model(x), atol=1e-2)
+    print("eager us:", do_bench(lambda: model(x)) * 1e3)
+    print("graph us:", do_bench(lambda: graph_step(x)) * 1e3)
+</code></pre></div>
+
+<h3>5. A PyTorch profiler trace</h3>
+<div class="code" data-lang="python" data-title="profile_step.py"><pre><code>
+from torch.profiler import profile, schedule, ProfilerActivity
+
+def step():
+    with torch.no_grad():
+        model(x)
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(wait=1, warmup=2, active=3, repeat=1),   # skip, warm up, then record 3 steps
+    on_trace_ready=lambda p: p.export_chrome_trace(f"trace_{p.step_num}.json"),
+    record_shapes=True,
+    with_stack=True,
+) as prof:
+    for _ in range(8):
+        step()
+        prof.step()                    # tell the scheduler a step ended
+
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))   # newer releases also accept "device_time_total"
+# open trace_*.json in a trace viewer (Perfetto UI or chrome://tracing)
+</code></pre></div>
+
+<h3>6. Nsight Systems and Nsight Compute</h3>
+<div class="code" data-lang="bash" data-title="nsys / ncu"><pre><code>
+# timeline of the whole run, with CUDA API, NVTX ranges and OS runtime calls
+nsys profile -t cuda,nvtx,osrt --cuda-graph-trace=node -o decode_report python bench_decode.py
+nsys stats decode_report.nsys-rep          # text summary: top kernels, API calls, gaps
+
+# limit capture to a region: call torch.cuda.profiler.start()/stop() in the script
+nsys profile --capture-range=cudaProfilerApi -o region python bench_decode.py
+
+# per-kernel hardware counters for the softmax kernel, 3 launches after skipping 10 warm-ups
+ncu --set full -k regex:softmax --launch-skip 10 --launch-count 3 -o softmax_ncu python bench_softmax.py
+ncu --import softmax_ncu.ncu-rep --page details   # or open in the Nsight Compute GUI
+</code></pre></div>
+<p>In the <code>ncu</code> report, read the "GPU Speed Of Light" section first: memory throughput and compute throughput as a percentage of peak. For the softmax, memory should be the high one. Then the memory workload analysis (are loads coalesced? L2 hit rate?) and occupancy. Mark interesting regions in your own code with <code>torch.cuda.nvtx.range_push("name")</code> / <code>range_pop()</code> so they show up as labelled bars in <code>nsys</code>.</p>
+
+<h3>7. On a Mac: custom Metal kernels in MLX</h3>
+<p>MLX exposes a way to compile a Metal kernel from a source string: <code>mx.fast.metal_kernel</code>. The API below matches the MLX documentation at the time of writing; check the current docs, since it has changed between releases. The model is close to CUDA's: each thread knows its position in the grid, and <code>grid</code> counts threads, not threadgroups.</p>
+<div class="code" data-lang="python" data-title="mlx_metal_add.py"><pre><code>
+import mlx.core as mx
+
+source = """
+    uint i = thread_position_in_grid.x;
+    out[i] = a[i] + b[i];
+"""
+kernel = mx.fast.metal_kernel(
+    name="vec_add",
+    input_names=["a", "b"],
+    output_names=["out"],
+    source=source,
+)
+
+a = mx.random.normal((1 &lt;&lt; 24,)); b = mx.random.normal((1 &lt;&lt; 24,))
+(out,) = kernel(
+    inputs=[a, b],
+    grid=(a.size, 1, 1),            # total threads: exactly one per element, so no bounds check
+    threadgroup=(256, 1, 1),
+    output_shapes=[a.shape],
+    output_dtypes=[a.dtype],
+)
+mx.eval(out)
+print(mx.abs(out - (a + b)).max())
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have: (1) a Triton fused softmax that matches <code>torch.softmax</code> within 1e-3 (max absolute error, fp32) for row lengths 1K to 32K; (2) a table of row length vs µs and GB/s for naive eager, <code>torch.softmax</code>, and yours, where yours beats the naive eager composition by at least 2× on rows of 16K+ and you report achieved GB/s as a percentage of your GPU's peak; (3) one <code>nsys</code> or profiler trace of the CUDA-graph script, eager vs graph, where you can point at the gaps that disappeared; and (4) one sentence per result explaining it from the formulas in this module. Stretch goal: extend the softmax to rows longer than one block using the online recurrence, and check that it still matches.</p>
+</div>
+
+<h3>Reading list</h3>
+<ul>
+  <li>Tillet, Kung &amp; Cox (2019), <a href="https://www.eecs.harvard.edu/~htk/publication/2019-mapl-tillet-kung-cox.pdf">Triton: an intermediate language and compiler for tiled neural network computations</a>, and the official <a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a> (vector add, fused softmax, matmul).</li>
+  <li>Milakov &amp; Gimelshein (2018), <a href="https://arxiv.org/abs/1805.02867">Online normalizer calculation for softmax</a>.</li>
+  <li>Dao et al. (2022), <a href="https://arxiv.org/abs/2205.14135">FlashAttention</a>; Dao (2023), <a href="https://arxiv.org/abs/2307.08691">FlashAttention-2</a>; Shah et al. (2024), <a href="https://arxiv.org/abs/2407.08608">FlashAttention-3</a>.</li>
+  <li>Frantar et al. (2024), <a href="https://arxiv.org/abs/2408.11743">MARLIN: mixed-precision auto-regressive parallel inference on large language models</a>.</li>
+  <li>Ansel et al. (2024), <a href="https://pytorch.org/docs/stable/torch.compiler.html">PyTorch 2 / torch.compile documentation</a>, and the <a href="https://pytorch.org/docs/stable/notes/cuda.html#cuda-graphs">CUDA graphs notes</a>.</li>
+  <li>Williams, Waterman &amp; Patterson (2009), "Roofline: an insightful visual performance model for multicore architectures".</li>
+</ul>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="18-main" data-title="Check yourself · Kernels, compilers &amp; profiling">
+  <div class="q" data-answer="2"><p>A chain of 4 elementwise ops (no extra inputs) runs on a tensor of 64M bf16 elements on an H100 (3.35 TB/s). Roughly how long does it take unfused vs fused, ignoring launch cost?</p>
+    <ol><li>80 µs vs 40 µs</li><li>160 µs vs 80 µs</li><li>320 µs vs 80 µs</li><li>320 µs vs 320 µs: fusion doesn't change memory traffic</li></ol>
+    <div class="explain">Unfused: \(2k \cdot N \cdot b = 8 \times 64\text{M} \times 2\) B ≈ 1.07 GB → ≈ 320 µs. Fused: one read and one write, \(2 \times 64\text{M} \times 2\) ≈ 268 MB → ≈ 80 µs. The 4× comes entirely from removing the intermediate round trips.</div></div>
+  <div class="q" data-answer="0"><p>A square 8192 × 8192 bf16 matmul uses 128 × 128 output tiles. How many times is each element of \(A\) fetched from global memory, and what is the tile-level arithmetic intensity?</p>
+    <ol><li>64 times; 64 FLOP/B</li><li>8192 times; 1 FLOP/B</li><li>128 times; 128 FLOP/B</li><li>Once; about 5,500 FLOP/B</li></ol>
+    <div class="explain">Each element of \(A\) is loaded once per column of output tiles: \(N/T = 8192/128 = 64\). Tile intensity is \(T/b = 128/2 = 64\) FLOP/B. "Once" is the compulsory minimum, which only L2 reuse gets close to; 8192 is the no-tiling case.</div></div>
+  <div class="q" data-answer="3"><p>In the online softmax, the running max goes from \(m_{i-1} = 2\) to \(m_i = 5\) when \(x_i = 5\) arrives. What happens to the running normalizer?</p>
+    <ol><li>It's reset to 0 and recomputed from scratch</li><li>\(d_i = d_{i-1} + e^{5}\)</li><li>\(d_i = d_{i-1} \cdot e^{3} + 1\)</li><li>\(d_i = d_{i-1} \cdot e^{-3} + 1\)</li></ol>
+    <div class="explain">\(d_i = d_{i-1}\, e^{m_{i-1} - m_i} + e^{x_i - m_i} = d_{i-1} e^{2-5} + e^{0}\). Old terms were measured relative to 2; relative to the new max 5 they're smaller by \(e^{-3}\). The normalizer stays between 1 and \(i\), so it never overflows.</div></div>
+  <div class="q" data-answer="1"><p>Llama-3-8B in bf16 (~16 GB of weights) decodes at 60 tokens/s at batch 1 and short context on an H100 SXM (3.35 TB/s). What is the MBU, and what's the most likely next step?</p>
+    <ol><li>About 90%; nothing left to gain without quantization</li><li>About 29%; look for launch overhead and syncs, e.g. add CUDA graphs</li><li>About 3%; the GPU is compute-bound, so buy more FLOPs</li><li>Can't be computed without knowing the FLOPs</li></ol>
+    <div class="explain">16 GB × 60/s ≈ 0.96 TB/s, which is 0.96 ÷ 3.35 ≈ 29%. That low a fraction at batch 1 usually means the GPU is idle much of the step, typically launch-bound eager code. CUDA graphs and fused kernels are the usual fix. MFU would be about 1% and tells you nothing here.</div></div>
+  <div class="q" data-answer="2"><p>Why does Flash-Decoding (split-KV) speed up batch-1 decode at 32K context but help little at batch 64 and short context?</p>
+    <ol><li>It reduces the number of FLOPs in attention</li><li>It compresses the KV cache</li><li>At batch 1 there are too few (batch × head) work units to fill the SMs, so splitting the KV length adds parallelism; at batch 64 the GPU is already full</li><li>It only works with FP8</li></ol>
+    <div class="explain">With 8 KV heads at batch 1 there are 8 work units for 132 SMs. Splitting a 32K cache into chunks gives each SM a share. At batch 64 there are already 512 units, so extra splitting only adds the merge cost. FLOPs and bytes are unchanged; only the parallelism changes.</div></div>
+  <div class="q" data-answer="3"><p>You wrap a model in <code>torch.compile</code>. Its forward contains <code>if mask.sum().item() &gt; 0:</code>, and requests arrive with many different sequence lengths. Which pair of problems should you expect?</p>
+    <ol><li>Out-of-memory errors and NaNs</li><li>Slower compile only on the first call, then no issues</li><li>The compiled model returns different numbers from eager</li><li>A graph break at <code>.item()</code>, and recompiles as lengths change (until dynamic shapes or the recompile limit kick in)</li></ol>
+    <div class="explain"><code>.item()</code> copies a value to the CPU, and Dynamo can't trace a Python branch on it, so it breaks the graph there (and syncs). New sequence lengths fail shape guards and trigger recompiles; after the recompile limit, the function falls back to eager. <code>TORCH_LOGS="graph_breaks,recompiles"</code> shows both.</div></div>
+  <div class="q" data-answer="1"><p>A decode trace shows GPU kernels of about 3 µs each separated by 6 µs gaps, while the CPU thread is busy the whole time with launch calls. Which change will help most?</p>
+    <ol><li>A GPU with more memory bandwidth</li><li>Capture the step in a CUDA graph (or fuse ops to cut the kernel count)</li><li>Use a larger tile size in the GEMMs</li><li>Switch the attention kernel to FlashAttention-3</li></ol>
+    <div class="explain">The GPU is busy about a third of the time, and the CPU is the bottleneck. A faster GPU would make the kernels shorter and the gaps relatively bigger. Removing per-kernel CPU cost, through graphs or fewer kernels, is the only change that removes the gaps.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, widget, fmtNum, fmtSI, rng, palette, clamp, softmax } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const fmtUs = us => !isFinite(us) ? "∞" : us >= 1e6 ? fmtNum(us / 1e6, 2) + " s" : us >= 1000 ? fmtNum(us / 1000, us >= 1e4 ? 1 : 2) + " ms" : fmtNum(us, us >= 100 ? 0 : 1) + " µs";
+  const fmtB = b => {
+    const u = [[1e12, "TB"], [1e9, "GB"], [1e6, "MB"], [1e3, "KB"]];
+    for (const [v, s] of u) if (b >= v) { const x = b / v; return fmtNum(x, x >= 100 ? 0 : x >= 10 ? 1 : 2) + " " + s; }
+    return fmtNum(b, 0) + " B";
+  };
+  const tint = { green: "rgba(26,122,82,.14)", brick: "rgba(176,67,46,.16)", blue: "rgba(47,93,138,.14)", gold: "rgba(154,123,34,.2)", grey: "rgba(118,115,107,.12)" };
+  const edge = { green: "rgba(26,122,82,.6)", brick: "rgba(176,67,46,.6)", blue: "rgba(47,93,138,.55)", gold: "rgba(154,123,34,.6)", grey: "rgba(28,27,25,.25)" };
+  function defs(s, id, color) {
+    const d = svg("defs");
+    d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color || palette.ink })));
+    s.appendChild(d);
+  }
+  function T(s, x, y, t, o) { s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink }, o || {}, { text: t }))); }
+  function R(s, x, y, w, h, o) { s.appendChild(svg("rect", Object.assign({ x, y, width: w, height: h, rx: 5, fill: "#fff", stroke: edge.grey, "stroke-width": 1.2 }, o || {}))); }
+  function L(s, x1, y1, x2, y2, id, o) { s.appendChild(svg("line", Object.assign({ x1, y1, x2, y2, stroke: palette.ink, "stroke-width": 1.3, "marker-end": id ? `url(#${id})` : null }, o || {}))); }
+  function box(s, x, y, w, h, title, sub, kind) {
+    const k = kind || "grey";
+    R(s, x, y, w, h, { fill: k === "white" ? "#fff" : tint[k], stroke: edge[k === "white" ? "grey" : k], rx: 8 });
+    const lines = sub ? sub.split("|") : [];
+    const top = y + h / 2 - (lines.length * 13) / 2 + (lines.length ? 2 : 4);
+    T(s, x + w / 2, top, title, { "text-anchor": "middle", "font-size": 12.5, "font-weight": 600 });
+    lines.forEach((t, i) => T(s, x + w / 2, top + 15 + i * 13, t, { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted }));
+  }
+
+  /* ---------------------------------------------------------- fig: eager dispatch */
+  (function () {
+    const s = document.getElementById("fig-dispatch");
+    defs(s, "arrD");
+    T(s, 20, 18, "CPU · per eager op (a few µs in total, approximate)", { "font-size": 11.5, class: "mono", fill: palette.muted });
+    const steps = [["Python", "torch.relu(x)"], ["C++ binding", "parse args|pick overload"], ["Dispatcher", "Autograd → Autocast|→ CUDA key"], ["ATen CUDA op", "choose kernel,|compute grid"], ["cudaLaunchKernel", "enqueue, return|immediately"]];
+    steps.forEach(([t, sub], i) => {
+      box(s, 20 + i * 168, 28, 150, 58, t, sub, "blue");
+      if (i) L(s, 20 + i * 168 - 18, 57, 20 + i * 168 - 2, 57, "arrD");
+    });
+    // stream + GPU
+    L(s, 767, 86, 767, 112, "arrD");
+    R(s, 430, 114, 410, 34, { fill: tint.grey, rx: 6 });
+    T(s, 440, 136, "CUDA stream (FIFO)", { "font-size": 11.5, class: "mono", fill: palette.muted });
+    ["k3", "k2", "k1"].forEach((k, i) => { R(s, 610 + i * 70, 119, 60, 24, { fill: tint.green, stroke: edge.green }); T(s, 640 + i * 70, 135, k, { "text-anchor": "middle", class: "mono", "font-size": 11 }); });
+    L(s, 430, 131, 380, 131, "arrD");
+    box(s, 210, 112, 168, 38, "GPU: SMs run kernel", null, "green");
+    T(s, 20, 136, "returns before the GPU", { "font-size": 11, fill: palette.muted });
+    T(s, 20, 149, "has even started", { "font-size": 11, fill: palette.muted });
+    // timeline
+    const x0 = 90, px = 10; // 10 px per µs
+    const yC = 196, yG = 236;
+    T(s, 20, yC + 15, "CPU", { class: "mono", "font-size": 11.5 });
+    T(s, 20, yG + 15, "GPU", { class: "mono", "font-size": 11.5 });
+    s.appendChild(svg("line", { x1: x0, x2: 845, y1: yG + 32, y2: yG + 32, stroke: palette.line }));
+    T(s, x0, 182, "short kernels (2 µs) · launch-bound", { "font-size": 11, class: "mono", fill: palette.brick });
+    T(s, 452, 182, "long kernels (7 µs) · CPU runs ahead", { "font-size": 11, class: "mono", fill: palette.green });
+    let gEnd = 0;
+    for (let i = 0; i < 6; i++) {
+      const c0 = x0 + i * 5 * px; R(s, c0, yC, 5 * px - 3, 22, { fill: tint.blue, stroke: edge.blue, rx: 3 });
+      const g0 = c0 + 5 * px; R(s, g0, yG, 2 * px - 2, 22, { fill: palette.green, stroke: "none", rx: 3, opacity: 0.85 }); gEnd = g0 + 2 * px;
+    }
+    s.appendChild(svg("line", { x1: 440, x2: 440, y1: 176, y2: yG + 34, stroke: palette.faint, "stroke-dasharray": "3 3" }));
+    let g = 0;
+    for (let i = 0; i < 8; i++) {
+      const c0 = 452 + i * 5 * px * 0.9; if (c0 + 42 > 845) break;
+      R(s, c0, yC, 5 * px * 0.9 - 3, 22, { fill: tint.blue, stroke: edge.blue, rx: 3 });
+      const start = Math.max(g || 0, c0 + 45);
+      if (start + 7 * px - 2 <= 845) R(s, start, yG, 7 * px - 2, 22, { fill: palette.green, stroke: "none", rx: 3, opacity: 0.85 });
+      g = start + 7 * px;
+    }
+    T(s, x0, yG + 50, "GPU idle ~60%: each kernel ends before the next launch arrives", { "font-size": 11, fill: palette.brick });
+    T(s, 452, yG + 50, "queue fills; launch cost hidden behind GPU work", { "font-size": 11, fill: palette.green });
+    T(s, 845, yG + 74, "time →  (illustrative, 10 px = 1 µs)", { "font-size": 10.5, "text-anchor": "end", fill: palette.faint });
+  })();
+
+  /* ---------------------------------------------------------- widget: fusion */
+  (function () {
+    const w = widget("w-fusion", { title: "Fused vs unfused elementwise chain", kicker: "Calculator", note: "Model: eager kernels are launched asynchronously, so a chain takes max(k × CPU cost, total GPU time). Each kernel's GPU time is ~2 µs fixed plus its bytes ÷ bandwidth. Illustrative, not a benchmark. The flat left part of each curve is overhead; the sloped right part is bandwidth." });
+    const gpus = [{ v: "h100", l: "H100 SXM · 3.35 TB/s", bw: 3.35e12 }, { v: "a100", l: "A100 80GB · 2.0 TB/s", bw: 2.0e12 }, { v: "4090", l: "RTX 4090 · 1.0 TB/s", bw: 1.0e12 }, { v: "l4", l: "L4 · 0.3 TB/s", bw: 0.3e12 }];
+    let gpu = gpus[0], b = 2;
+    const ks = slider(w.controls, { label: "Ops in the chain (k)", min: 1, max: 12, step: 1, value: 4, onInput: draw });
+    const ns = slider(w.controls, { label: "Elements per tensor", min: 10, max: 30, step: 1, value: 24, fmt: v => "2^" + v + " ≈ " + fmtSI(2 ** v, 0), onInput: draw });
+    const rs = slider(w.controls, { label: "Extra full-size inputs (r)", min: 0, max: 3, step: 1, value: 0, onInput: draw });
+    const ls = slider(w.controls, { label: "CPU cost per eager op", min: 2, max: 20, step: 1, value: 5, fmt: v => v + " µs", onInput: draw });
+    const cd = el("div", { class: "ctl" }, el("label", null, el("span", { text: "dtype" })));
+    seg(cd, { options: [{ value: 4, label: "fp32" }, { value: 2, label: "bf16" }], value: 2, onChange: v => { b = v; draw(); } });
+    w.controls.appendChild(cd);
+    select(w.controls, { label: "GPU", options: gpus.map(g => ({ value: g.v, label: g.l })), value: "h100", onChange: v => { gpu = gpus.find(g => g.v === v); draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [2 ** 10, 2 ** 30], y: [1, 1e6], logx: true, logy: true, xlabel: "elements per tensor", ylabel: "time for the chain", xfmt: v => fmtSI(v, 0), yfmt: v => fmtUs(v), margin: { l: 64 } });
+    const set = stats(w.body, [{ key: "bu", label: "Bytes, unfused" }, { key: "bf", label: "Bytes, fused" }, { key: "tu", label: "Time, unfused" }, { key: "tf", label: "Time, fused" }, { key: "sp", label: "Speedup" }]);
+    const FIX = 2;
+    function times(N, k, r, tl) {
+      const bu = (2 * k + r) * N * b, bf = (2 + r) * N * b;
+      const gpuU = k * FIX + bu / gpu.bw * 1e6, gpuF = FIX + bf / gpu.bw * 1e6;
+      return { bu, bf, tu: Math.max(k * tl, gpuU), tf: Math.max(tl, gpuF), cpuU: k * tl > gpuU };
+    }
+    function draw() {
+      const k = ks.value, r = rs.value, tl = ls.value, N = 2 ** ns.value;
+      const t = times(N, k, r, tl);
+      P.draw([
+        { fn: x => times(x, k, r, tl).tu, color: palette.brick, label: `unfused: ${k} kernel${k > 1 ? "s" : ""}` },
+        { fn: x => times(x, k, r, tl).tf, color: palette.green, label: "fused: 1 kernel" },
+        { vline: N, color: palette.muted },
+        { marker: [N, t.tu], color: palette.brick },
+        { marker: [N, t.tf], color: palette.green }
+      ]);
+      set("bu", fmtB(t.bu), null, `(2·${k} + ${r}) passes`);
+      set("bf", fmtB(t.bf), "good", `(2 + ${r}) passes`);
+      set("tu", fmtUs(t.tu), t.cpuU ? "bad" : null, t.cpuU ? "CPU launch-bound" : "bandwidth-bound");
+      set("tf", fmtUs(t.tf), "good", t.tf <= tl + 1e-9 ? "launch cost sets the floor" : "bandwidth-bound");
+      set("sp", fmtNum(t.tu / t.tf, 2) + "×", t.tu / t.tf > 1.5 ? "good" : null, "bandwidth limit: " + fmtNum((2 * k + r) / (2 + r), 2) + "×");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: matmul tiling */
+  (function () {
+    const s = document.getElementById("fig-tiles");
+    defs(s, "arrT");
+    const n = 4, sz = 140, c = sz / n;
+    const grid = (x, y, label, hi) => {
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const kind = hi(i, j);
+        s.appendChild(svg("rect", { x: x + j * c + 1, y: y + i * c + 1, width: c - 2, height: c - 2, rx: 2, fill: kind === 2 ? "rgba(176,67,46,.55)" : kind === 1 ? tint.gold : "#fbfaf7", stroke: edge.grey, "stroke-width": 0.8 }));
+      }
+      T(s, x + sz / 2, y - 8, label, { "text-anchor": "middle", class: "mono", "font-size": 12 });
+    };
+    const kStep = 2, ti = 1, tj = 3;
+    grid(30, 170, "", (i, j) => i === ti ? (j === kStep ? 2 : 1) : 0);
+    T(s, 100, 326, "A  (M × K)", { "text-anchor": "middle", class: "mono", "font-size": 12 });
+    grid(200, 18, "B  (K × N)", (i, j) => j === tj ? (i === kStep ? 2 : 1) : 0);
+    // C
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) s.appendChild(svg("rect", { x: 200 + j * c + 1, y: 170 + i * c + 1, width: c - 2, height: c - 2, rx: 2, fill: i === ti && j === tj ? "rgba(26,122,82,.6)" : "#fbfaf7", stroke: edge.grey, "stroke-width": 0.8 }));
+    T(s, 270, 326, "C  (M × N)", { "text-anchor": "middle", class: "mono", "font-size": 12 });
+    // SRAM box
+    R(s, 430, 40, 410, 175, { fill: tint.blue, stroke: edge.blue, rx: 10 });
+    T(s, 445, 62, "Shared memory (on-chip SRAM, up to ~227 KB per block on H100)", { "font-size": 11.5, fill: palette.blue, "font-weight": 600 });
+    R(s, 455, 80, 120, 50, { fill: "rgba(176,67,46,.4)", stroke: "none" });
+    T(s, 515, 102, "A tile", { "text-anchor": "middle", "font-size": 12, "font-weight": 600 });
+    T(s, 515, 118, "B_M × B_K", { "text-anchor": "middle", class: "mono", "font-size": 10.5 });
+    R(s, 595, 80, 70, 100, { fill: "rgba(176,67,46,.4)", stroke: "none" });
+    T(s, 630, 125, "B tile", { "text-anchor": "middle", "font-size": 12, "font-weight": 600 });
+    T(s, 630, 141, "B_K × B_N", { "text-anchor": "middle", class: "mono", "font-size": 10.5 });
+    T(s, 690, 100, "× 2–4 stages:", { "font-size": 11, fill: palette.muted });
+    T(s, 690, 115, "load next pair", { "font-size": 11, fill: palette.muted });
+    T(s, 690, 130, "while computing", { "font-size": 11, fill: palette.muted });
+    T(s, 690, 145, "this one", { "font-size": 11, fill: palette.muted });
+    R(s, 455, 150, 120, 50, { fill: "rgba(26,122,82,.45)", stroke: "none" });
+    T(s, 515, 172, "accumulator", { "text-anchor": "middle", "font-size": 12, "font-weight": 600 });
+    T(s, 515, 188, "B_M × B_N fp32 (registers)", { "text-anchor": "middle", class: "mono", "font-size": 9.5 });
+    s.appendChild(svg("path", { d: `M${30 + kStep * c + c / 2},${170 + ti * c + 2} L${30 + kStep * c + c / 2},164 L410,164 L452,103`, fill: "none", stroke: palette.brick, "stroke-width": 1.3, "marker-end": "url(#arrT)" }));
+    L(s, 200 + tj * c + c, 18 + kStep * c + c / 2, 593, 110, "arrT", { stroke: palette.brick });
+    L(s, 455, 190, 200 + tj * c + c - 2, 170 + ti * c + c / 2, "arrT", { stroke: palette.green, "stroke-dasharray": "4 3" });
+    T(s, 430, 240, "for k0 in range(0, K, B_K):", { class: "mono", "font-size": 11.5 });
+    T(s, 450, 257, "load A[m0:m0+B_M, k0:k0+B_K] and B[k0:k0+B_K, n0:n0+B_N]", { class: "mono", "font-size": 11 });
+    T(s, 450, 274, "acc += A_tile @ B_tile        # tensor cores, from SRAM", { class: "mono", "font-size": 11 });
+    T(s, 430, 291, "C[m0:m0+B_M, n0:n0+B_N] = acc   # written once (dashed arrow)", { class: "mono", "font-size": 11 });
+    T(s, 430, 316, "One thread block per output tile; blocks run in parallel across SMs.", { "font-size": 11, fill: palette.muted });
+    T(s, 430, 333, "Gold: the strips of A and B this block reads. Brick: the current K step.", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- widget: tile size */
+  (function () {
+    const w = widget("w-tile", { title: "Tile size vs memory traffic", kicker: "Interactive", note: "Square M = N = K matmul, square B_M = B_N = T tiles, B_K = 64, 3 pipeline stages. Global loads include L2 hits; HBM traffic lies between the tile-level number and the compulsory minimum (read A and B once, write C once). Limits are H100's: ~227 KB shared memory per block, 256 KB of registers per SM. Ridge points use dense peak (bf16 989, fp8 1979 TFLOP/s) over 3.35 TB/s." });
+    const TS = [16, 32, 64, 128, 256];
+    let N = 8192, b = 2;
+    const ts = slider(w.controls, { label: "Tile size T", min: 0, max: 4, step: 1, value: 3, fmt: i => TS[i] + " × " + TS[i], onInput: draw });
+    const cN = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Matrix size N" })));
+    seg(cN, { options: [{ value: 1024, label: "1024" }, { value: 4096, label: "4096" }, { value: 8192, label: "8192" }, { value: 16384, label: "16384" }], value: 8192, onChange: v => { N = v; draw(); } });
+    w.controls.appendChild(cN);
+    const cb = el("div", { class: "ctl" }, el("label", null, el("span", { text: "dtype" })));
+    seg(cb, { options: [{ value: 2, label: "bf16" }, { value: 1, label: "fp8" }], value: 2, onChange: v => { b = v; draw(); } });
+    w.controls.appendChild(cb);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 270, x: [16, 256], y: [1, 1e5], logx: true, logy: true, xticks: TS, yticks: [1, 10, 100, 1000, 10000, 100000], xlabel: "tile size T", ylabel: "FLOPs per byte", xfmt: v => String(v), yfmt: v => fmtSI(v, 0) });
+    const set = stats(w.body, [{ key: "loads", label: "Global loads" }, { key: "comp", label: "Compulsory minimum" }, { key: "ai", label: "Tile-level AI" }, { key: "smem", label: "Shared memory needed" }, { key: "regs", label: "Accumulator" }]);
+    const ai = (T) => { const F = 2 * N ** 3, Q = (2 * N ** 3 / T + N * N) * b; return F / Q; };
+    function draw() {
+      const T = TS[ts.value];
+      const ridge = b === 2 ? 295 : 591;
+      const loads = (2 * N ** 3 / T + N * N) * b, comp = 3 * N * N * b;
+      const aiC = 2 * N ** 3 / comp;
+      P.draw([
+        { fn: ai, color: palette.blue, label: "tile-level AI (global loads)" },
+        { hline: aiC, color: palette.green, label: "compulsory AI: " + fmtNum(aiC, 0) },
+        { hline: ridge, color: palette.brick, label: "HBM ridge ≈ " + ridge },
+        { marker: [T, ai(T)], color: palette.blue, label: fmtNum(ai(T), 0) + " FLOP/B" }
+      ]);
+      const smem = 3 * 2 * T * 64 * b, regs = T * T * 4;
+      set("loads", fmtB(loads), null, `each element fetched ${fmtNum(N / T, 0)}×`);
+      set("comp", fmtB(comp), "good", `${fmtNum(loads / comp, 0)}× less than tile-level`);
+      set("ai", fmtNum(ai(T), 0) + " FLOP/B", ai(T) >= ridge ? "good" : "warn", ai(T) >= ridge ? "above HBM ridge" : "relies on L2 reuse");
+      set("smem", fmtNum(smem / 1024, 0) + " KB", smem > 227 * 1024 ? "bad" : smem > 160 * 1024 ? "warn" : "good", "3 stages × (A + B) tiles");
+      set("regs", fmtNum(regs / 1024, 0) + " KB", regs >= 256 * 1024 ? "bad" : regs > 128 * 1024 ? "warn" : "good", "fp32, of 256 KB per SM");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: triton grid + mask */
+  (function () {
+    const s = document.getElementById("fig-triton");
+    defs(s, "arrG");
+    const n = 2600, B = 1024, x0 = 40, W = 780, slots = 3 * B;
+    const sx = v => x0 + v / slots * W;
+    T(s, x0, 20, "x  (n_elements = 2600, BLOCK_SIZE = 1024 → grid = cdiv(2600, 1024) = 3 programs)", { class: "mono", "font-size": 11.5 });
+    const cols = [tint.green, tint.blue, tint.gold], eds = [edge.green, edge.blue, edge.gold];
+    for (let p = 0; p < 3; p++) {
+      const a = sx(p * B), bnd = sx(Math.min((p + 1) * B, n));
+      R(s, a + 1, 34, bnd - a - 2, 40, { fill: cols[p], stroke: eds[p], rx: 4 });
+      T(s, (a + sx((p + 1) * B)) / 2, 58, `pid = ${p}`, { "text-anchor": "middle", class: "mono", "font-size": 12, "font-weight": 600 });
+      T(s, a + 4, 92, `offsets ${p * B}…${(p + 1) * B - 1}`, { class: "mono", "font-size": 10.5, fill: palette.muted });
+    }
+    // masked region
+    const m0 = sx(n), m1 = sx(slots);
+    R(s, m0 + 1, 34, m1 - m0 - 2, 40, { fill: "#f1f0ea", stroke: edge.grey, "stroke-dasharray": "3 3", rx: 4 });
+    for (let xx = m0 + 6; xx < m1 - 2; xx += 10) s.appendChild(svg("line", { x1: xx, y1: 72, x2: Math.min(xx + 12, m1 - 2), y2: 36, stroke: palette.faint, "stroke-width": 0.8 }));
+    T(s, (m0 + m1) / 2, 108, "mask = False (472 lanes)", { "text-anchor": "middle", class: "mono", "font-size": 10.5, fill: palette.brick });
+    T(s, m0, 30, "2600", { "text-anchor": "middle", class: "mono", "font-size": 10, fill: palette.brick });
+    // inside program 2
+    const y = 140;
+    T(s, x0, y, "inside program 2:", { "font-size": 12, "font-weight": 600 });
+    const steps = [["tl.arange(0, 1024)", "0, 1, …, 1023"], ["+ pid * 1024", "2048 … 3071"], ["< n_elements", "mask: 552 True, 472 False"], ["tl.load(ptr + offs, mask)", "masked lanes: no access"]];
+    steps.forEach(([a, bb], i) => {
+      box(s, x0 + i * 200, y + 12, 180, 52, a, bb, "white");
+      if (i) L(s, x0 + i * 200 - 18, y + 38, x0 + i * 200 - 2, y + 38, "arrG");
+    });
+  })();
+
+  /* ---------------------------------------------------------- widget: online softmax */
+  (function () {
+    const w = widget("w-online", { title: "Online softmax, one element at a time", kicker: "Step through", note: "Bars are the inputs x. Green: processed. Gold: the element just processed. Brick: the running max. Grey: not yet seen. Push the logit scale up: a naive fp32 sum of exp(x) overflows once any x exceeds about 88.7, while the online normalizer d stays between 1 and i." });
+    const Rg = rng(5);
+    const base = Array.from({ length: 12 }, () => Rg.normal());
+    base[2] = 0.6; base[7] = 2.1; base[10] = 1.2;
+    const sc = slider(w.controls, { label: "Logit scale", min: 1, max: 120, step: 1, value: 3, fmt: v => "× " + v, onInput: draw });
+    const st = slider(w.controls, { label: "Elements processed (i)", min: 0, max: 12, step: 1, value: 3, onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 220 });
+    const set = stats(w.body, [{ key: "m", label: "Running max m_i" }, { key: "d", label: "Normalizer d_i" }, { key: "f", label: "Rescale this step" }, { key: "naive", label: "Naive Σ exp(x), fp32" }, { key: "err", label: "Max |online − 2-pass|" }]);
+    function draw() {
+      const x = base.map(v => v * sc.value), i = st.value;
+      let m = -Infinity, d = 0, f = null, arg = -1;
+      for (let j = 0; j < i; j++) {
+        const mNew = Math.max(m, x[j]);
+        const r = m === -Infinity ? 0 : Math.exp(m - mNew);
+        d = d * r + Math.exp(x[j] - mNew);
+        if (j === i - 1) f = m === -Infinity ? null : r;
+        if (x[j] >= m) arg = j;
+        m = mNew;
+      }
+      const colors = x.map((_, j) => j === arg ? palette.brick : j === i - 1 ? palette.gold : j < i ? palette.green : "#d9d7cf");
+      B.draw(x.map((_, j) => "x" + (j + 1)), x, { colors, fmt: v => Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1) });
+      set("m", i ? fmtNum(m, 2) : "−∞", null, i ? "after " + i + " element" + (i > 1 ? "s" : "") : "m₀");
+      set("d", i ? fmtNum(d, 4) : "0", null, "always in [1, " + Math.max(i, 1) + "]");
+      if (f === null) set("f", i ? "—" : "—", null, i === 1 ? "first element" : "");
+      else set("f", f === 1 ? "× 1" : "× " + (f < 1e-3 ? f.toExponential(2) : fmtNum(f, 4)), f < 1 ? "warn" : null, f < 1 ? "new max: old sum shrunk" : "max unchanged");
+      const seen = x.slice(0, Math.max(i, 1));
+      const over = Math.max(...seen) > 88.72;
+      const naive = seen.reduce((a, v) => a + Math.exp(v), 0);
+      set("naive", i === 0 ? "—" : over ? "∞ (overflow)" : naive.toExponential(3), i && over ? "bad" : null, "no max subtraction");
+      if (i === 12) {
+        const two = softmax(x), on = x.map(v => Math.exp(v - m) / d);
+        const e = Math.max(...on.map((v, j) => Math.abs(v - two[j])));
+        set("err", e === 0 ? "0 (exact)" : e.toExponential(1), "good", "same answer, one pass for (m, d)");
+      } else set("err", "—", null, "finish all 12 to compare");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: FlashAttention loop */
+  (function () {
+    const s = document.getElementById("fig-faloop");
+    defs(s, "arrF");
+    const nb = 4, cell = 50, qi = 2, kj = 1;
+    const Sx = 170, Sy = 120;
+    // K^T
+    for (let j = 0; j < nb; j++) s.appendChild(svg("rect", { x: Sx + j * cell + 1, y: 40, width: cell - 2, height: 56, rx: 3, fill: j === kj ? "rgba(47,93,138,.5)" : "#fbfaf7", stroke: edge.grey }));
+    T(s, Sx + nb * cell / 2, 30, "Kᵀ  (d × N), blocks K_j", { "text-anchor": "middle", class: "mono", "font-size": 11.5 });
+    // Q
+    for (let i = 0; i < nb; i++) s.appendChild(svg("rect", { x: 90, y: Sy + i * cell + 1, width: 56, height: cell - 2, rx: 3, fill: i === qi ? "rgba(154,123,34,.5)" : "#fbfaf7", stroke: edge.grey }));
+    T(s, 118, Sy - 10, "Q (N × d)", { "text-anchor": "middle", class: "mono", "font-size": 11.5 });
+    T(s, 84, Sy + qi * cell + 30, "Q_i", { "text-anchor": "end", class: "mono", "font-size": 11.5, fill: palette.gold });
+    // S grid
+    for (let i = 0; i < nb; i++) for (let j = 0; j < nb; j++) {
+      const skip = j > i, cur = i === qi && j === kj, done = i === qi && j < kj;
+      s.appendChild(svg("rect", { x: Sx + j * cell + 1, y: Sy + i * cell + 1, width: cell - 2, height: cell - 2, rx: 3, fill: cur ? "rgba(176,67,46,.55)" : done ? tint.brick : skip ? "#efede6" : "#fbfaf7", stroke: edge.grey, "stroke-dasharray": skip ? "3 3" : null }));
+      if (skip) T(s, Sx + j * cell + cell / 2, Sy + i * cell + cell / 2 + 4, "skip", { "text-anchor": "middle", "font-size": 9.5, fill: palette.faint, class: "mono" });
+    }
+    T(s, Sx + nb * cell / 2, Sy + nb * cell + 18, "S = QKᵀ (N × N): never stored", { "text-anchor": "middle", class: "mono", "font-size": 11 });
+    T(s, Sx + nb * cell / 2, Sy + nb * cell + 32, "one tile at a time, in SRAM", { "text-anchor": "middle", class: "mono", "font-size": 11, fill: palette.muted });
+    // V
+    const Vx = Sx + nb * cell + 24;
+    for (let j = 0; j < nb; j++) s.appendChild(svg("rect", { x: Vx, y: Sy + j * cell + 1, width: 56, height: cell - 2, rx: 3, fill: j === kj ? "rgba(47,93,138,.5)" : "#fbfaf7", stroke: edge.grey }));
+    T(s, Vx + 28, Sy - 10, "V (N × d)", { "text-anchor": "middle", class: "mono", "font-size": 11.5 });
+    // loop labels
+    L(s, 30, Sy + 10, 30, Sy + nb * cell - 10, "arrF", { stroke: palette.gold });
+    T(s, 22, Sy + nb * cell / 2, "outer i: parallel", { transform: `rotate(-90 22 ${Sy + nb * cell / 2})`, "text-anchor": "middle", "font-size": 11, fill: palette.gold, class: "mono" });
+    L(s, Sx + 6, 108, Sx + kj * cell + cell - 6, 108, "arrF", { stroke: palette.blue });
+    T(s, Sx + kj * cell + cell + 4, 112, "inner j: sequential", { "font-size": 11, fill: palette.blue, class: "mono" });
+    // SRAM panel
+    const px = 520;
+    R(s, px, 30, 320, 310, { fill: tint.blue, stroke: edge.blue, rx: 10 });
+    T(s, px + 14, 52, "SRAM / registers of one thread block", { "font-size": 12, "font-weight": 600, fill: palette.blue });
+    const rows = [
+      ["Q_i", "B_r × d · loaded once", "rgba(154,123,34,.5)"],
+      ["K_j, V_j", "B_c × d · streamed in, then dropped", "rgba(47,93,138,.5)"],
+      ["S_ij = Q_i K_jᵀ / √d", "B_r × B_c · tensor cores", "rgba(176,67,46,.55)"],
+      ["m_i, ℓ_i", "B_r numbers each · running stats", "rgba(118,115,107,.35)"],
+      ["O_i accumulator", "B_r × d fp32 · rescaled, += P̃ V_j", "rgba(26,122,82,.5)"]
+    ];
+    rows.forEach(([a, bb, col], k) => {
+      const y = 68 + k * 44;
+      R(s, px + 14, y, 14, 30, { fill: col, stroke: "none", rx: 3 });
+      T(s, px + 38, y + 13, a, { class: "mono", "font-size": 12, "font-weight": 600 });
+      T(s, px + 38, y + 27, bb, { "font-size": 10.5, fill: palette.muted });
+    });
+    T(s, px + 14, 300, "after the last j: O_i ← O_i / ℓ_i", { class: "mono", "font-size": 11 });
+    T(s, px + 14, 316, "write O_i and L_i = m_i + log ℓ_i to HBM once", { class: "mono", "font-size": 11 });
+    L(s, Vx + 58, Sy + kj * cell + cell / 2, px - 2, 126, "arrF", { stroke: palette.blue, "stroke-dasharray": "4 3" });
+  })();
+
+  /* ---------------------------------------------------------- widget: FlashAttention IO */
+  (function () {
+    const w = widget("w-flash", { title: "HBM traffic: standard attention vs FlashAttention", kicker: "Calculator", note: "One layer, 32 heads, bf16, forward pass. Standard: read Q, K, V, write O, plus write and read S and P (4 N² per head). Flash (FA-2 order): read Q and write O once, re-read K and V once per query block, with B_r = SRAM ÷ (4·d·2 bytes), capped at 16–256 (illustrative). In practice many K/V re-reads hit L2, so real HBM traffic often sits nearer the compulsory curve. When d² approaches the SRAM size, the flash curve can cross above standard: the IO advantage needs M ≫ d²." });
+    let d = 128; const H = 32, b = 2;
+    const ns = slider(w.controls, { label: "Sequence length N", min: 9, max: 17, step: 1, value: 13, fmt: v => fmtNum(2 ** v, 0), onInput: draw });
+    const ms = slider(w.controls, { label: "SRAM for the tile working set", min: 48, max: 228, step: 4, value: 192, fmt: v => v + " KB", onInput: draw });
+    const cd = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Head dim d" })));
+    seg(cd, { options: [{ value: 64, label: "64" }, { value: 128, label: "128" }, { value: 256, label: "256" }], value: 128, onChange: v => { d = v; draw(); } });
+    w.controls.appendChild(cd);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [512, 131072], y: [1e6, 1e13], logx: true, logy: true, xticks: [512, 2048, 8192, 32768, 131072], yticks: [1e6, 1e8, 1e10, 1e12], xlabel: "sequence length N", ylabel: "HBM bytes per layer", xfmt: v => fmtSI(v, 0), yfmt: v => fmtB(v) });
+    const set = stats(w.body, [{ key: "br", label: "Query block B_r" }, { key: "std", label: "Standard" }, { key: "fl", label: "Flash (no L2 help)" }, { key: "ratio", label: "Reduction" }, { key: "S", label: "Score matrix if stored" }]);
+    function cost(N) {
+      const M = ms.value * 1024 / b;
+      const Br = clamp(Math.floor(M / (4 * d)), 16, 256);
+      return {
+        Br,
+        std: H * b * (4 * N * N + 4 * N * d),
+        flash: H * b * (2 * N * d + 2 * N * d * Math.ceil(N / Br)),
+        comp: H * b * 4 * N * d,
+        S: H * N * N * b
+      };
+    }
+    function draw() {
+      const N = 2 ** ns.value, c = cost(N);
+      P.draw([
+        { fn: x => cost(x).std, color: palette.brick, label: "standard (S and P through HBM)" },
+        { fn: x => cost(x).flash, color: palette.green, label: "FlashAttention, K/V re-reads from HBM" },
+        { fn: x => cost(x).comp, color: palette.green, dash: "5 4", label: "compulsory: Q, K, V, O once" },
+        { vline: N, color: palette.muted },
+        { marker: [N, c.std], color: palette.brick }, { marker: [N, c.flash], color: palette.green }
+      ]);
+      set("br", String(c.Br) + " rows", null, fmtNum(Math.ceil(N / c.Br), 0) + " K/V passes");
+      set("std", fmtB(c.std), null, fmtUs(c.std / 3.35e12 * 1e6) + " at 3.35 TB/s");
+      set("fl", fmtB(c.flash), c.flash < c.std ? "good" : "bad", fmtUs(c.flash / 3.35e12 * 1e6) + " at 3.35 TB/s");
+      set("ratio", fmtNum(c.std / c.flash, 1) + "×", c.std / c.flash > 1 ? "good" : "bad", "vs " + fmtNum(c.std / c.comp, 0) + "× if L2 caught every re-read");
+      set("S", fmtB(c.S), c.S > 8e10 ? "bad" : c.S > 8e9 ? "warn" : null, "per layer, all heads, bf16");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: split-KV */
+  (function () {
+    const s = document.getElementById("fig-splitkv");
+    defs(s, "arrS");
+    const smGrid = (x, y, busy, title, sub, col) => {
+      T(s, x, y - 26, title, { "font-size": 12, "font-weight": 600 });
+      T(s, x, y - 11, sub, { "font-size": 10.5, fill: palette.muted, class: "mono" });
+      for (let k = 0; k < 132; k++) {
+        const r = Math.floor(k / 22), c = k % 22;
+        s.appendChild(svg("rect", { x: x + c * 14, y: y + r * 14, width: 12, height: 12, rx: 2, fill: k < busy ? col : "#ecebe4" }));
+      }
+    };
+    smGrid(20, 50, 8, "No split · batch 1 · 8 KV heads", "8 work units → 8 of 132 SMs busy", palette.brick);
+    smGrid(20, 190, 128, "Split-KV · 16 chunks per head", "128 work units → 128 of 132 SMs busy", palette.green);
+    // right: one head's KV split
+    const x0 = 380, y0 = 60, W = 300;
+    T(s, x0, 32, "one head: KV cache of length T, split into chunks", { "font-size": 12, "font-weight": 600 });
+    T(s, x0 - 8, y0 + 20, "q", { "text-anchor": "end", class: "mono", "font-size": 13, "font-weight": 600, fill: palette.gold });
+    const cols = [tint.green, tint.blue, tint.gold, tint.brick];
+    for (let k = 0; k < 4; k++) {
+      R(s, x0 + k * W / 4 + 1, y0, W / 4 - 2, 32, { fill: cols[k], stroke: edge.grey, rx: 3 });
+      T(s, x0 + k * W / 4 + W / 8, y0 + 20, "KV chunk " + (k + 1), { "text-anchor": "middle", "font-size": 11, class: "mono" });
+      const bx = x0 + k * W / 4 + 4, by = y0 + 60;
+      L(s, x0 + k * W / 4 + W / 8, y0 + 34, x0 + k * W / 4 + W / 8, by - 2, "arrS", { stroke: palette.muted });
+      R(s, bx, by, W / 4 - 8, 46, { fill: "#fff", stroke: edge.grey, rx: 5 });
+      T(s, bx + (W / 4 - 8) / 2, by + 19, "SM " + (k + 1), { "text-anchor": "middle", "font-size": 11, "font-weight": 600 });
+      T(s, bx + (W / 4 - 8) / 2, by + 35, `O${k + 1}, m${k + 1}, ℓ${k + 1}`, { "text-anchor": "middle", "font-size": 10.5, class: "mono", fill: palette.muted });
+      L(s, bx + (W / 4 - 8) / 2, by + 48, x0 + W / 2, y0 + 148, "arrS", { stroke: palette.muted });
+    }
+    box(s, x0 + W / 2 - 110, y0 + 150, 220, 44, "combine (log-sum-exp)", "rescale by e^(m_s − m), weight by ℓ_s", "green");
+    L(s, x0 + W / 2, y0 + 194, x0 + W / 2, y0 + 208, "arrS");
+    T(s, x0 + W / 2, y0 + 224, "O: exact attention output", { "text-anchor": "middle", "font-size": 11.5, class: "mono" });
+    T(s, x0 + W + 20, y0 + 84, "parallel across", { "font-size": 11, fill: palette.muted });
+    T(s, x0 + W + 20, y0 + 98, "chunks, heads, batch", { "font-size": 11, fill: palette.muted });
+    T(s, x0 + W + 20, y0 + 176, "a second, tiny kernel", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- widget: split-KV */
+  (function () {
+    const w = widget("w-splitkv", { title: "Why decode attention needs split-KV", kicker: "Interactive", note: "One layer of a Llama-3-8B-like model (8 KV heads × 128 dims, bf16 → 4 KB of K+V per token per layer). Model: each work unit runs on one SM, each SM pulls an equal 1/SMs share of peak bandwidth, and units run in waves. A single busy SM can actually draw somewhat more than its fair share, so the no-split penalty here is exaggerated, but the direction is right. The merge adds an illustrative 3 µs." });
+    const sms = [{ v: "h100", l: "H100 SXM · 132 SMs · 3.35 TB/s", n: 132, bw: 3.35e12 }, { v: "a100", l: "A100 · 108 SMs · 2.0 TB/s", n: 108, bw: 2.0e12 }, { v: "4090", l: "RTX 4090 · 128 SMs · 1.0 TB/s", n: 128, bw: 1.0e12 }];
+    let dev = sms[0], chunk = 0;
+    const BS = [1, 2, 4, 8, 16, 32, 64];
+    const bs = slider(w.controls, { label: "Batch (sequences)", min: 0, max: 6, step: 1, value: 0, fmt: i => String(BS[i]), onInput: draw });
+    const ts = slider(w.controls, { label: "Context length", min: 10, max: 17, step: 1, value: 15, fmt: v => fmtNum(2 ** v, 0) + " tokens", onInput: draw });
+    const cc = el("div", { class: "ctl" }, el("label", null, el("span", { text: "KV chunk per work unit" })));
+    seg(cc, { options: [{ value: 0, label: "no split" }, { value: 8192, label: "8192" }, { value: 2048, label: "2048" }, { value: 512, label: "512" }], value: 0, onChange: v => { chunk = v; draw(); } });
+    w.controls.appendChild(cc);
+    select(w.controls, { label: "GPU", options: sms.map(g => ({ value: g.v, label: g.l })), value: "h100", onChange: v => { dev = sms.find(g => g.v === v); draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 150" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "units", label: "Work units" }, { key: "waves", label: "Waves" }, { key: "util", label: "SM utilization" }, { key: "t", label: "Attention time / layer" }, { key: "ideal", label: "Bandwidth ideal" }]);
+    const HKV = 8, BPT = 4096;
+    function draw() {
+      const B = BS[bs.value], Tn = 2 ** ts.value;
+      const nSplit = chunk ? Math.ceil(Tn / chunk) : 1;
+      const units = B * HKV * nSplit;
+      const waves = Math.ceil(units / dev.n);
+      const util = units / (waves * dev.n);
+      const bytes = B * Tn * BPT;
+      const perUnit = bytes / units;
+      const t = waves * perUnit / (dev.bw / dev.n) * 1e6 + (nSplit > 1 ? 3 : 0);
+      const ideal = bytes / dev.bw * 1e6;
+      while (s.firstChild) s.removeChild(s.firstChild);
+      const cols = 33, cw = 21;
+      const busyFirst = Math.min(units, dev.n);
+      const lastWave = units - (waves - 1) * dev.n;
+      T(s, 10, 14, `SMs in the first wave${waves > 1 ? ` (last wave: ${lastWave} of ${dev.n} busy)` : ""}`, { "font-size": 11.5, class: "mono", fill: palette.muted });
+      for (let k = 0; k < dev.n; k++) {
+        const r = Math.floor(k / cols), c = k % cols;
+        s.appendChild(svg("rect", { x: 10 + c * cw, y: 24 + r * cw, width: cw - 3, height: cw - 3, rx: 3, fill: k < busyFirst ? (util > 0.8 ? palette.green : util > 0.4 ? palette.gold : palette.brick) : "#ecebe4", opacity: 0.85 }));
+      }
+      set("units", fmtNum(units, 0), null, `${B} seq × ${HKV} heads × ${nSplit} chunk${nSplit > 1 ? "s" : ""}`);
+      set("waves", String(waves), null, `${dev.n} SMs`);
+      set("util", fmtNum(100 * util, 0) + "%", util > 0.8 ? "good" : util > 0.4 ? "warn" : "bad", "busy SM-slots ÷ total");
+      set("t", fmtUs(t), t < 1.5 * ideal + 4 ? "good" : t < 4 * ideal ? "warn" : "bad", fmtNum(t / ideal, 1) + "× the ideal");
+      set("ideal", fmtUs(ideal), null, fmtB(bytes) + " of KV");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: compile pipeline */
+  (function () {
+    const s = document.getElementById("fig-compile");
+    defs(s, "arrC");
+    const st = [["Python code", "your forward()", "white"], ["TorchDynamo", "bytecode → FX graph|+ guards", "blue"], ["AOTAutograd", "fwd + bwd graphs|decompose to core ops", "blue"], ["TorchInductor", "fuse loops, schedule,|generate code", "blue"], ["Kernels", "Triton (GPU), C++ (CPU)|+ cuBLAS / cuDNN calls", "green"]];
+    st.forEach(([t, sub, k], i) => {
+      box(s, 20 + i * 168, 30, 150, 70, t, sub, k);
+      if (i) L(s, 20 + i * 168 - 18, 65, 20 + i * 168 - 2, 65, "arrC");
+    });
+    // graph break
+    L(s, 263, 100, 263, 140, "arrC", { stroke: palette.brick });
+    box(s, 150, 142, 240, 50, "graph break", "unsupported code runs in plain Python,|then a new graph starts", "brick");
+    // cuda graphs
+    L(s, 775, 100, 775, 140, "arrC", { stroke: palette.green });
+    box(s, 640, 142, 210, 50, "mode='reduce-overhead'", "replay the kernels as a CUDA graph", "green");
+    // guard loop
+    R(s, 420, 142, 200, 50, { fill: tint.gold, stroke: edge.gold, rx: 8 });
+    T(s, 520, 162, "every call: check guards", { "text-anchor": "middle", "font-size": 12, "font-weight": 600 });
+    T(s, 520, 178, "shape, dtype, device, values", { "text-anchor": "middle", "font-size": 10.5, fill: palette.muted });
+    T(s, 20, 222, "guard hit → reuse cached compiled code.   guard miss → recompile (often with symbolic shapes); past the recompile limit → run eagerly.", { "font-size": 11.5, fill: palette.ink });
+    T(s, 20, 242, "Inspect: TORCH_LOGS=\"graph_breaks,recompiles,output_code\"  ·  torch._dynamo.explain(fn)(x)", { "font-size": 11, class: "mono", fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- widget: CUDA graphs */
+  (function () {
+    const w = widget("w-graphs", { title: "Decode step time: eager vs CUDA graph", kicker: "Interactive", note: "Model from the formula card. GPU time per kernel grows with batch as w·(1 + (B − 1)/128), a stand-in for weight-bound kernels that slowly pick up per-sequence KV and activation work. Replay cost 10 µs. Illustrative: real kernel times vary a lot, and engines also shrink n by fusing." });
+    const BS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+    const nk = slider(w.controls, { label: "Kernels per step (n)", min: 50, max: 1500, step: 10, value: 600, onInput: draw });
+    const tl = slider(w.controls, { label: "CPU launch cost per kernel", min: 2, max: 20, step: 0.5, value: 6, fmt: v => v + " µs", onInput: draw });
+    const gw = slider(w.controls, { label: "GPU work per kernel at batch 1", min: 1, max: 30, step: 0.5, value: 6, fmt: v => v + " µs", onInput: draw });
+    const bs = slider(w.controls, { label: "Batch size", min: 0, max: 8, step: 1, value: 0, fmt: i => String(BS[i]), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 270, x: [1, 256], y: [0.05, 100], logx: true, logy: true, xticks: [1, 4, 16, 64, 256], yticks: [0.1, 1, 10, 100], xlabel: "batch size", ylabel: "step time (ms)", xfmt: v => String(v), yfmt: v => v < 1 ? v.toFixed(1) : String(v) });
+    const set = stats(w.body, [{ key: "e", label: "Eager step" }, { key: "g", label: "Graph step" }, { key: "sp", label: "Speedup" }, { key: "busy", label: "GPU busy (eager)" }, { key: "tps", label: "Tokens/s (graph)" }]);
+    const REPLAY = 10;
+    const model = B => {
+      const n = nk.value, gpu = n * gw.value * (1 + (B - 1) / 128), cpu = n * tl.value;
+      return { eager: Math.max(cpu, gpu), graph: REPLAY + gpu, gpu, cpu };
+    };
+    function draw() {
+      const B = BS[bs.value], m = model(B);
+      P.draw([
+        { fn: x => model(x).eager / 1000, color: palette.brick, label: "eager: max(n·t_launch, Σ t_i)" },
+        { fn: x => model(x).graph / 1000, color: palette.green, label: "CUDA graph: t_replay + Σ t_i" },
+        { fn: x => model(x).cpu / 1000, color: palette.muted, dash: "4 4", label: "CPU launch time alone" },
+        { vline: B, color: palette.muted },
+        { marker: [B, m.eager / 1000], color: palette.brick }, { marker: [B, m.graph / 1000], color: palette.green }
+      ]);
+      set("e", fmtUs(m.eager), m.cpu > m.gpu ? "bad" : null, m.cpu > m.gpu ? "CPU-bound" : "GPU-bound");
+      set("g", fmtUs(m.graph), "good", "launches removed");
+      set("sp", fmtNum(m.eager / m.graph, 2) + "×", m.eager / m.graph > 1.3 ? "good" : null, m.eager / m.graph > 1.3 ? "graphs pay off" : "little to gain here");
+      set("busy", fmtNum(100 * m.gpu / m.eager, 0) + "%", m.gpu / m.eager < 0.7 ? "bad" : "good", "Σ t_i ÷ step time");
+      set("tps", fmtNum(B / (m.graph / 1e6), 0), null, `batch ${B}`);
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: MBU */
+  (function () {
+    const w = widget("w-mbu", { title: "MBU calculator: is my decode fast?", kicker: "Calculator", note: "Batch 1, dense model. Weight bytes = params × bits ÷ 8. KV bytes read per token = bytes per cached token × context (Llama-3-8B in fp16: 128 KB; 70B: 320 KB; Qwen2.5-7B: 56 KB). Bandwidths are spec-sheet peaks; Apple figure is for the higher-end M4 Max. Interpretation bands are rules of thumb." });
+    const gpus = [
+      { v: "h100", l: "H100 SXM · 3.35 TB/s", bw: 3350 }, { v: "h200", l: "H200 · 4.8 TB/s", bw: 4800 }, { v: "a100", l: "A100 80GB SXM · 2.04 TB/s", bw: 2039 },
+      { v: "l40s", l: "L40S · 864 GB/s", bw: 864 }, { v: "4090", l: "RTX 4090 · 1008 GB/s", bw: 1008 }, { v: "mi300", l: "MI300X · 5.3 TB/s", bw: 5300 }, { v: "m4", l: "M4 Max · 546 GB/s", bw: 546 }
+    ];
+    let gpu = gpus[0], bits = 16;
+    const PS = [1, 3, 7, 8, 14, 32, 70];
+    const ps = slider(w.controls, { label: "Parameters", min: 0, max: 6, step: 1, value: 3, fmt: i => PS[i] + "B", onInput: draw });
+    const cb = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Bits per weight" })));
+    seg(cb, { options: [{ value: 16, label: "16" }, { value: 8, label: "8" }, { value: 4.5, label: "4.5" }], value: 16, onChange: v => { bits = v; draw(); } });
+    w.controls.appendChild(cb);
+    const kv = slider(w.controls, { label: "KV bytes per cached token", min: 16, max: 320, step: 8, value: 128, fmt: v => v + " KB", onInput: draw });
+    const ctx = slider(w.controls, { label: "Current context", min: 0, max: 32768, step: 512, value: 2048, fmt: v => fmtNum(v, 0) + " tokens", onInput: draw });
+    const tps = slider(w.controls, { label: "Measured decode speed", min: 1, max: 600, step: 1, value: 120, fmt: v => v + " tok/s", onInput: draw });
+    select(w.controls, { label: "Hardware", options: gpus.map(g => ({ value: g.v, label: g.l })), value: "h100", onChange: v => { gpu = gpus.find(g => g.v === v); draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const Bc = bars(wrap, { width: 760, height: 120, horizontal: true, labelWidth: 150 });
+    const set = stats(w.body, [{ key: "bpt", label: "Bytes per token" }, { key: "ach", label: "Achieved bandwidth" }, { key: "mbu", label: "MBU" }, { key: "ceil", label: "Ceiling at 100%" }]);
+    const verdict = el("p", { class: "small", style: { margin: "10px 0 0" } }); w.body.appendChild(verdict);
+    function draw() {
+      const N = PS[ps.value] * 1e9;
+      const wB = N * bits / 8, kvB = kv.value * 1024 * ctx.value;
+      const per = wB + kvB;
+      const ach = per * tps.value / 1e9;
+      const mbu = ach / gpu.bw;
+      Bc.draw(["achieved GB/s", "peak GB/s"], [ach, gpu.bw], { max: Math.max(ach, gpu.bw), colors: [mbu > 1 ? palette.brick : mbu > 0.6 ? palette.green : mbu > 0.3 ? palette.gold : palette.brick, palette.muted], fmt: v => fmtNum(v, 0) + " GB/s" });
+      set("bpt", fmtB(per), null, `weights ${fmtB(wB)} + KV ${fmtB(kvB)}`);
+      set("ach", fmtNum(ach, 0) + " GB/s", null, `${fmtB(per)} × ${tps.value}/s`);
+      set("mbu", fmtNum(100 * mbu, 0) + "%", mbu > 1 ? "bad" : mbu > 0.6 ? "good" : mbu > 0.3 ? "warn" : "bad", "of " + fmtNum(gpu.bw, 0) + " GB/s");
+      set("ceil", fmtNum(gpu.bw * 1e9 / per, 0) + " tok/s", null, "bandwidth ÷ bytes per token");
+      verdict.textContent = mbu > 1 ? "Over 100%: the model doesn't match what's running. Mixture-of-experts (use active parameters), speculative decoding, batch > 1, or the wrong bit width."
+        : mbu > 0.6 ? "Healthy for batch 1. Further gains come from moving fewer bytes (quantization, smaller KV) rather than from the engine."
+        : mbu > 0.3 ? "Room to improve: likely launch overhead, a host sync per token, or a slow attention kernel at this context. Profile one step."
+        : "The GPU is idle much of the time. Typical of eager, launch-bound code: try CUDA graphs or an inference engine, then re-measure.";
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: reading a trace */
+  (function () {
+    const s = document.getElementById("fig-trace");
+    const x0 = 80, x1 = 845;
+    const panel = (p, title) => {
+      const y = 8 + p * 112;
+      T(s, 10, y + 12, title, { "font-size": 12, "font-weight": 600 });
+      T(s, 20, y + 36, "CPU", { class: "mono", "font-size": 11 });
+      T(s, 20, y + 66, "GPU", { class: "mono", "font-size": 11 });
+      s.appendChild(svg("line", { x1: x0, x2: x1, y1: y + 78, y2: y + 78, stroke: palette.line }));
+      return y;
+    };
+    const cpu = (y, a, w, label, col) => { R(s, a, y + 22, w, 20, { fill: col || tint.blue, stroke: col ? "none" : edge.blue, rx: 3 }); if (label) T(s, a + w / 2, y + 36, label, { "text-anchor": "middle", "font-size": 10, class: "mono", fill: col ? "#fff" : palette.ink }); };
+    const gpu = (y, a, w) => R(s, a, y + 52, w, 20, { fill: palette.green, stroke: "none", rx: 3, opacity: 0.85 });
+    const gap = (y, a, w, label) => { R(s, a, y + 50, w, 24, { fill: "none", stroke: palette.brick, "stroke-dasharray": "3 3", rx: 3 }); if (label) T(s, a + w / 2, y + 92, label, { "text-anchor": "middle", "font-size": 10.5, fill: palette.brick }); };
+    // A: launch-bound
+    let y = panel(0, "Launch-bound (eager, batch-1 decode)");
+    for (let i = 0; i < 16; i++) {
+      const a = x0 + i * 47; if (a + 44 > x1) break;
+      cpu(y, a, 44, "launch");
+      if (a + 48 + 16 <= x1) gpu(y, a + 48, 16);
+    }
+    gap(y, x0 + 48 + 16 + 2, 47 - 20, "");
+    T(s, x0 + 230, y + 94, "GPU idle between every kernel: the CPU is the bottleneck", { "font-size": 10.5, fill: palette.brick });
+    // B: sync
+    y = panel(1, "Host sync (.item() in the middle of a step)");
+    const ends = [];
+    let g = 0;
+    for (let i = 0; i < 5; i++) {
+      const a = x0 + i * 40; cpu(y, a, 37, "op");
+      const st = Math.max(g, a + 40); gpu(y, st, 50); g = st + 52; ends.push(g);
+    }
+    const syncA = x0 + 200, syncB = g + 2;
+    cpu(y, syncA, syncB - syncA, "cudaStreamSynchronize", palette.brick);
+    cpu(y, syncB + 2, 40, "python");
+    let a2 = syncB + 44;
+    let g2 = 0;
+    for (let i = 0; i < 6; i++) {
+      const a = a2 + i * 40; if (a + 37 > x1) break;
+      cpu(y, a, 37, "op");
+      const st = Math.max(g2, a + 40); if (st + 50 <= x1) gpu(y, st, 50); g2 = st + 52;
+    }
+    gap(y, g, a2 + 40 - g, "idle: queue drained while the CPU waited, then relaunched");
+    // C: healthy
+    y = panel(2, "Healthy (CUDA graph, or large kernels)");
+    cpu(y, x0, 40, "replay");
+    cpu(y, x0 + 420, 90, "prep next step");
+    const widths = [30, 70, 22, 90, 26, 60, 18, 110, 24, 64, 30, 80, 40, 56];
+    let gx = x0 + 44;
+    widths.forEach(wd => { if (gx + wd <= x1) gpu(y, gx, wd - 2); gx += wd; });
+    T(s, x0 + 230, y + 94, "kernels back to back: GPU busy ≈ 100%; now optimize the kernels themselves", { "font-size": 10.5, fill: palette.green });
+  })();
+})();
+</script>
+</body>
+</html>

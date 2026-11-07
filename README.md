@@ -25,7 +25,7 @@ Everything runs offline. Open `site/index.html` in a browser; there's no server,
 | VIII · Inference engineering II | 19 Inside an inference engine · 20 Distributed inference · 21 The serving platform |
 | IX · Practice | 22 Labs & study plan |
 
-Modules 17–22 are being written. Until they're in, their sidebar links lead to missing pages.
+The inference-engineering track (17–21) goes from GPU architecture and kernels through engine internals, distributed inference and the serving platform around it.
 
 ## Layout
 
@@ -41,12 +41,14 @@ site/
     fonts/                Newsreader, Inter, JetBrains Mono (SIL OFL 1.1, licences in fonts/licenses/)
 AUTHORING.md              rules and helper API for writing a module
 scripts/check-module.mjs  structure lint: counts, local-only assets, KaTeX validity, quiz shape, script syntax
+scripts/check-links.mjs   every relative href and #fragment resolves
 ```
 
-To check a module after editing it:
+To check modules and links after editing:
 
 ```
-node scripts/check-module.mjs site/modules/09-quantization.html
+node scripts/check-module.mjs site/modules/*.html
+node scripts/check-links.mjs
 ```
 
 ## Accuracy

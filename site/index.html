@@ -16,8 +16,8 @@
   .continue{display:inline-flex;align-items:center;gap:10px;margin-top:6px;text-decoration:none;font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;background:var(--ink);color:var(--paper);padding:11px 16px;border-radius:10px}
   .continue:hover{background:var(--ink-soft);color:var(--paper)}
   .stack{max-width:1100px;margin:46px auto 0;display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--line);border-radius:14px;background:var(--card);overflow:hidden}
-  .stack div{padding:16px 18px;border-right:1px solid var(--line-soft)}
-  .stack div:last-child{border-right:0}
+  .stack > div{padding:16px 18px;border-right:1px solid var(--line-soft)}
+  .stack > div:last-child{border-right:0}
   .stack .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--green-deep);font-weight:600}
   .stack p{margin:4px 0 0;font-size:14px;color:var(--ink-soft)}
   @media (max-width:800px){.stack{grid-template-columns:1fr 1fr}}
@@ -32,7 +32,7 @@
   <div>
     <p class="eyebrow">An LLM systems course · runs offline</p>
     <h1 class="title">Inside the <span class="it">machine</span></h1>
-    <p class="lede">You already use models and agents. This course covers the layer underneath: the math one symbol at a time, then transformers, memory and bandwidth, quantization, fine-tuning, retrieval, agents, and evaluation. Each idea comes with a picture you can poke at.</p>
+    <p class="lede">You already use models and agents. This course covers the layer underneath: the math one symbol at a time, then transformers, quantization, fine-tuning, retrieval, agents, evaluation, image and audio models, and the inference stack from GPU kernels to serving fleets. Each idea comes with a picture you can poke at.</p>
     <a class="continue" id="continue" href="modules/00-start.html">Start with module 00 →</a>
   </div>
   <div class="hero-fig"><svg id="hero-svg" viewBox="0 0 460 360" role="img" aria-label="Diagram of a token flowing through a transformer"></svg></div>
@@ -45,7 +45,7 @@
   <div><div class="k">Labs</div><p>Each module ends with something to build, and an exit criterion you can measure.</p></div>
 </div>
 
-<div id="map"></div>
+<div id="map" style="max-width:1100px"></div>
 
 <p class="small muted" style="max-width:1100px;margin:60px auto 0">Progress and quiz answers are stored in this browser's localStorage. Nothing leaves your machine.</p>
 </main>
@@ -97,7 +97,7 @@
     s.appendChild(svg("text", { x: 306, y: y + 19, "text-anchor": "end", "font-size": 10.5, class: "mono", fill: palette.muted, text: "attn → mlp" }));
   });
   s.appendChild(svg("line", { x1: 175, y1: 258, x2: 175, y2: 234, stroke: palette.muted, "marker-end": "url(#harr)" }));
-  s.appendChild(svg("line", { x1: 175, y1: 80, x2: 175, y2: 62, stroke: palette.muted, "marker-end": "url(#harr)" }));
+  s.appendChild(svg("line", { x1: 137, y1: 80, x2: 137, y2: 60, stroke: palette.muted, "marker-end": "url(#harr)" }));
   const probs = [0.52, 0.21, 0.12, 0.08, 0.04];
   const words = [" the", " a", " my", " its", " top"];
   probs.forEach((p, i) => {

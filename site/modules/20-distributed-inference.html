@@ -1,0 +1,1420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Distributed inference — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+</head>
+<body data-module="20">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 20 · Inference engineering II</p>
+<h1 class="title">Distributed inference: one model, <span class="it">many</span> GPUs</h1>
+<p class="lede">Llama-3.1-70B in bf16 is 141 GB of weights, and an H100 holds 80 GB. DeepSeek-V3 has 671B parameters spread over 256 experts per layer. Serving models like these means cutting them into pieces, putting the pieces on different GPUs, and paying for every byte the pieces exchange. This module is about choosing the cuts so that bill stays small.</p>
+<div class="meta"><span class="tag">~3.5 hours</span><span class="tag n">prereqs: 07, 08, 09</span><span class="tag g">hands-on: vLLM, SGLang, nccl-tests, torch.distributed</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Say whether a deployment is short on memory, throughput, or latency, and name the parallelism axis that fixes each.</li>
+    <li>Estimate the time of an all-reduce from message size, GPU count, and link bandwidth, and read <code>busbw</code> from nccl-tests.</li>
+    <li>Explain why tensor parallelism costs two all-reduces per layer, and predict when it stops paying off over PCIe or across nodes.</li>
+    <li>Reason about MoE serving: all-to-all traffic, hot experts, capacity factors, and why the slowest GPU sets the pace.</li>
+    <li>Size disaggregated prefill/decode and KV offloading by comparing transfer time against recompute time.</li>
+    <li>Pick a TP × PP × DP (× EP) layout for a given model and cluster, then measure it.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="why" data-short="When one GPU isn't enough">When one GPU isn't enough</h2>
+
+<p>Three different problems push a deployment past one GPU, and each has its own fix. Picking the wrong one is the most common way to end up with an expensive layout that doesn't help.</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">Memory</div><h4>It doesn't fit</h4><p>Weights plus KV cache exceed one GPU's memory. Llama-3.1-70B at bf16 needs 141 GB before a single token of context. Nothing short of splitting the model (or quantizing it, <a href="09-quantization.html#why">Module 09</a>) will help.</p></div>
+  <div class="card blue"><div class="k">Throughput</div><h4>It fits, but too few users</h4><p>An 8B model fits on one H100 with room to spare, yet one GPU only has so much KV memory and so many FLOPs. If the queue grows, you want more copies of the model, not a model split across more GPUs.</p></div>
+  <div class="card"><div class="k">Latency</div><h4>Each token is too slow</h4><p>At low batch, decode time is weight bytes divided by memory bandwidth (<a href="08-inference.html#roofline">Module 08</a>). Split the weights over 4 GPUs and each reads a quarter, so a step can finish up to 4× sooner, minus the cost of talking.</p></div>
+</div>
+
+<p>The first question is always the memory one, because it's binary. Count the bytes:</p>
+
+<div class="formula" data-name="Minimum GPUs to hold one model instance">
+  <div class="tex">$$\htmlClass{t1}{G_{\min}} = \left\lceil \frac{\htmlClass{t2}{M_W} + \htmlClass{t3}{M_{KV}} + \htmlClass{t4}{M_{\text{act}}}}{\htmlClass{t5}{u} \cdot \htmlClass{t6}{M_{\text{GPU}}}} \right\rceil$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(G_{\min}\)</dt><dd>fewest GPUs a single copy of the model can live on (round up to a degree your engine supports, usually a power of 2)</dd></div>
+    <div data-t="t2"><dt>\(M_W\)</dt><dd>weight bytes: parameters × bits / 8</dd></div>
+    <div data-t="t3"><dt>\(M_{KV}\)</dt><dd>KV cache you want resident: tokens in flight × KV bytes per token (<a href="08-inference.html#kvcache">Module 08</a>)</dd></div>
+    <div data-t="t4"><dt>\(M_{\text{act}}\)</dt><dd>activations, workspace, CUDA graphs, communication buffers: a few GB per GPU</dd></div>
+    <div data-t="t5"><dt>\(u\)</dt><dd>usable fraction of memory, typically 0.85–0.92 (vLLM's <code>--gpu-memory-utilization</code> defaults to 0.9)</dd></div>
+    <div data-t="t6"><dt>\(M_{\text{GPU}}\)</dt><dd>memory per GPU (H100: 80 GB, H200: 141 GB)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Add up everything that must sit in GPU memory at once and divide by what one GPU can actually give you.</p>
+  <p class="why"><b>Why it matters</b>Llama-3.1-70B, bf16, 32 concurrent users at 8K tokens: 141 GB of weights + 32 × 8,192 × 320 KB ≈ 86 GB of KV + ~10 GB overhead ≈ 237 GB. Divided by 72 GB usable per H100, that's 3.3, so 4 GPUs. Halve the users and you still need 2.7, which becomes 4 because TP degrees come in powers of two. Quantize the weights to fp8 <em>and</em> halve the users (70.6 + 43 + 10 ≈ 124 GB) and it fits on 2.</p>
+</div>
+
+<figure class="fig wide"><svg viewBox="0 0 880 330" id="fig-decide"></svg>
+<figcaption>A first-pass decision. Memory is a hard constraint and comes first. Throughput and latency are separate dials: replicas add throughput without touching per-token latency, while tensor parallelism cuts latency and costs communication. Real deployments usually turn all three.</figcaption></figure>
+
+<details class="think"><summary>Think first: an 8B model runs fine on one GPU, but you need to serve twice as many users. TP=2, or two replicas?</summary>
+<div>Two replicas. Each replica keeps its own full KV memory, so capacity doubles, and replicas never talk to each other. TP=2 also doubles memory, but every layer now pays two all-reduces, and the per-GPU KV room only grows by the half of the weights each GPU no longer stores (8 GB, about 14% more). Reach for TP=2 only if the per-token latency target isn't met on one GPU.</div>
+</details>
+
+<!-- ================================================================== -->
+<h2 id="collectives" data-short="Collective communication">Collective communication primitives</h2>
+
+<p>Every multi-GPU scheme in this module is built from a handful of communication patterns. They come from the MPI world and have the same names everywhere.</p>
+
+<div class="def"><b>Definition · Rank, world, collective</b>
+<p>Each participating process (one per GPU, usually) is a <strong>rank</strong>, numbered 0 to \(p-1\). The set of ranks that communicate is a <strong>group</strong> or <strong>communicator</strong>, with <strong>world size</strong> \(p\). A <strong>collective</strong> is an operation every rank in the group calls together, such as "sum this tensor across all of us". Nobody returns until their part is done, so one slow rank holds up the whole group.</p>
+</div>
+
+<p>On NVIDIA GPUs the collectives come from <strong>NCCL</strong> (NVIDIA Collective Communications Library, pronounced "nickel"). AMD's equivalent is RCCL. PyTorch's <code>torch.distributed</code> with the <code>"nccl"</code> backend calls it, and vLLM, SGLang and TensorRT-LLM all use it, sometimes swapping in custom kernels for small messages (more in <a href="#commtricks">§ communication tricks</a>). NCCL figures out the topology (NVLink, PCIe, network cards) and picks an algorithm and transport for each call.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 380" id="fig-coll"></svg>
+<figcaption>The five collectives on 4 GPUs. Each column is one GPU's buffer, split into 4 chunks, shown before (left) and after (right). Colours mark which GPU the data came from, and Σ marks a chunk that has been summed across all four. All-reduce is the same as a reduce-scatter followed by an all-gather, and that's exactly how the ring algorithm implements it.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Primitive</th><th>Result</th><th class="num">Bytes sent per GPU (ring, ideal)</th><th>Where inference uses it</th></tr></thead>
+  <tbody>
+    <tr><td>broadcast</td><td>one rank's buffer copied to all</td><td class="num">≈ \(S\)</td><td>Scheduler metadata and input token ids from the driver rank to TP workers</td></tr>
+    <tr><td>all-reduce</td><td>every rank gets the element-wise sum</td><td class="num">\(2\frac{p-1}{p}S\)</td><td>Tensor parallelism: after each row-parallel matmul</td></tr>
+    <tr><td>reduce-scatter</td><td>rank \(i\) gets the sum of chunk \(i\) only</td><td class="num">\(\frac{p-1}{p}S\)</td><td>TP with sequence parallelism; first half of ring all-reduce</td></tr>
+    <tr><td>all-gather</td><td>every rank gets every rank's chunk</td><td class="num">\(\frac{p-1}{p}S\)</td><td>Collecting vocab-sharded logits; second half of ring all-reduce</td></tr>
+    <tr><td>all-to-all</td><td>rank \(i\)'s chunk \(j\) goes to rank \(j\)</td><td class="num">\(\frac{p-1}{p}S\)</td><td>MoE token dispatch and combine; Ulysses-style sequence parallelism</td></tr>
+    <tr><td>send / recv</td><td>point-to-point copy</td><td class="num">\(S\)</td><td>Pipeline stage boundaries; KV cache transfer between instances</td></tr>
+  </tbody>
+</table>
+
+<h3>Ring all-reduce</h3>
+<p>The obvious way to sum a tensor across \(p\) GPUs is for everyone to send their copy to rank 0, which adds them and sends the result back. Rank 0's link then carries \(2(p-1)S\) bytes while every other link sits idle. The <strong>ring</strong> algorithm spreads the load evenly. Arrange the GPUs in a circle and split the tensor into \(p\) chunks.</p>
+<ol>
+  <li><strong>Reduce-scatter phase</strong> (\(p-1\) steps). Each GPU sends one chunk to its right neighbour and adds the chunk arriving from its left neighbour into its own copy. Each step shifts which chunk is in flight. After \(p-1\) steps, each GPU holds one chunk that contains the sum from all \(p\) GPUs.</li>
+  <li><strong>All-gather phase</strong> (\(p-1\) steps). The finished chunks travel around the ring once more, overwriting instead of adding, until every GPU has all of them.</li>
+</ol>
+
+<figure class="fig wide"><svg viewBox="0 0 880 300" id="fig-ring"></svg>
+<figcaption>Ring all-reduce on 4 GPUs. Left: each GPU sends only to its right neighbour, so every link is busy every step. Right: the chunk each GPU sends at each step. During reduce-scatter (gold), a received chunk is added in. During all-gather (green), it's copied. In 2(p − 1) = 6 steps, each moving S/4 bytes per GPU, everyone ends with the full sum.</figcaption></figure>
+
+<div class="formula" data-name="Ring all-reduce time">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{AR}}} \approx 2\,\frac{\htmlClass{t2}{p}-1}{\htmlClass{t2}{p}} \cdot \frac{\htmlClass{t3}{S}}{\htmlClass{t4}{BW}} \;+\; 2(\htmlClass{t2}{p}-1)\,\htmlClass{t5}{\alpha}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{AR}}\)</dt><dd>wall-clock time of one all-reduce</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>number of GPUs in the group</dd></div>
+    <div data-t="t3"><dt>\(S\)</dt><dd>size of the tensor being reduced, in bytes (same on every GPU)</dd></div>
+    <div data-t="t4"><dt>\(BW\)</dt><dd>per-direction bandwidth of the <em>slowest</em> link in the ring</dd></div>
+    <div data-t="t5"><dt>\(\alpha\)</dt><dd>fixed latency per step: kernel launch, synchronization, wire latency. Microseconds</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each GPU ships almost two full copies of the tensor, at the speed of the worst link, plus a small fixed cost for each of the \(2(p-1)\) steps.</p>
+  <p class="why"><b>Why it matters</b>The bandwidth term barely depends on \(p\): going from 2 to 8 GPUs raises it from \(1.0\,S/BW\) to \(1.75\,S/BW\). The latency term grows linearly with \(p\). Large messages are bandwidth-bound and scale well; tiny messages, like one decode token's activations, are latency-bound and get <em>worse</em> as you add GPUs.</p>
+</div>
+
+<p>Benchmarks report two bandwidth numbers, and the difference trips people up.</p>
+
+<div class="formula" data-name="Algorithm bandwidth vs bus bandwidth">
+  <div class="tex">$$\htmlClass{t1}{\text{algbw}} = \frac{\htmlClass{t2}{S}}{\htmlClass{t3}{t}}, \qquad \htmlClass{t4}{\text{busbw}} = \htmlClass{t1}{\text{algbw}} \cdot \frac{2(\htmlClass{t5}{p}-1)}{\htmlClass{t5}{p}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>algbw</dt><dd>"algorithm bandwidth": tensor size divided by elapsed time. What your application experiences</dd></div>
+    <div data-t="t2"><dt>\(S\)</dt><dd>bytes in the tensor</dd></div>
+    <div data-t="t3"><dt>\(t\)</dt><dd>measured all-reduce time</dd></div>
+    <div data-t="t4"><dt>busbw</dt><dd>"bus bandwidth": algbw corrected for how many bytes the ring actually moves per GPU. Comparable to the link's rated speed</dd></div>
+    <div data-t="t5"><dt>\(p\)</dt><dd>number of ranks</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>For an all-reduce, each GPU really pushes \(2(p-1)/p\) times the tensor size, so busbw scales algbw up by that factor. For all-gather and reduce-scatter the factor is \((p-1)/p\).</p>
+  <p class="why"><b>Why it matters</b>busbw is independent of \(p\) for an ideal ring, so you can compare it straight against hardware specs. If 8 H100s on NVLink show a busbw near the per-direction NVLink figure at 1 GB messages, the fabric is healthy. If it's a fraction of that, something's wrong (a GPU on the wrong PCIe switch, NVLink down, peer-to-peer disabled).</p>
+</div>
+
+<div id="w-ring"></div>
+
+<div class="flag"><b>The ring is a model, not a promise</b>
+<p>NCCL chooses among ring, tree, and (on NVSwitch systems) NVLink SHARP algorithms, where the switch itself does the summing, plus several wire protocols tuned for small or large messages. For small messages it will beat the ring formula; for multi-node jobs, tree or hierarchical schemes change the latency term to roughly \(\log p\). Use the formula for intuition and nccl-tests (<a href="#handson">hands-on</a>) for numbers.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="tp" data-short="Tensor parallelism">Tensor parallelism for inference</h2>
+
+<p>Tensor parallelism (TP) splits each weight matrix across GPUs so every GPU does a slice of every layer. The scheme everyone uses comes from Megatron-LM (Shoeybi et al., 2019), which <a href="07-training.html#mp">Module 07</a> covered for training. Inference uses the same split with no backward pass, so the rules are simpler and the costs show up differently.</p>
+
+<p>Two kinds of split, and the trick is to alternate them:</p>
+<ul>
+  <li>A <strong>column-parallel</strong> linear layer \(Y = XA\) splits \(A\) by columns: \(A = [A_1 \; A_2]\). GPU \(i\) computes \(XA_i\), a slice of the <em>output features</em>. Nothing needs to be exchanged, as long as every GPU has the full input \(X\).</li>
+  <li>A <strong>row-parallel</strong> linear layer \(Z = YB\) splits \(B\) by rows. If GPU \(i\) already holds the matching slice of input features \(Y_i\), it computes \(Y_iB_i\), a full-size <em>partial sum</em>. The true output is \(\sum_i Y_iB_i\), which takes one all-reduce.</li>
+</ul>
+<p>Column-parallel followed by row-parallel needs exactly one all-reduce, at the end. A transformer layer has two such pairs:</p>
+<ol>
+  <li><strong>Attention.</strong> The Q, K and V projections are column-parallel <em>by heads</em>: with 64 query heads and TP=4, each GPU gets 16 query heads and the matching share of KV heads. Each GPU runs attention for its own heads against its own slice of the KV cache, so the cache is sharded for free. The output projection \(W_O\) is row-parallel, followed by all-reduce #1.</li>
+  <li><strong>MLP.</strong> The gate and up projections are column-parallel (each GPU gets \(d_{ff}/t\) hidden units, and SiLU acts element-wise on its slice). The down projection is row-parallel, followed by all-reduce #2.</li>
+</ol>
+
+<figure class="fig wide"><svg viewBox="0 0 880 300" id="fig-tp"></svg>
+<figcaption>One transformer layer with TP = 2. Both GPUs start with the same input. Column-parallel layers (blue) need no communication because each GPU produces a distinct slice of features. Row-parallel layers (gold) produce full-size partial sums, and an all-reduce (brick) adds them. Two all-reduces per layer, every layer, every forward pass. The norms and residual adds run redundantly on every GPU.</figcaption></figure>
+
+<div class="formula" data-name="TP communication per layer (forward pass)">
+  <div class="tex">$$\htmlClass{t1}{V_{\text{layer}}} = \htmlClass{t2}{2} \cdot \htmlClass{t3}{b} \cdot \htmlClass{t4}{d} \cdot \htmlClass{t5}{T}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(V_{\text{layer}}\)</dt><dd>total size of the tensors all-reduced in one layer (before the ring's \(2(t-1)/t\) factor)</dd></div>
+    <div data-t="t2"><dt>2</dt><dd>two all-reduces per layer: after attention's output projection and after the MLP's down projection</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bytes per activation element (bf16: 2)</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>hidden size (model dimension)</dd></div>
+    <div data-t="t5"><dt>\(T\)</dt><dd>tokens in this forward step: prompt tokens in prefill, one per running sequence in decode</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each all-reduce carries one hidden vector per token, and there are two per layer.</p>
+  <p class="why"><b>Why it matters</b>Llama-3.1-70B (\(d = 8192\), 80 layers) decoding one token: 2 × 2 × 8192 = 32 KB per layer, 2.6 MB per step. That's tiny in bytes but it's 160 separate synchronizations, so decode TP is latency-bound. Prefilling 4,096 tokens: 134 MB per layer, 10.7 GB per forward pass. That's bandwidth-bound.</p>
+</div>
+
+<p>In the bandwidth-bound regime, a simplification falls out. A dense layer does about \(24\,T d^2\) FLOPs (four \(d\times d\) attention projections and an MLP with \(d_{ff} = 4d\), two FLOPs per multiply-add), split \(t\) ways. Communication is \(2\cdot 2\frac{t-1}{t}\cdot T d b\) bytes per GPU. Divide one by the other and \(T\) cancels:</p>
+
+<div class="formula" data-name="TP communication-to-compute ratio (large batches)">
+  <div class="tex">$$\frac{\htmlClass{t1}{t_{\text{comm}}}}{\htmlClass{t2}{t_{\text{compute}}}} \approx \frac{(\htmlClass{t3}{t}-1)\,\htmlClass{t4}{b}\,\htmlClass{t5}{F}}{6\,\htmlClass{t6}{d}\,\htmlClass{t7}{BW}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{comm}}\)</dt><dd>time spent in TP all-reduces per layer (no overlap)</dd></div>
+    <div data-t="t2"><dt>\(t_{\text{compute}}\)</dt><dd>time spent in that layer's matmuls</dd></div>
+    <div data-t="t3"><dt>\(t\)</dt><dd>TP degree</dd></div>
+    <div data-t="t4"><dt>\(b\)</dt><dd>bytes per activation (2 for bf16)</dd></div>
+    <div data-t="t5"><dt>\(F\)</dt><dd>achieved FLOP/s per GPU (H100 bf16: ~989 TFLOP/s peak dense, ~600 sustained is a fair working number)</dd></div>
+    <div data-t="t6"><dt>\(d\)</dt><dd>hidden size</dd></div>
+    <div data-t="t7"><dt>\(BW\)</dt><dd>per-direction link bandwidth between TP ranks</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Faster GPUs and more TP ranks make communication relatively worse; wider models and faster links make it better. The number of tokens doesn't matter once messages are large.</p>
+  <p class="why"><b>Why it matters</b>70B model (\(d = 8192\)), \(t = 8\), \(F = 600\) TFLOP/s: over NVLink at ~450 GB/s the ratio is about 0.38. Over PCIe Gen5 at ~64 GB/s it's 2.7, so the GPUs spend most of their time waiting. Across nodes at 50 GB/s with \(t = 16\), it's 7.3. That's why TP lives inside an NVLink domain.</p>
+</div>
+
+<p>In decode, the weight reads dominate compute and the all-reduces are small, so the step time looks like this:</p>
+
+<div class="formula" data-name="Decode step time under TP">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{token}}} \approx \frac{\htmlClass{t2}{M_W}}{\htmlClass{t3}{t}\cdot \htmlClass{t4}{B_{\text{HBM}}}} + 2\htmlClass{t5}{L}\cdot \htmlClass{t6}{t_{\text{AR}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{token}}\)</dt><dd>time per decode step (TPOT at low batch)</dd></div>
+    <div data-t="t2"><dt>\(M_W\)</dt><dd>total weight bytes</dd></div>
+    <div data-t="t3"><dt>\(t\)</dt><dd>TP degree: each GPU reads \(1/t\) of the weights</dd></div>
+    <div data-t="t4"><dt>\(B_{\text{HBM}}\)</dt><dd>achieved HBM bandwidth per GPU (H100: 3.35 TB/s peak, ~80% achievable)</dd></div>
+    <div data-t="t5"><dt>\(L\)</dt><dd>number of layers</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{AR}}\)</dt><dd>one small-message all-reduce, dominated by latency: on the order of 10 µs on NVLink, often more</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The first term shrinks as you add GPUs; the second doesn't, and its per-call latency creeps up with \(t\).</p>
+  <p class="why"><b>Why it matters</b>70B bf16 at TP=8: 141 GB / (8 × 2.7 TB/s) ≈ 6.5 ms of weight reads, plus 160 all-reduces at ~15 µs ≈ 2.4 ms. Communication is over a quarter of the step. Going from TP=4 to TP=8 saves 6.5 ms of reads but adds latency to every all-reduce, so the speedup is well under 2×. Illustrative numbers; measure your own.</p>
+</div>
+
+<div id="w-tp"></div>
+
+<div class="pitfall"><b>Pitfall · heads have to divide</b>
+<p>TP splits attention by heads, so the number of query heads must be divisible by \(t\). Qwen2.5-32B has 40 query heads: TP=8 works (5 each), TP=16 doesn't. KV heads are the subtler limit. Llama-3.1-70B has 8 KV heads; at TP=16 each KV head must be stored on two GPUs, so the KV cache stops shrinking per GPU and you've paid for 16 GPUs to get the KV capacity of 8. With GQA (<a href="08-inference.html#gqa">Module 08</a>), TP beyond the KV-head count is usually a mistake.</p>
+</div>
+
+<div class="mle"><b>MLE angle · check the topology before choosing TP</b>
+<p>Run <code>nvidia-smi topo -m</code>. <code>NV#</code> between two GPUs means NVLink; <code>PIX</code>, <code>PXB</code>, <code>PHB</code> or <code>SYS</code> mean the traffic goes through PCIe switches, the CPU's root complex, or across CPU sockets. A "4-GPU box" of PCIe cards may have half its pairs crossing sockets. TP=2 on a pair that shares a PCIe switch can be fine; TP=4 across sockets on PCIe often runs slower than two TP=2 replicas.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="commtricks" data-short="Cheaper communication">Making TP communication cheaper</h2>
+
+<p>Since TP's all-reduces sit on the critical path of every decode step, engines have built a stack of cheaper ways to do them. You don't need to implement these, but you should recognize them in a profile and in engine flags.</p>
+
+<table class="t">
+  <thead><tr><th>Technique</th><th>What it does</th><th>Where it shows up</th></tr></thead>
+  <tbody>
+    <tr><td>One-shot / two-shot all-reduce</td><td>For small messages, each GPU reads its peers' buffers directly over NVLink and sums locally (one-shot), or does a single reduce-scatter + all-gather round (two-shot). Two or three synchronizations instead of \(2(p-1)\).</td><td>vLLM's "custom all-reduce", TensorRT-LLM and FlashInfer kernels. Usually on by default for NVLink-connected GPUs.</td></tr>
+    <tr><td>NVLink SHARP (NVLS)</td><td>The NVSwitch performs the reduction in the switch, so each GPU sends its data once and receives the result once.</td><td>H100/B200 NVSwitch systems; NCCL picks it automatically when available.</td></tr>
+    <tr><td>Fused all-reduce + residual + RMSNorm</td><td>The next layer's norm needs the all-reduced result anyway, so one kernel does the sum, the residual add and the normalization, saving launches and memory round trips.</td><td>TensorRT-LLM, recent vLLM and SGLang kernels.</td></tr>
+    <tr><td>Sequence parallelism</td><td>Replaces each all-reduce with a reduce-scatter and an all-gather, and runs the norms on \(1/t\) of the tokens in between. Same bytes, less redundant work.</td><td>Mostly prefill and training (Korthikanti et al., 2022).</td></tr>
+    <tr><td>Compute/communication overlap</td><td>Split a matmul into chunks so the all-reduce of chunk \(i\) runs while chunk \(i+1\) computes.</td><td>Prefill-heavy paths; "async TP" in some frameworks.</td></tr>
+    <tr><td>Low-precision communication</td><td>Send activations in fp8 instead of bf16, halving bytes. Can cost accuracy, so it needs evaluation.</td><td>Experimental or opt-in in most engines.</td></tr>
+    <tr><td>CUDA graphs</td><td>Capture the whole decode step, collectives included, and replay it, removing per-kernel CPU launch overhead.</td><td>Default decode path in vLLM and SGLang.</td></tr>
+  </tbody>
+</table>
+
+<div class="intuition"><b>Intuition</b>
+<p>In decode, an all-reduce is like a meeting where everyone shares one sentence. The sentence takes no time to say; scheduling the meeting is the cost. The techniques above either hold fewer meetings, make them shorter, or fold them into work you were doing anyway.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="pp" data-short="Pipeline parallelism">Pipeline parallelism for inference</h2>
+
+<p>Pipeline parallelism (PP) splits the model by depth. With PP=4 and 80 layers, GPU 0 holds layers 1–20, GPU 1 holds 21–40, and so on. Each stage hands its output activations (\(T\cdot d\cdot b\) bytes) to the next stage with a point-to-point send. That's one small transfer per stage boundary per step, instead of TP's two all-reduces per layer, so PP tolerates slow links, including the network between nodes.</p>
+
+<p>The catch is that PP doesn't make a single sequence any faster. A decode step still has to pass through all 80 layers, one stage after another, and while stage 2 is working, stages 0, 1 and 3 have nothing to do for that sequence. To keep every stage busy you need several independent groups of sequences (<strong>micro-batches</strong>) in flight, staggered so that each stage works on a different one. Inference has no backward pass, so there is no gradient bubble as in training (<a href="07-training.html#mp">Module 07</a>), but there is a dependency: token \(n+1\) of a sequence can't enter stage 0 until token \(n\) has left the last stage.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 310" id="fig-pp"></svg>
+<figcaption>Decode with 4 pipeline stages. Top: one micro-batch in flight. Each token passes through the stages in order, and each stage is idle three quarters of the time (brick). Bottom: four micro-batches (A–D) staggered one slot apart fill the pipeline. Each sequence still gets a token every 4 slots, so per-token latency is unchanged, but four times as many sequences make progress.</figcaption></figure>
+
+<div class="formula" data-name="Pipeline decode: latency and utilization">
+  <div class="tex">$$\htmlClass{t1}{\text{TPOT}} \approx \max(\htmlClass{t2}{m},\htmlClass{t3}{p})\cdot\frac{\htmlClass{t4}{t_1}}{\htmlClass{t3}{p}} + (\htmlClass{t3}{p}-1)\,\htmlClass{t5}{t_{\text{hop}}}, \qquad \htmlClass{t6}{\text{util}} = \frac{\min(\htmlClass{t2}{m},\htmlClass{t3}{p})}{\htmlClass{t3}{p}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>TPOT</dt><dd>time per output token for one sequence</dd></div>
+    <div data-t="t2"><dt>\(m\)</dt><dd>micro-batches in flight (independent groups of sequences)</dd></div>
+    <div data-t="t3"><dt>\(p\)</dt><dd>pipeline stages</dd></div>
+    <div data-t="t4"><dt>\(t_1\)</dt><dd>time for the whole model to process one micro-batch step, as if on one GPU</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{hop}}\)</dt><dd>time to send activations between adjacent stages</dd></div>
+    <div data-t="t6"><dt>util</dt><dd>fraction of time each stage is busy</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>With up to \(p\) micro-batches, a token still takes one full trip through the model, and utilization rises with every micro-batch you add. Beyond \(p\), utilization is maxed and the extra micro-batches just wait in line, so latency goes up.</p>
+  <p class="why"><b>Why it matters</b>70B bf16 on 4 GPUs. With PP=4, \(t_1 \approx\) 141 GB / 2.7 TB/s ≈ 52 ms, so TPOT is about 52 ms whatever you do, and you need 4 micro-batches to use the GPUs fully. With TP=4 the same model decodes in roughly 13–16 ms per token. PP buys capacity and throughput; TP buys latency.</p>
+</div>
+
+<p>PP earns its place in three situations. The most common is crossing nodes: a model that needs two 8-GPU servers is usually laid out as TP=8 inside each server and PP=2 across them, so only one activation transfer per step goes over the network. It also suits high-throughput batch jobs, where there are always enough sequences to fill the pipeline and nobody is watching per-token latency. And on PCIe-only machines, where TP's all-reduces are too expensive, PP's point-to-point traffic is cheap enough to ignore.</p>
+<p>Where it hurts: interactive traffic at low load (bubbles), and uneven stages. The embedding layer, the LM head and the sampler sit on the first and last stages, so equal layer counts don't mean equal work. Engines let you shift layers between stages for that reason.</p>
+
+<!-- ================================================================== -->
+<h2 id="dp" data-short="Data-parallel replicas">Data-parallel replicas, and when they win</h2>
+
+<p>Data parallelism (DP) for inference just means running several independent copies of the model, each on its own GPU or GPU group, with a load balancer in front. Replicas exchange nothing during a forward pass. If the model fits, this is the simplest and most efficient way to add throughput: no all-reduce, no pipeline bubbles, and a GPU failure takes out one replica instead of the whole service.</p>
+
+<p>When should you stop adding TP and start adding replicas? KV room decides it:</p>
+
+<div class="formula" data-name="KV room in one instance">
+  <div class="tex">$$\htmlClass{t1}{M_{KV}^{\text{room}}}(\htmlClass{t2}{t}) = \htmlClass{t2}{t}\cdot \htmlClass{t3}{u}\,\htmlClass{t4}{M_{\text{GPU}}} - \htmlClass{t5}{M_W} - \htmlClass{t2}{t}\cdot\htmlClass{t6}{M_{\text{act}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{KV}^{\text{room}}\)</dt><dd>memory left for KV cache in one model instance</dd></div>
+    <div data-t="t2"><dt>\(t\)</dt><dd>GPUs in the instance (TP × PP)</dd></div>
+    <div data-t="t3"><dt>\(u\)</dt><dd>usable memory fraction</dd></div>
+    <div data-t="t4"><dt>\(M_{\text{GPU}}\)</dt><dd>memory per GPU</dd></div>
+    <div data-t="t5"><dt>\(M_W\)</dt><dd>weight bytes, paid once per instance regardless of \(t\)</dd></div>
+    <div data-t="t6"><dt>\(M_{\text{act}}\)</dt><dd>per-GPU overhead (activations, buffers)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The weights are a fixed tax per instance. Spreading one instance over more GPUs dilutes that tax, so KV room grows faster than the GPU count while weights are a big share of memory, and roughly in proportion once they aren't.</p>
+  <p class="why"><b>Why it matters</b>It tells you whether bigger instances or more instances give more concurrent users per GPU. See the table below.</p>
+</div>
+
+<table class="t">
+  <thead><tr><th>Model on H100 80 GB (72 GB usable, overhead ignored)</th><th class="num">TP</th><th class="num">KV room per instance</th><th class="num">KV room per GPU</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Llama-3.1-70B, fp8 weights (70.6 GB)</td><td class="num">1</td><td class="num">1.4 GB</td><td class="num">1.4 GB</td><td>Fits, but room for ~4K tokens. Useless.</td></tr>
+    <tr><td></td><td class="num">2</td><td class="num">73 GB</td><td class="num">37 GB</td><td>Workable</td></tr>
+    <tr><td></td><td class="num">4</td><td class="num">217 GB</td><td class="num">54 GB</td><td>~1.5× the per-GPU KV of TP=2</td></tr>
+    <tr><td></td><td class="num">8</td><td class="num">505 GB</td><td class="num">63 GB</td><td>Diminishing; TP=4 × 2 replicas is often better</td></tr>
+    <tr><td>Llama-3.1-8B, bf16 (16 GB)</td><td class="num">1</td><td class="num">56 GB</td><td class="num">56 GB</td><td>Replicate this</td></tr>
+    <tr><td></td><td class="num">2</td><td class="num">128 GB</td><td class="num">64 GB</td><td>+14% KV per GPU, but pays all-reduces</td></tr>
+  </tbody>
+</table>
+
+<p>So the rule is: use the <em>smallest</em> instance that fits the model with healthy KV room and meets your latency target, then replicate. A model that fits on one GPU with plenty of KV memory should almost always be served as TP=1 replicas. Raising TP from there buys lower per-token latency at the cost of all-reduce overhead and slightly lower throughput per GPU.</p>
+
+<div class="flag"><b>Replicas aren't free either</b>
+<p>Each replica keeps its own prefix cache (<a href="08-inference.html#prefix">Module 08</a>). Spread a shared system prompt or a multi-turn conversation across 8 replicas with a round-robin balancer and you may compute the same prefix 8 times. Cache-aware routing, which sends requests with the same prefix to the same replica, becomes important as replica count grows (Module 21 covers the routing layer).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="moe" data-short="MoE & expert parallelism">Mixture-of-experts serving and expert parallelism</h2>
+
+<p>A mixture-of-experts (MoE) layer replaces the single MLP with \(E\) smaller MLPs ("experts") and a <strong>router</strong>: a small linear layer that scores each token against every expert and sends the token to its top-\(k\). The token's output is the router-weighted sum of those \(k\) experts' outputs. Many MoE models also have one or more <strong>shared experts</strong> that every token uses. DeepSeek-V3 has 256 routed experts and 1 shared expert per MoE layer, with \(k = 8\): 671B parameters in total, about 37B used per token.</p>
+
+<p>That split between total and active parameters is the whole appeal and the whole problem. Compute per token looks like a 37B model, but memory looks like a 671B model. You need many GPUs just to hold the weights, and then each GPU only has a small fraction of the experts.</p>
+
+<p><strong>Expert parallelism</strong> (EP) puts different experts on different GPUs. With \(E = 64\) and EP=8, each GPU owns 8 experts. Attention runs wherever the token's sequence lives, then each MoE layer needs two all-to-all exchanges:</p>
+<ol>
+  <li><strong>Dispatch</strong>: every GPU sends each token's hidden vector to the GPUs that own its chosen experts.</li>
+  <li>Each GPU runs its experts on whatever tokens arrived, as a grouped GEMM over variable-sized groups.</li>
+  <li><strong>Combine</strong>: results go back to the tokens' home GPUs, where they're weighted and summed.</li>
+</ol>
+
+<figure class="fig wide"><svg viewBox="0 0 880 330" id="fig-moe"></svg>
+<figcaption>One MoE layer with EP = 4 and 8 experts (2 per GPU). Each square on the left is a token, coloured by the GPU that owns its chosen expert. Dispatch is an all-to-all: line thickness shows how many tokens go from each source to each destination. Here GPU 1 hosts a popular expert and receives far more tokens than the others, so everyone waits for it. Combine (dashed) reverses the trip.</figcaption></figure>
+
+<div class="formula" data-name="All-to-all volume per GPU per MoE layer">
+  <div class="tex">$$\htmlClass{t1}{V_{\text{a2a}}} \approx \htmlClass{t2}{T_{\text{loc}}}\cdot\htmlClass{t3}{k}\cdot\htmlClass{t4}{d}\cdot\htmlClass{t5}{b}\cdot\left(1-\frac{1}{\htmlClass{t6}{EP}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(V_{\text{a2a}}\)</dt><dd>bytes each GPU sends in one direction (dispatch; combine is similar)</dd></div>
+    <div data-t="t2"><dt>\(T_{\text{loc}}\)</dt><dd>tokens that live on this GPU in this step</dd></div>
+    <div data-t="t3"><dt>\(k\)</dt><dd>experts per token (top-\(k\))</dd></div>
+    <div data-t="t4"><dt>\(d\)</dt><dd>hidden size</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per element on the wire (fp8 dispatch: 1; bf16: 2)</dd></div>
+    <div data-t="t6"><dt>\(EP\)</dt><dd>expert-parallel degree. A fraction \(1/EP\) of picks land on local experts and never leave</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every token gets copied \(k\) times, once per chosen expert, and almost all of those copies travel to another GPU.</p>
+  <p class="why"><b>Why it matters</b>DeepSeek-V3-sized (\(d = 7168\), \(k = 8\)), 128 decode tokens per GPU, fp8 dispatch, EP=64: about 7.2 MB out per layer, and roughly twice that coming back in bf16. Multiply by ~58 MoE layers and it's over a gigabyte of all-to-all per decode step per GPU, much of it across the network. This is why large-scale EP depends so heavily on all-to-all kernels (DeepSeek open-sourced theirs as DeepEP) and on network bandwidth.</p>
+</div>
+
+<h3>Load imbalance, capacity, and hot experts</h3>
+<p>The all-to-all is synchronous: the layer finishes when the busiest GPU finishes. Routers are trained to spread load, but at inference time the traffic is whatever your users send. A batch full of Python code or one language can concentrate tokens on a few experts.</p>
+
+<div class="formula" data-name="Expert capacity and imbalance">
+  <div class="tex">$$\htmlClass{t1}{C} = \left\lceil \htmlClass{t2}{c_f}\cdot\frac{\htmlClass{t3}{T}\cdot\htmlClass{t4}{k}}{\htmlClass{t5}{E}} \right\rceil, \qquad \htmlClass{t6}{I} = \frac{\max_g \htmlClass{t7}{n_g}}{\operatorname{mean}_g \htmlClass{t7}{n_g}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C\)</dt><dd>capacity: the most tokens one expert will accept (or the buffer it's sized for)</dd></div>
+    <div data-t="t2"><dt>\(c_f\)</dt><dd>capacity factor: slack over perfect balance, often 1.0–2.0</dd></div>
+    <div data-t="t3"><dt>\(T\)</dt><dd>tokens in the step (across the EP group)</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>experts per token</dd></div>
+    <div data-t="t5"><dt>\(E\)</dt><dd>number of routed experts</dd></div>
+    <div data-t="t6"><dt>\(I\)</dt><dd>imbalance: busiest GPU's load over the average. Step time scales with it</dd></div>
+    <div data-t="t7"><dt>\(n_g\)</dt><dd>token-expert assignments that land on GPU \(g\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Perfect balance gives every expert \(Tk/E\) tokens. The capacity factor says how much over that you allow. Imbalance says how far the hottest GPU sits above average.</p>
+  <p class="why"><b>Why it matters</b>With \(I = 2\), every GPU waits for one that has twice the average work, and your expensive cluster runs at about half its MoE throughput. In training, tokens past capacity are often dropped. Inference engines generally don't drop tokens, since that changes outputs, so imbalance shows up as time instead, and \(C\) becomes a buffer-sizing number.</p>
+</div>
+
+<div id="w-moe"></div>
+
+<p>What engines do about hot experts:</p>
+<ul>
+  <li><strong>Redundant experts.</strong> Keep extra copies of the most loaded experts on otherwise idle GPUs and split their traffic. This needs load statistics, and the hot set drifts with the workload, so it gets recomputed periodically. DeepSeek published an expert-placement balancer (EPLB) for this.</li>
+  <li><strong>Placement.</strong> Put experts that are often co-selected on different GPUs, and keep each token's experts on as few nodes as possible so most traffic stays on NVLink.</li>
+  <li><strong>Data-parallel attention.</strong> With MLA (DeepSeek's latent attention), each token caches one compressed latent vector shared by all heads, so splitting heads across TP ranks would replicate the cache on every rank. Engines instead run attention data-parallel, with each GPU owning different requests, and only the experts expert-parallel. SGLang calls this "DP attention".</li>
+</ul>
+
+<div class="def"><b>Case study · DeepSeek-V3 deployment, as reported</b>
+<p>The DeepSeek-V3 technical report (DeepSeek-AI, 2024) describes its serving layout roughly as follows. Treat the specifics as that team's configuration at publication time, not a recipe. Prefill used a minimum unit of 4 nodes (32 H800 GPUs): attention with TP=4 plus sequence parallelism and DP=8, and experts with EP=32, plus redundant copies of high-load experts. Decode used a much larger unit of about 40 nodes (320 GPUs) with EP across all of them, roughly one routed expert per GPU, and some GPUs dedicated to redundant and shared experts. Dispatch traffic was quantized to fp8 and the all-to-all used NVLink within a node and InfiniBand across nodes. The point to take away: decode wants very wide EP so each GPU's expert weights are read by many tokens per step, which pushes the memory-bound expert GEMMs toward being compute-bound.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="layout" data-short="Choosing a layout">Choosing a parallelism layout</h2>
+
+<p>The axes compose. An instance can be TP=8 × PP=2 (16 GPUs), and you can run 4 such instances (DP=4) on 64 GPUs. MoE models add EP for the expert layers, usually overlapping the same GPUs that do DP or TP for attention. A layout that works well usually follows these rules, in order:</p>
+<ol>
+  <li><strong>Fit first.</strong> Find the smallest instance (TP × PP) that holds the weights plus the KV cache you need for your target concurrency.</li>
+  <li><strong>TP inside the fastest domain.</strong> TP's traffic is the chattiest, so it gets NVLink. On standard 8-GPU servers that caps TP at 8. Rack-scale NVLink systems (such as GB200 NVL72) stretch the domain further.</li>
+  <li><strong>PP (or EP) across slower links.</strong> If one node isn't enough, add pipeline stages across nodes rather than stretching TP over the network.</li>
+  <li><strong>DP for everything else.</strong> Replicate the instance to fill the remaining GPUs and meet throughput.</li>
+  <li><strong>Then check latency.</strong> If TPOT is too high, raise TP inside the node (and shrink DP), or consider speculative decoding (<a href="08-inference.html#spec">Module 08</a>).</li>
+</ol>
+
+<div id="w-layout"></div>
+
+<table class="t">
+  <thead><tr><th>Situation</th><th>Reasonable starting layout</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>8B bf16, one 8×H100 node, chat</td><td>TP=1 × DP=8</td><td>Fits with 56 GB of KV room per GPU; no communication at all</td></tr>
+    <tr><td>70B bf16, one 8×H100 node, latency-sensitive</td><td>TP=4 × DP=2, or TP=8 × DP=1</td><td>TP=2 barely fits with no KV room; TP=8 for lowest TPOT</td></tr>
+    <tr><td>405B fp8, one 8×H100 node</td><td>TP=8</td><td>405 GB of weights in 640 GB; ~170 GB left for KV</td></tr>
+    <tr><td>405B bf16, two 8×H100 nodes</td><td>TP=8 × PP=2</td><td>810 GB needs 16 GPUs; only one activation hop per step crosses the network</td></tr>
+    <tr><td>Large MoE, many nodes</td><td>DP attention + wide EP for experts</td><td>See <a href="#moe">§ MoE</a>; all-to-all bandwidth and balance decide throughput</td></tr>
+    <tr><td>8 PCIe GPUs, no NVLink</td><td>TP=2 pairs (same PCIe switch) × DP, or PP</td><td>TP=8 over PCIe spends most of each step waiting on all-reduces</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="disagg" data-short="Disaggregated prefill/decode">Disaggregated prefill and decode</h2>
+
+<p>Prefill and decode stress hardware in opposite ways (<a href="08-inference.html#phases">Module 08</a>). Prefill is compute-bound: thousands of tokens per weight read. Decode is bandwidth-bound: one token per sequence per step, many sequences batched to amortize the weight read. When both share a GPU, they get in each other's way:</p>
+<ul>
+  <li>A 32K-token prompt arrives. Its prefill takes hundreds of milliseconds, and while it runs, every in-flight decode sequence on that GPU waits. Users see a stall in the token stream, and TPOT tail latency spikes.</li>
+  <li>The reverse also happens: a GPU full of decode batches delays new prefills, so TTFT climbs.</li>
+  <li>You can't tune one setup for both. Prefill wants high TP for fast TTFT and doesn't need much KV memory. Decode wants large batches, lots of KV memory, and maybe lower TP.</li>
+</ul>
+<p>Chunked prefill (Module 19) softens the first problem by slicing prompts into pieces interleaved with decode steps. <strong>Disaggregation</strong> removes it: run prefill on one pool of GPUs and decode on another, and ship each request's KV cache from the first to the second when prefill finishes.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 340" id="fig-disagg"></svg>
+<figcaption>Top: a disaggregated deployment. The prefill pool computes the prompt's KV cache and the first token, then transfers the KV to a decode instance over RDMA or NVLink. Bottom: why it helps. On a colocated GPU (first row), a long prefill (gold) freezes every running decode stream (blue). With separate pools, decode steps keep a steady rhythm and prefills run back to back.</figcaption></figure>
+
+<p>Three research systems shaped the idea. Each is described here at the level of its published design; check the papers for details.</p>
+<ul>
+  <li><strong>DistServe</strong> (Zhong et al., 2024) separates the phases and chooses parallelism and GPU counts for each so as to maximize <em>goodput</em>: requests per second that meet both a TTFT and a TPOT target.</li>
+  <li><strong>Splitwise</strong> (Patel et al., 2024) makes the same split and observes that the decode phase can run on cheaper or older GPUs, since it needs memory bandwidth and capacity more than FLOPs.</li>
+  <li><strong>Mooncake</strong> (Qin et al., 2024), the serving system behind Moonshot AI's Kimi, builds the design around the KV cache: a cluster-wide pool of KV in CPU DRAM and SSD that both prefill and decode nodes can read and write, with a scheduler that routes on cache hits.</li>
+</ul>
+<p>Production engines have adopted the pattern: vLLM and SGLang both have disaggregated-serving modes with pluggable KV transfer backends. The APIs are moving quickly, so check current docs.</p>
+
+<div class="formula" data-name="KV transfer time">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{xfer}}} = \frac{\htmlClass{t2}{P}\cdot\htmlClass{t3}{m_{KV}}}{\htmlClass{t4}{BW_{\text{link}}}}, \qquad \htmlClass{t3}{m_{KV}} = 2\,\htmlClass{t5}{L}\,\htmlClass{t6}{n_{kv}}\,\htmlClass{t7}{d_{h}}\,b$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{xfer}}\)</dt><dd>time to move one request's KV cache from prefill to decode</dd></div>
+    <div data-t="t2"><dt>\(P\)</dt><dd>prompt length in tokens</dd></div>
+    <div data-t="t3"><dt>\(m_{KV}\)</dt><dd>KV bytes per token across all layers (Llama-3.1-70B, bf16: 320 KB)</dd></div>
+    <div data-t="t4"><dt>\(BW_{\text{link}}\)</dt><dd>achieved bandwidth between the two instances; can be several NICs in parallel when the KV is sharded across TP ranks</dd></div>
+    <div data-t="t5"><dt>\(L\)</dt><dd>layers</dd></div>
+    <div data-t="t6"><dt>\(n_{kv}\)</dt><dd>KV heads</dd></div>
+    <div data-t="t7"><dt>\(d_h\)</dt><dd>head dimension (\(b\): bytes per element)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The KV cache is a big tensor; moving it takes its size divided by the pipe.</p>
+  <p class="why"><b>Why it matters</b>70B, 8K-token prompt: 2.7 GB. Over one 400 Gb/s NIC (50 GB/s), 54 ms. Over eight NICs in parallel (TP=8, each rank sends its own shard), about 7 ms. The prefill itself takes several hundred milliseconds on 4–8 H100s, so if the transfer streams layer by layer as prefill proceeds, it's almost entirely hidden. Over 100 GbE TCP with a small model and a fast prefill, it isn't.</p>
+</div>
+
+<div id="w-disagg"></div>
+
+<div class="flag"><b>When disaggregation doesn't pay</b>
+<p>It adds a second pool to size and autoscale, a transfer path that can fail, and a router that has to know about both. At small scale, with short prompts, or when TTFT and TPOT targets are loose, chunked prefill on colocated instances is simpler and often just as good. The win grows with long prompts, strict TPOT targets, and enough traffic to keep both pools busy.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="offload" data-short="KV offloading & tiers">KV cache offloading and tiered storage</h2>
+
+<p>Prefix caching (<a href="08-inference.html#prefix">Module 08</a>) reuses KV blocks that are still in GPU memory. But HBM is small, and the cache gets evicted within minutes on a busy server. A lot of traffic repeats long prefixes over longer spans: multi-turn chats where every turn resends the history, agents that resend the same tool definitions and file contents, RAG over the same popular documents. Keeping evicted KV in a bigger, slower tier and loading it back can be much cheaper than recomputing it.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 270" id="fig-tiers"></svg>
+<figcaption>KV storage tiers, from small and fast to large and slow. Bandwidths are approximate, per GPU, and depend heavily on hardware: PCIe lanes are shared with the NIC, NVMe throughput scales with the number of drives, and remote stores are limited by the network card. Blocks are evicted downward when HBM fills and reloaded upward when a request reuses the prefix.</figcaption></figure>
+
+<p>Systems like LMCache (an open-source KV caching layer that plugs into vLLM and SGLang), and the KV-centric design of Mooncake, store KV in chunks keyed by a hash of the token prefix. When a request arrives, the engine looks up the longest cached prefix across tiers, loads those chunks into HBM (ideally overlapped with computing the rest), and only prefills the new tokens. The engine integration points (vLLM's KV connector interface, for example) are still evolving, so check the current docs before building on one.</p>
+
+<div class="formula" data-name="Reload beats recompute when">
+  <div class="tex">$$\underbrace{\frac{\htmlClass{t1}{P}\cdot\htmlClass{t2}{m_{KV}}}{\htmlClass{t3}{BW_{\text{tier}}}}}_{\text{reload}} \;\lt\; \underbrace{\frac{2\htmlClass{t4}{N}\htmlClass{t1}{P} + 2\htmlClass{t5}{L}\,\htmlClass{t6}{d_{\text{attn}}}\,\htmlClass{t1}{P}^2}{\htmlClass{t7}{F_{\text{eff}}}}}_{\text{recompute (prefill)}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P\)</dt><dd>length of the cached prefix in tokens</dd></div>
+    <div data-t="t2"><dt>\(m_{KV}\)</dt><dd>KV bytes per token</dd></div>
+    <div data-t="t3"><dt>\(BW_{\text{tier}}\)</dt><dd>bandwidth from the tier holding the KV into HBM</dd></div>
+    <div data-t="t4"><dt>\(N\)</dt><dd>parameters used per token (active parameters for MoE)</dd></div>
+    <div data-t="t5"><dt>\(L\)</dt><dd>layers</dd></div>
+    <div data-t="t6"><dt>\(d_{\text{attn}}\)</dt><dd>attention width, heads × head dim (causal attention costs about \(2 L d_{\text{attn}} P^2\) FLOPs)</dd></div>
+    <div data-t="t7"><dt>\(F_{\text{eff}}\)</dt><dd>achieved prefill FLOP/s</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Loading costs bytes over bandwidth and grows linearly with the prefix. Recomputing costs FLOPs over compute and grows faster than linearly, because attention is quadratic. The longer the prefix, the more reloading wins.</p>
+  <p class="why"><b>Why it matters</b>Llama-3.1-8B, 32K-token prefix: 4.3 GB of KV. From CPU DRAM at ~50 GB/s that's ~86 ms. Recomputing is ~0.8 PFLOP, about 2 s at 400 TFLOP/s. Reload wins by ~20×. Even a single NVMe drive at ~7 GB/s (0.6 s) beats recompute here. The comparison flips for short prefixes on slow tiers, and for models with tiny KV per token relative to their FLOPs.</p>
+</div>
+
+<div id="w-offload"></div>
+
+<div class="pitfall"><b>Pitfall · the GPU must not wait for the disk</b>
+<p>A reload that takes 86 ms helps only if the engine schedules around it: start loading as soon as the request is admitted, run other requests meanwhile, and load layer by layer so layer 1 can compute while layer 2's KV is still arriving. A synchronous load that stalls the whole batch can cost more total throughput than recomputing would have.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="longctx" data-short="Long context across GPUs">Long context across GPUs</h2>
+
+<p>A single long sequence can outgrow one GPU in two ways. The KV cache can get too big: Llama-3.1-8B at 1M tokens needs 131 GB of KV, more than an H100 holds before counting the weights. Or the prefill can get too slow: attention for that 1M-token prompt is about \(2\cdot 32\cdot 4096\cdot (10^6)^2 \approx 2.6\times10^{17}\) FLOPs, roughly seven minutes on one H100 at 600 TFLOP/s. TP doesn't fix either well, because it splits heads, not positions. <strong>Context parallelism</strong> (CP) splits the sequence itself.</p>
+
+<h3>Ring attention for prefill</h3>
+<p>Split the prompt into \(p\) chunks, one per GPU. Each GPU computes Q, K and V for its own chunk. Attention needs every query to see every (earlier) key, so the K/V chunks travel around a ring: at each step, each GPU computes attention between its queries and the K/V chunk it currently holds, while sending that chunk to the next GPU and receiving the next one. Partial results are merged with the same running-max trick FlashAttention uses (<a href="08-inference.html#flash">Module 08</a>). This is Ring Attention (Liu et al., 2023).</p>
+
+<figure class="fig wide"><svg viewBox="0 0 880 300" id="fig-ringattn"></svg>
+<figcaption>Ring attention on 4 GPUs. Left: GPU \(i\) keeps query chunk \(Q_i\). The number in each cell is the step at which GPU \(i\) holds KV chunk \(j\). With a causal mask, blocks above the diagonal are skipped (grey) and diagonal blocks are half-masked. GPU 0 has one block of real work while GPU 3 has four, which is why practical schemes give each GPU a mix of early and late chunks (striped or zigzag assignment). Right: KV chunks move one hop per step while compute runs.</figcaption></figure>
+
+<div class="formula" data-name="Ring attention hides communication when">
+  <div class="tex">$$\frac{4\,\htmlClass{t1}{c}^2\,\htmlClass{t2}{d}}{\htmlClass{t3}{F}} \;\ge\; \frac{2\,\htmlClass{t1}{c}\,\htmlClass{t4}{d_{kv}}\,\htmlClass{t5}{b}}{\htmlClass{t6}{BW}} \quad\Longrightarrow\quad \htmlClass{t1}{c} \;\ge\; \frac{\htmlClass{t4}{d_{kv}}\,\htmlClass{t5}{b}\,\htmlClass{t3}{F}}{2\,\htmlClass{t2}{d}\,\htmlClass{t6}{BW}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(c\)</dt><dd>chunk length: tokens per GPU</dd></div>
+    <div data-t="t2"><dt>\(d\)</dt><dd>query width (heads × head dim)</dd></div>
+    <div data-t="t3"><dt>\(F\)</dt><dd>achieved FLOP/s per GPU</dd></div>
+    <div data-t="t4"><dt>\(d_{kv}\)</dt><dd>KV width (KV heads × head dim); smaller than \(d\) with GQA</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per element</dd></div>
+    <div data-t="t6"><dt>\(BW\)</dt><dd>per-direction bandwidth to the next GPU in the ring</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Compute on a block pair grows with \(c^2\) and the transfer grows with \(c\), so big enough chunks always hide the communication. The formula gives the threshold (per layer, full block; causal diagonal blocks have half the work).</p>
+  <p class="why"><b>Why it matters</b>Llama-3.1-70B (\(d = 8192\), \(d_{kv} = 1024\)), bf16, 600 TFLOP/s, across nodes at 50 GB/s: \(c \ge\) ~1,500 tokens. Without GQA (\(d_{kv} = d\)) it would be ~12,000. CP pays off for very long prompts and is wasteful for short ones.</p>
+</div>
+
+<h3>Decode with a sharded KV cache</h3>
+<p>During decode, the new token's query is tiny but the KV cache is huge and already spread across GPUs. So the query goes to every GPU instead: each computes attention over its own KV shard and returns a partial output with two scalars per head, its local max score and its local sum of exponentials. A cheap merge produces the exact result.</p>
+
+<div class="formula" data-name="Merging partial attention from shards">
+  <div class="tex">$$\htmlClass{t1}{o} = \frac{\sum_i e^{\htmlClass{t2}{m_i}-\htmlClass{t3}{m}}\,\htmlClass{t4}{\ell_i}\,\htmlClass{t5}{o_i}}{\sum_i e^{\htmlClass{t2}{m_i}-\htmlClass{t3}{m}}\,\htmlClass{t4}{\ell_i}}, \qquad \htmlClass{t3}{m}=\max_i \htmlClass{t2}{m_i}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(o\)</dt><dd>exact attention output, as if computed over the whole sequence</dd></div>
+    <div data-t="t2"><dt>\(m_i\)</dt><dd>maximum attention score within shard \(i\)</dd></div>
+    <div data-t="t3"><dt>\(m\)</dt><dd>global maximum, for numerical stability</dd></div>
+    <div data-t="t4"><dt>\(\ell_i\)</dt><dd>\(\sum_{j \in i} e^{s_j - m_i}\): shard \(i\)'s softmax denominator</dd></div>
+    <div data-t="t5"><dt>\(o_i\)</dt><dd>shard \(i\)'s normalized attention output</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each shard reports its answer plus how much total probability mass it holds. Weight each answer by its mass and renormalize.</p>
+  <p class="why"><b>Why it matters</b>Only \(d_h + 2\) numbers per head travel per shard per layer, independent of context length. That's what makes million-token decode across GPUs practical.</p>
+</div>
+
+<p>A different approach, DeepSpeed-Ulysses (Jacobs et al., 2023), uses an all-to-all to switch from "each GPU has some positions, all heads" to "each GPU has all positions, some heads" around the attention computation. It's simpler but can't use more GPUs than there are KV heads. Context parallelism for training appears briefly in <a href="07-training.html#mp">Module 07</a>; for inference it's mainly a long-prompt prefill tool.</p>
+
+<!-- ================================================================== -->
+<h2 id="multinode" data-short="Multi-node realities">Multi-node realities</h2>
+
+<p>Inside an 8-GPU server, NVLink gives each GPU hundreds of GB/s to its peers. Leave the box and you're on a network card. The table shows the cliff. All figures are approximate per-GPU numbers; check your hardware.</p>
+
+<table class="t">
+  <thead><tr><th>Link</th><th class="num">Per direction, approx.</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>NVLink 4 (H100, via NVSwitch)</td><td class="num">~450 GB/s</td><td>Often quoted as 900 GB/s, which counts both directions</td></tr>
+    <tr><td>NVLink 5 (B200)</td><td class="num">~900 GB/s</td><td>1.8 TB/s bidirectional; NVL72 racks extend the domain to 72 GPUs</td></tr>
+    <tr><td>PCIe Gen5 x16</td><td class="num">~64 GB/s</td><td>~50 achievable; shared with the NIC if they sit behind the same switch</td></tr>
+    <tr><td>PCIe Gen4 x16</td><td class="num">~32 GB/s</td><td>A100-era servers and many workstation cards</td></tr>
+    <tr><td>InfiniBand NDR / 400 GbE RoCE</td><td class="num">~50 GB/s per NIC</td><td>400 Gb/s; high-end servers have one NIC per GPU, ~400 GB/s per node</td></tr>
+    <tr><td>100 GbE</td><td class="num">~12.5 GB/s</td><td>Common in commodity clouds; TCP adds latency and CPU overhead</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig wide"><svg viewBox="0 0 880 300" id="fig-topo"></svg>
+<figcaption>Two 8-GPU nodes in a rail-optimized network. Inside each node, GPUs talk through NVSwitch. Each GPU has its own NIC on a nearby PCIe switch, and NIC \(k\) of every node connects to the same leaf switch ("rail" \(k\)), so GPU \(k\) talks to GPU \(k\) in another node in one switch hop. Topology-aware libraries route traffic along rails and keep TP inside the NVLink box.</figcaption></figure>
+
+<h3>The pieces that make the network usable</h3>
+<p><strong>RDMA</strong> (remote direct memory access) lets a network card write into another machine's memory without involving either CPU. InfiniBand was designed around it. <strong>RoCE</strong> (RDMA over Converged Ethernet) brings it to Ethernet, at the price of more switch tuning to keep the network lossless. <strong>GPUDirect RDMA</strong> goes one step further and lets the NIC read and write GPU memory directly over PCIe, so data never bounces through host memory. Without it, every transfer pays an extra copy and some CPU time.</p>
+<p>None of this helps if traffic takes the wrong path. NCCL works out which NIC is closest to each GPU, but containers and VMs can hide the PCIe layout from it. Set <code>NCCL_DEBUG=INFO</code> and read which transports it chose: <code>NET/Socket</code> where you expected <code>NET/IB</code> means you're on plain TCP and something is misconfigured.</p>
+
+<h3>Failure domains and stragglers</h3>
+<p>A model instance spread across \(G\) GPUs is one failure domain: if any of them fails, the instance stops. Hardware faults are rare per GPU, but they multiply.</p>
+
+<div class="formula" data-name="Instance availability and step time">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{up}}} = (1-\htmlClass{t2}{f})^{\htmlClass{t3}{G}}, \qquad \htmlClass{t4}{t_{\text{step}}} = \max_{i \le \htmlClass{t3}{G}} \htmlClass{t5}{t_i}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{up}}\)</dt><dd>probability the instance survives a period without any GPU fault</dd></div>
+    <div data-t="t2"><dt>\(f\)</dt><dd>per-GPU fault probability over that period (assumed independent)</dd></div>
+    <div data-t="t3"><dt>\(G\)</dt><dd>GPUs in one instance</dd></div>
+    <div data-t="t4"><dt>\(t_{\text{step}}\)</dt><dd>time of one synchronous step</dd></div>
+    <div data-t="t5"><dt>\(t_i\)</dt><dd>time rank \(i\) takes for its share of the step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every GPU has to be healthy for the instance to be up, and every GPU has to finish for the step to finish.</p>
+  <p class="why"><b>Why it matters</b>With an illustrative \(f = 0.1\%\) per GPU per day, an 8-GPU instance has a 0.8% chance of a fault each day, and a 320-GPU decode unit has a 27% chance. Separately, one GPU running 20% slow (thermal throttling, a degraded NVLink lane, a noisy network neighbour) slows its entire instance by 20%. Wide instances need health checks, fast replacement, and spare capacity; DP replicas fail independently and degrade gracefully.</p>
+</div>
+
+<div class="mle"><b>MLE angle · admit nodes only after a burn-in</b>
+<p>Before a node joins a serving pool, run a short <code>all_reduce_perf</code> within the node and between it and a known-good neighbour, and compare busbw to a baseline. Tools like NVIDIA's DCGM diagnostics catch failing memory and links. A node that's 30% slow on all-reduce today often becomes the one that crashes next week.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="handson">Hands-on</h2>
+
+<p>Engine flags for distributed serving change between releases. The commands below match vLLM and SGLang as of their 2025 releases; check the current docs before relying on any flag.</p>
+
+<h3>1. Measure the fabric with nccl-tests</h3>
+<div class="code" data-lang="bash" data-title="nccl-tests"><pre><code>
+git clone https://github.com/NVIDIA/nccl-tests.git
+cd nccl-tests
+make -j                         # add MPI=1 MPI_HOME=/path/to/mpi for multi-node runs
+
+# what is connected to what? (NV# = NVLink, PIX/PXB/PHB/SYS = PCIe paths)
+nvidia-smi topo -m
+
+# one process driving 8 GPUs; sizes from 8 B to 8 GB, doubling each time
+./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+
+# repeat with 2 and 4 GPUs to see how latency and bandwidth scale
+CUDA_VISIBLE_DEVICES=0,1 ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 2
+
+# which transport did NCCL pick? (P2P/NVLink, NVLS, NET/IB, NET/Socket)
+NCCL_DEBUG=INFO ./build/all_reduce_perf -b 1G -e 1G -g 8 2&gt;&amp;1 | grep -iE "via|NVLS|NET/" | head
+
+# two nodes x 8 GPUs, one process per GPU (MPI build)
+mpirun -np 16 -H node1:8,node2:8 ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
+</code></pre></div>
+
+<p>Each output row is one message size. The columns are size, element count, type and reduction op, then for <em>out-of-place</em> and <em>in-place</em> runs: time in µs, <code>algbw</code> and <code>busbw</code> in GB/s, and <code>#wrong</code> (should be 0). A final line reports the average bus bandwidth. Read the curve in two parts. At small sizes time is flat (latency-bound) and busbw is tiny. Note that floor time, since it's your \(\alpha\) term. At large sizes busbw plateaus; that plateau is your effective \(BW\). Compare it with the link's per-direction rating.</p>
+
+<h3>2. The same measurement from PyTorch</h3>
+<div class="code" data-lang="python" data-title="allreduce_bench.py · torchrun --nproc_per_node=4 allreduce_bench.py"><pre><code>
+import os
+import torch
+import torch.distributed as dist
+
+def main():
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+    for size_bytes in [2 ** k for k in range(10, 31, 2)]:      # 1 KiB .. 1 GiB
+        x = torch.zeros(size_bytes // 2, dtype=torch.bfloat16, device="cuda")
+        for _ in range(5):                                     # warm-up: NCCL sets up lazily
+            dist.all_reduce(x)
+        torch.cuda.synchronize()
+
+        iters = 20
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            dist.all_reduce(x)
+        end.record()
+        torch.cuda.synchronize()
+
+        t = start.elapsed_time(end) / 1e3 / iters              # seconds per all-reduce
+        algbw = size_bytes / t / 1e9
+        busbw = algbw * 2 * (world - 1) / world
+        if rank == 0:
+            print(f"{size_bytes / 1e6:10.3f} MB {t * 1e6:10.1f} us "
+                  f"algbw {algbw:7.1f} GB/s  busbw {busbw:7.1f} GB/s")
+
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
+</code></pre></div>
+
+<h3>3. Serving with vLLM</h3>
+<div class="code" data-lang="bash" data-title="vLLM (check current docs for flag names)"><pre><code>
+# tensor parallel inside one node
+vllm serve meta-llama/Llama-3.1-70B-Instruct --tensor-parallel-size 4
+
+# TP inside groups of GPUs, pipeline stages between them
+vllm serve meta-llama/Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 4 --pipeline-parallel-size 2
+
+# data-parallel ranks inside one server, mainly for MoE with expert parallelism
+vllm serve Qwen/Qwen3-30B-A3B --data-parallel-size 4 --enable-expert-parallel
+
+# multi-node with Ray: start a cluster, then launch from the head node
+ray start --head --port=6379                  # on node 1
+ray start --address=NODE1_IP:6379             # on node 2
+vllm serve meta-llama/Llama-3.1-405B-Instruct \
+  --tensor-parallel-size 8 --pipeline-parallel-size 2 \
+  --distributed-executor-backend ray
+</code></pre></div>
+
+<h3>4. Serving with SGLang</h3>
+<div class="code" data-lang="bash" data-title="SGLang (check current docs for flag names)"><pre><code>
+# tensor parallel
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# data-parallel replicas managed by one launcher
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --dp 4 --tp 1
+
+# two nodes: run on each node, changing --node-rank (this example stretches TP over
+# the network, as several published examples do; benchmark it against TP=8 x PP=2)
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-405B-Instruct \
+  --tp 16 --nnodes 2 --node-rank 0 --dist-init-addr NODE1_IP:50000
+</code></pre></div>
+
+<h3>5. Measure the TP tradeoff</h3>
+<div class="code" data-lang="bash" data-title="sweep TP and concurrency"><pre><code>
+MODEL=meta-llama/Llama-3.1-8B-Instruct
+for TP in 1 2 4; do
+  vllm serve $MODEL --tensor-parallel-size $TP --port 8000 &amp;
+  SERVER=$!
+  until curl -s localhost:8000/v1/models &gt; /dev/null; do sleep 5; done
+  for C in 1 8 32 128; do
+    vllm bench serve --model $MODEL --port 8000 \
+      --dataset-name random --random-input-len 1024 --random-output-len 256 \
+      --num-prompts $((C * 8)) --max-concurrency $C \
+      --save-result --result-filename tp${TP}_c${C}.json
+  done
+  kill $SERVER; wait $SERVER
+done
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>Rent a node with 2–8 NVLink-connected GPUs (note the GPU model and run <code>nvidia-smi topo -m</code>). You're done when you have:</p>
+<ol>
+  <li>An nccl-tests <code>all_reduce_perf</code> curve for 2, 4 and (if available) 8 GPUs, with the small-message floor time and the large-message busbw plateau written down, and your torch microbenchmark agreeing with nccl-tests busbw within ~15% at 256 MB and above.</li>
+  <li>A table for one model (8B works on any 80 GB GPU) with rows TP = 1, 2, 4 and columns <em>concurrency · TTFT p50 · TPOT p50 · output tok/s · output tok/s per GPU</em>.</li>
+  <li>A written explanation, using this module's formulas, of two results: why the highest TP gives the lowest TPOT at concurrency 1, and why TP=1 replicas give the most tokens per second per GPU at high concurrency. Include your predicted communication share from the decode-step formula, using your measured \(\alpha\), next to what you observed.</li>
+</ol>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="20-main" data-title="Check yourself · Distributed inference">
+  <div class="q" data-answer="2"><p>Ring all-reduce of a 1 GB tensor across 8 GPUs whose slowest link runs at 50 GB/s per direction. Ignoring latency, about how long does it take?</p>
+    <ol><li>~20 ms</li><li>~160 ms</li><li>~35 ms</li><li>~280 ms</li></ol>
+    <div class="explain">\(2 \cdot \tfrac{7}{8} \cdot 1\,\text{GB} / 50\,\text{GB/s} = 1.75 / 50 = 35\) ms. Each GPU sends almost two copies of the tensor. 20 ms is a single copy; 280 ms is the naive "everyone sends to rank 0" pattern, \(2(p-1)S/BW\).</div></div>
+  <div class="q" data-answer="0"><p>Llama-3.1-70B (80 layers) runs with TP=4. How many all-reduces does one decode step's forward pass need, ignoring the embedding and LM head?</p>
+    <ol><li>160</li><li>80</li><li>320</li><li>4</li></ol>
+    <div class="explain">Two per layer, one after the attention output projection and one after the MLP down projection, independent of the TP degree. 80 × 2 = 160. That's why small-message latency matters so much for TP decode.</div></div>
+  <div class="q" data-answer="3"><p>Disaggregated serving of Llama-3.1-70B (320 KB of KV per token in bf16). An 8,000-token prompt's KV goes from prefill to decode over one 400 Gb/s link. Ideal transfer time?</p>
+    <ol><li>~5 ms</li><li>~0.4 s</li><li>~2.6 s</li><li>~52 ms</li></ol>
+    <div class="explain">8,000 × 327,680 B ≈ 2.6 GB. 400 Gb/s = 50 GB/s, so ≈ 52 ms. (2.6 s is what you get if you treat 400 Gb/s as about 1 GB/s; 5 ms would need ten such links working in parallel.) Prefill of 8K tokens on a 70B model takes several hundred ms, so layer-wise streaming can hide this.</div></div>
+  <div class="q" data-answer="1"><p>64 experts on EP=8 (8 per GPU), 4,096 tokens, top-2 routing. The hottest GPU receives 2,048 token-expert assignments. What's the imbalance, and what does it mean?</p>
+    <ol><li>1.25: within normal capacity, no effect</li><li>2.0: the MoE layer takes as long as if every GPU had 2,048, so the GPUs run at about half their useful throughput</li><li>0.5: the hottest GPU is underloaded</li><li>8.0: one GPU gets everything</li></ol>
+    <div class="explain">Total assignments = 4,096 × 2 = 8,192, so the mean per GPU is 1,024. Imbalance = 2,048 / 1,024 = 2. All-to-all and the next layer wait on the slowest GPU, so the average GPU does half the work it could in that time.</div></div>
+  <div class="q" data-answer="2"><p>You serve Llama-3.1-8B (bf16) on one 8×H100 node for a high-throughput batch summarization job. Which layout maximizes total tokens per second?</p>
+    <ol><li>One instance with TP=8</li><li>One instance with PP=8</li><li>Eight TP=1 replicas behind a load balancer</li><li>TP=2 × PP=4</li></ol>
+    <div class="explain">The model fits on one GPU with ~56 GB of KV room. Replicas have no communication and no bubbles, and each has its own KV memory. TP=8 lowers per-token latency but adds 64 all-reduces per step, and the per-GPU KV gain is small. PP=8 adds bubbles and hops for no memory benefit.</div></div>
+  <div class="q" data-answer="3"><p>A 70B model is split PP=4 across 4 GPUs, and only one user is active. Compared with a hypothetical single GPU big enough to hold the whole model, what happens to that user's time per output token?</p>
+    <ol><li>About 4× faster</li><li>About 2× faster</li><li>About 4× slower</li><li>About the same or slightly slower, with each GPU idle ~75% of the time</li></ol>
+    <div class="explain">Each token still passes through all 80 layers in sequence; the stages just take turns. TPOT ≈ \(t_1\) + 3 hops. With \(m = 1\), utilization is \(1/p = 25\%\). PP adds capacity and throughput when there are enough micro-batches, not single-stream speed. TP=4 would cut TPOT by spreading the weight reads.</div></div>
+  <div class="q" data-answer="0"><p>Llama-3.1-8B, a cached 32K-token prefix sitting in CPU DRAM (~50 GB/s to the GPU), KV 128 KB per token, prefill compute ~400 TFLOP/s. Reload or recompute?</p>
+    <ol><li>Reload: ~86 ms versus ~2 s to recompute</li><li>Recompute: prefill is compute-bound and GPUs are fast</li><li>About equal, so it doesn't matter</li><li>Neither: KV from another request can't be reused</li></ol>
+    <div class="explain">Reload: 32,768 × 131,072 B ≈ 4.3 GB / 50 GB/s ≈ 86 ms. Recompute: \(2 \cdot 8\text{B} \cdot 32768 \approx 5.2\times10^{14}\) plus attention \(2 \cdot 32 \cdot 4096 \cdot 32768^2 \approx 2.8\times10^{14}\), total ≈ \(8\times10^{14}\) FLOPs / 400 TFLOP/s ≈ 2 s. KV for an identical token prefix is identical, so reuse is exact.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, bars, widget, fmtNum, rng, palette, clamp, heat } = C;
+
+  /* ---------------------------------------------------------- shared helpers */
+  const GC = [palette.green, palette.blue, palette.gold, palette.plum];
+  const prec = (v, n) => String(+v.toPrecision(n || 3));
+  const fB = b => { const a = Math.abs(b);
+    if (a >= 1e12) return fmtNum(b / 1e12, b / 1e12 < 10 ? 2 : 1) + " TB";
+    if (a >= 1e9) return fmtNum(b / 1e9, b / 1e9 < 10 ? 2 : 1) + " GB";
+    if (a >= 1e6) return fmtNum(b / 1e6, b / 1e6 < 10 ? 2 : 1) + " MB";
+    if (a >= 1e3) return fmtNum(b / 1e3, b / 1e3 < 10 ? 1 : 0) + " KB";
+    return fmtNum(b, 0) + " B"; };
+  const tickB = v => v >= 1e9 ? prec(v / 1e9) + " GB" : v >= 1e6 ? prec(v / 1e6) + " MB" : v >= 1e3 ? prec(v / 1e3) + " KB" : prec(v) + " B";
+  const fT = s => { if (!isFinite(s)) return "∞";
+    if (s >= 1) return fmtNum(s, s < 10 ? 2 : 1) + " s";
+    if (s >= 1e-3) return fmtNum(s * 1e3, s * 1e3 < 10 ? 2 : 1) + " ms";
+    if (s >= 1e-6) return fmtNum(s * 1e6, s * 1e6 < 10 ? 1 : 0) + " µs";
+    return fmtNum(s * 1e9, 0) + " ns"; };
+  const tickMs = v => v >= 1000 ? prec(v / 1000) + " s" : v >= 1 ? prec(v) + " ms" : v >= 1e-3 ? prec(v * 1e3) + " µs" : prec(v * 1e6) + " ns";
+  const tickN = v => v >= 1e6 ? prec(v / 1e6) + "M" : v >= 1e3 ? prec(v / 1e3) + "K" : prec(v);
+  const logRange = (lo, hi) => [10 ** Math.floor(Math.log10(lo)), 10 ** Math.ceil(Math.log10(hi))];
+  function marker(s, id, color) {
+    const d = svg("defs");
+    d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color || palette.ink })));
+    s.appendChild(d);
+  }
+  function tx(s, x, y, t, o) { const n = svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, "text-anchor": "middle", text: t }, o || {})); s.appendChild(n); return n; }
+  function bx(s, x, y, w, h, o) { const n = svg("rect", Object.assign({ x, y, width: w, height: h, rx: 6, fill: "#fff", stroke: "rgba(28,27,25,.25)", "stroke-width": 1.2 }, o || {})); s.appendChild(n); return n; }
+  function ln(s, x1, y1, x2, y2, o) { const n = svg("line", Object.assign({ x1, y1, x2, y2, stroke: palette.ink, "stroke-width": 1.3 }, o || {})); s.appendChild(n); return n; }
+  function pth(s, d, o) { const n = svg("path", Object.assign({ d, fill: "none", stroke: palette.ink, "stroke-width": 1.3 }, o || {})); s.appendChild(n); return n; }
+  const alpha = (hex, a) => { const h = hex.replace("#", ""); return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${a})`; };
+
+  // H100-class working numbers used by several widgets (illustrative)
+  const GPU = { F: 600e12, HBM: 2.68e12, mem: 80e9 };
+
+  /* ---------------------------------------------------------- fig: decision */
+  (function () {
+    const s = document.getElementById("fig-decide");
+    marker(s, "arr-decide", palette.muted);
+    const box = (x, y, w, h, title, sub, kind) => {
+      const fill = kind === "a" ? "rgba(26,122,82,.08)" : kind === "b" ? "rgba(176,67,46,.07)" : "#fbfaf7";
+      const stroke = kind === "a" ? "rgba(26,122,82,.55)" : kind === "b" ? "rgba(176,67,46,.5)" : "rgba(28,27,25,.25)";
+      bx(s, x, y, w, h, { rx: 10, fill, stroke });
+      tx(s, x + w / 2, y + (sub ? 22 : h / 2 + 4), title, { "font-size": 13, "font-weight": 600 });
+      if (sub) sub.split("|").forEach((t, i) => tx(s, x + w / 2, y + 40 + i * 14, t, { "font-size": 11, fill: palette.muted }));
+    };
+    const link = (x1, y1, x2, y2, label) => {
+      pth(s, `M${x1},${y1} C ${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2 - 4}`, { stroke: palette.muted, "stroke-width": 1.2, "marker-end": "url(#arr-decide)" });
+      if (label) tx(s, (x1 + x2) / 2 + (x2 >= x1 ? 8 : -8), (y1 + y2) / 2 - 3, label, { "text-anchor": x2 >= x1 ? "start" : "end", "font-size": 11, fill: palette.muted, class: "mono" });
+    };
+    box(290, 10, 300, 58, "Weights + KV fit on one GPU?", "M_W + M_KV + overhead ≤ ~90% of memory", "q");
+    box(20, 120, 250, 72, "Shard the model", "TP inside the NVLink node|PP or EP across nodes", "b");
+    box(330, 120, 230, 58, "Enough tokens/s?", "queueing, KV memory full", "q");
+    box(620, 120, 240, 58, "Per-token latency OK?", "TPOT vs your target", "q");
+    link(390, 68, 145, 120, "no");
+    link(440, 68, 445, 120, "yes");
+    link(490, 68, 740, 120, "yes");
+    box(330, 230, 230, 66, "Add DP replicas", "independent copies, a router|no cross-GPU traffic", "a");
+    box(620, 230, 240, 66, "Raise TP inside the node", "splits weight reads|pays 2 all-reduces per layer", "a");
+    link(445, 178, 445, 230, "no");
+    link(740, 178, 740, 230, "no");
+    box(20, 230, 250, 66, "Then ask the other two", "a sharded instance can still be|replicated or given more TP", "q");
+    link(145, 192, 145, 230, "");
+    tx(s, 440, 318, "Long prompts add context parallelism; MoE models add expert parallelism. Same questions, more axes.", { "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: collectives */
+  (function () {
+    const s = document.getElementById("fig-coll");
+    marker(s, "arr-coll", palette.muted);
+    const SUM = "sum";
+    const panels = [
+      { x: 10, y: 8, name: "broadcast", cap: "one rank's data copied to all",
+        before: (i, r) => i === 0 ? { c: 0, t: "A" + r } : null, after: (i, r) => ({ c: 0, t: "A" + r }) },
+      { x: 300, y: 8, name: "all-reduce", cap: "every rank ends with the sum",
+        before: (i, r) => ({ c: i, t: "abcd"[i] + r }), after: (i, r) => ({ c: SUM, t: "Σ" + r }) },
+      { x: 590, y: 8, name: "reduce-scatter", cap: "summed, each rank keeps 1/p",
+        before: (i, r) => ({ c: i, t: "abcd"[i] + r }), after: (i, r) => r === i ? { c: SUM, t: "Σ" + r } : null },
+      { x: 155, y: 196, name: "all-gather", cap: "every rank collects every piece",
+        before: (i, r) => r === i ? { c: i, t: "abcd"[i] } : null, after: (i, r) => ({ c: r, t: "abcd"[r] }) },
+      { x: 445, y: 196, name: "all-to-all", cap: "rank i's chunk j goes to rank j",
+        before: (i, r) => ({ c: i, t: i + "→" + r }), after: (i, r) => ({ c: r, t: r + "→" + i }) }
+    ];
+    const cw = 24, gap = 6, ch = 20;
+    panels.forEach(P => {
+      bx(s, P.x, P.y, 280, 176, { rx: 10, fill: "#fbfaf7", stroke: "rgba(28,27,25,.14)" });
+      tx(s, P.x + 140, P.y + 18, P.name, { "font-size": 13, "font-weight": 600, class: "mono" });
+      tx(s, P.x + 140, P.y + 34, P.cap, { "font-size": 10.5, fill: palette.muted });
+      [["before", P.before, P.x + 14], ["after", P.after, P.x + 152]].forEach(([lab, fn, gx]) => {
+        tx(s, gx + 57, P.y + 50, lab, { "font-size": 10, fill: palette.faint });
+        for (let i = 0; i < 4; i++) {
+          const x = gx + i * (cw + gap);
+          for (let r = 0; r < 4; r++) {
+            const y = P.y + 58 + r * (ch + 2);
+            const c = fn(i, r);
+            if (!c) { bx(s, x, y, cw, ch, { rx: 3, fill: "none", stroke: "rgba(28,27,25,.18)", "stroke-dasharray": "2 2" }); continue; }
+            const col = c.c === SUM ? palette.ink : GC[c.c];
+            bx(s, x, y, cw, ch, { rx: 3, fill: c.c === SUM ? "rgba(28,27,25,.78)" : alpha(col, 0.22), stroke: c.c === SUM ? "none" : alpha(col, 0.6), "stroke-width": 1 });
+            tx(s, x + cw / 2, y + 14, c.t, { "font-size": 9.5, class: "mono", fill: c.c === SUM ? "#fff" : palette.ink });
+          }
+          tx(s, x + cw / 2, P.y + 166, "G" + i, { "font-size": 10, class: "mono", fill: palette.muted });
+        }
+      });
+      ln(s, P.x + 133, P.y + 101, P.x + 149, P.y + 101, { stroke: palette.muted, "marker-end": "url(#arr-coll)" });
+    });
+  })();
+
+  /* ---------------------------------------------------------- fig: ring all-reduce */
+  (function () {
+    const s = document.getElementById("fig-ring");
+    marker(s, "arr-ring", palette.ink);
+    const cx = 150, cy = 150, R = 92, p = 4;
+    const pos = i => { const a = -Math.PI / 2 + i * 2 * Math.PI / p; return [cx + R * Math.cos(a), cy + R * Math.sin(a)]; };
+    for (let i = 0; i < p; i++) {
+      const [x1, y1] = pos(i), [x2, y2] = pos((i + 1) % p);
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      const ox = (mx - cx) * 0.35, oy = (my - cy) * 0.35;
+      const sh = 0.27;
+      const sx1 = x1 + (x2 - x1) * sh, sy1 = y1 + (y2 - y1) * sh, ex = x1 + (x2 - x1) * (1 - sh), ey = y1 + (y2 - y1) * (1 - sh);
+      pth(s, `M${sx1},${sy1} Q ${mx + ox},${my + oy} ${ex},${ey}`, { "stroke-width": 1.6, "marker-end": "url(#arr-ring)" });
+      tx(s, mx + ox * 2.1, my + oy * 2.1 + 4, "S/p", { "font-size": 10.5, class: "mono", fill: palette.muted });
+    }
+    for (let i = 0; i < p; i++) {
+      const [x, y] = pos(i);
+      s.appendChild(svg("circle", { cx: x, cy: y, r: 24, fill: alpha(GC[i], 0.18), stroke: GC[i], "stroke-width": 1.5 }));
+      tx(s, x, y + 4, "G" + i, { "font-size": 13, "font-weight": 600, class: "mono" });
+    }
+    tx(s, cx, 282, "each GPU sends only to its right neighbour", { "font-size": 11, fill: palette.muted });
+    // step table
+    const x0 = 340, y0 = 40, lw = 120, cwid = 100, rh = 32;
+    for (let i = 0; i < p; i++) tx(s, x0 + lw + i * cwid + cwid / 2, y0 - 10, "G" + i + " sends", { "font-size": 11.5, class: "mono", fill: palette.muted });
+    for (let st = 0; st < 2 * (p - 1); st++) {
+      const rs = st < p - 1, k = rs ? st : st - (p - 1);
+      const y = y0 + st * rh;
+      tx(s, x0 + lw - 12, y + 20, (rs ? "reduce-scatter " : "all-gather ") + (k + 1), { "text-anchor": "end", "font-size": 11.5, fill: rs ? palette.gold : palette.green, "font-weight": 600 });
+      for (let i = 0; i < p; i++) {
+        const chunk = rs ? ((i - k) % p + p) % p : ((i + 1 - k) % p + p) % p;
+        bx(s, x0 + lw + i * cwid + 6, y + 3, cwid - 12, rh - 6, { rx: 4, fill: rs ? "rgba(154,123,34,.16)" : "rgba(26,122,82,.14)", stroke: rs ? "rgba(154,123,34,.5)" : "rgba(26,122,82,.5)", "stroke-width": 1 });
+        tx(s, x0 + lw + i * cwid + cwid / 2, y + 20, "chunk " + chunk + (rs ? "  (+=)" : "  (copy)"), { "font-size": 11, class: "mono" });
+      }
+    }
+    tx(s, x0 + lw + 2 * cwid, y0 + 6 * rh + 24, "6 steps × S/4 bytes = 1.5 S sent per GPU  =  2(p−1)/p · S", { "font-size": 12, class: "mono" });
+  })();
+
+  /* ---------------------------------------------------------- widget: ring all-reduce */
+  (function () {
+    const w = widget("w-ring", { title: "All-reduce time: latency-bound vs bandwidth-bound", kicker: "Calculator", note: "Ring model from the formula above. The per-step latency α values are illustrative round numbers. NCCL's tree, NVLS and low-latency protocols beat the ring at small sizes, so treat the left side of the curve as pessimistic and measure with nccl-tests." });
+    const PS = [2, 4, 8, 16, 32, 64];
+    const LINKS = {
+      nvlink: { bw: 450e9, a: 1e-6, l: "NVLink 4 (H100) · ~450 GB/s per direction" },
+      pcie5: { bw: 64e9, a: 2.5e-6, l: "PCIe Gen5 x16 · ~64 GB/s per direction" },
+      ib: { bw: 50e9, a: 5e-6, l: "InfiniBand 400 Gb/s · ~50 GB/s" },
+      eth: { bw: 12.5e9, a: 15e-6, l: "100 GbE · ~12.5 GB/s" }
+    };
+    let link = "nvlink";
+    const pS = slider(w.controls, { label: "GPUs in the ring (p)", min: 0, max: PS.length - 1, step: 1, value: 2, fmt: i => String(PS[i]), onInput: draw });
+    const mS = slider(w.controls, { label: "Message size S", min: 3, max: 9.9, step: 0.1, value: 7.5, fmt: v => fB(10 ** v), onInput: draw });
+    select(w.controls, { label: "Slowest link", options: Object.entries(LINKS).map(([k, v]) => ({ value: k, label: v.l })), value: link, onChange: v => { link = v; draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 300, x: [1e3, 8e9], y: [1e-3, 1e3], logx: true, logy: true, xlabel: "message size S", ylabel: "time", xfmt: tickB, yfmt: tickMs, margin: { l: 62 } });
+    const set = stats(w.body, [{ key: "t", label: "All-reduce time" }, { key: "alg", label: "algbw = S / t" }, { key: "bus", label: "busbw" }, { key: "reg", label: "Regime" }]);
+    const T = (p, S, L) => 2 * (p - 1) / p * S / L.bw + 2 * (p - 1) * L.a;
+    function draw() {
+      const p = PS[pS.value], S = 10 ** mS.value, L = LINKS[link], t = T(p, S, L);
+      P.y = logRange(T(p, 1e3, L) * 1e3 * 0.6, T(p, 8e9, L) * 1e3 * 1.5);
+      P.draw([
+        { fn: x => 2 * (p - 1) * L.a * 1e3, color: palette.gold, dash: "5 4", width: 1.6, label: "latency term 2(p−1)α" },
+        { fn: x => 2 * (p - 1) / p * x / L.bw * 1e3, color: palette.blue, dash: "5 4", width: 1.6, label: "bandwidth term 2(p−1)/p · S/BW" },
+        { fn: x => T(p, x, L) * 1e3, color: palette.brick, width: 2.4, label: "total" },
+        { marker: [S, t * 1e3], color: palette.ink, label: fT(t) }
+      ]);
+      const alg = S / t, bus = alg * 2 * (p - 1) / p;
+      const latShare = 2 * (p - 1) * L.a / t;
+      set("t", fT(t), null, `p = ${p}, S = ${fB(S)}`);
+      set("alg", fmtNum(alg / 1e9, alg / 1e9 < 10 ? 2 : 1) + " GB/s", null, "what the app sees");
+      set("bus", fmtNum(bus / 1e9, bus / 1e9 < 10 ? 2 : 1) + " GB/s", bus > 0.8 * L.bw ? "good" : bus > 0.3 * L.bw ? "warn" : "bad", `link: ${fmtNum(L.bw / 1e9, 0)} GB/s`);
+      set("reg", latShare > 0.5 ? "latency-bound" : "bandwidth-bound", latShare > 0.5 ? "warn" : "good", fmtNum(latShare * 100, 0) + "% of time is fixed latency");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: tensor parallel layer */
+  (function () {
+    const s = document.getElementById("fig-tp");
+    marker(s, "arr-tp", palette.ink);
+    const lanes = [70, 170], H = 60;
+    const COLP = { fill: "rgba(47,93,138,.12)", stroke: "rgba(47,93,138,.55)" };
+    const ROWP = { fill: "rgba(154,123,34,.16)", stroke: "rgba(154,123,34,.6)" };
+    const LOC = { fill: "#fbfaf7", stroke: "rgba(28,27,25,.25)" };
+    const items = [
+      [20, 70, "X", ["full copy", "full copy"], LOC],
+      [108, 108, "QKV (column)", ["heads 0…h/2−1", "heads h/2…h−1"], COLP],
+      [232, 92, "attention", ["own heads + KV", "own heads + KV"], LOC],
+      [340, 92, "W_O (row)", ["partial sum", "partial sum"], ROWP],
+      [510, 108, "gate/up (column)", ["units 0…d_ff/2", "units d_ff/2…"], COLP],
+      [634, 72, "SiLU ⊙", ["local", "local"], LOC],
+      [722, 90, "down (row)", ["partial sum", "partial sum"], ROWP]
+    ];
+    lanes.forEach((y, g) => {
+      tx(s, 10, y - 8, "GPU " + g, { "text-anchor": "start", "font-size": 11, class: "mono", fill: palette.muted });
+      items.forEach(([x, wd, name, subs, sty], k) => {
+        bx(s, x, y, wd, H, Object.assign({ rx: 7 }, sty));
+        tx(s, x + wd / 2, y + 26, name, { "font-size": 12, "font-weight": 600 });
+        tx(s, x + wd / 2, y + 44, subs[g], { "font-size": 10, fill: palette.muted, class: "mono" });
+        const nx = k + 1 < items.length ? items[k + 1][0] : null;
+        if (nx != null && k !== 3) ln(s, x + wd + 2, y + H / 2, nx - 3, y + H / 2, { "marker-end": "url(#arr-tp)" });
+      });
+      ln(s, 434, y + H / 2, 447, y + H / 2, { "marker-end": "url(#arr-tp)" });
+      ln(s, 493, y + H / 2, 507, y + H / 2, { "marker-end": "url(#arr-tp)" });
+      ln(s, 814, y + H / 2, 825, y + H / 2, { "marker-end": "url(#arr-tp)" });
+    });
+    [[450, "all-reduce #1"], [828, "all-reduce #2"]].forEach(([x, lab]) => {
+      bx(s, x, 60, 40, 180, { rx: 6, fill: "rgba(176,67,46,.18)", stroke: "rgba(176,67,46,.65)" });
+      const t = tx(s, x + 20, 150, lab, { "font-size": 11.5, "font-weight": 600, fill: palette.brick, transform: `rotate(-90 ${x + 20} 150)` });
+      t.setAttribute("dy", "4");
+    });
+    pth(s, "M108,44 L108,36 L432,36 L432,44", { stroke: palette.muted });
+    tx(s, 270, 28, "attention block", { "font-size": 11.5, fill: palette.muted });
+    pth(s, "M510,44 L510,36 L812,36 L812,44", { stroke: palette.muted });
+    tx(s, 661, 28, "MLP block", { "font-size": 11.5, fill: palette.muted });
+    tx(s, 440, 270, "column-parallel: each GPU computes different output features (no communication)", { "font-size": 11.5, fill: palette.blue });
+    tx(s, 440, 288, "row-parallel: each GPU computes a partial sum of the full output (needs all-reduce)", { "font-size": 11.5, fill: palette.gold });
+  })();
+
+  /* ---------------------------------------------------------- widget: TP compute vs communication */
+  (function () {
+    const w = widget("w-tp", { title: "Tensor parallelism: compute vs communication per forward step", kicker: "Model", note: "Assumes H100-class GPUs (~600 TFLOP/s achieved bf16, ~2.7 TB/s achieved HBM, 80 GB), bf16 weights and activations, ring all-reduce with no compute/communication overlap, and illustrative per-step latencies (NVLink 1 µs, PCIe 2.5–3 µs, InfiniBand 5 µs). Compute time is the roofline max of FLOPs and weight reads; KV-cache reads are ignored. TP=16 means two 8-GPU nodes, so the ring crosses the network." });
+    const MODELS = {
+      l8: { l: "Llama-3.1-8B · d 4096 · 32 layers", N: 8.0e9, d: 4096, L: 32, h: 32, kv: 8 },
+      q32: { l: "Qwen2.5-32B · d 5120 · 64 layers", N: 32.8e9, d: 5120, L: 64, h: 40, kv: 8 },
+      l70: { l: "Llama-3.1-70B · d 8192 · 80 layers", N: 70.6e9, d: 8192, L: 80, h: 64, kv: 8 },
+      l405: { l: "Llama-3.1-405B · d 16384 · 126 layers", N: 405e9, d: 16384, L: 126, h: 128, kv: 8 }
+    };
+    const LINKS = {
+      nvlink: { bw: 450e9, a: 1e-6, l: "NVLink (~900 GB/s bidirectional, ~450 per direction)" },
+      pcie5: { bw: 64e9, a: 2.5e-6, l: "PCIe Gen5 x16 (~64 GB/s per direction)" },
+      pcie4: { bw: 32e9, a: 3e-6, l: "PCIe Gen4 x16 (~32 GB/s per direction)" },
+      ib: { bw: 50e9, a: 5e-6, l: "Across nodes: InfiniBand 400 Gb/s (~50 GB/s)" }
+    };
+    let mk = "l70", tp = 8, link = "nvlink";
+    select(w.controls, { label: "Model", options: Object.entries(MODELS).map(([k, v]) => ({ value: k, label: v.l })), value: mk, onChange: v => { mk = v; draw(); } });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "TP degree" })));
+    seg(c1, { options: [1, 2, 4, 8, 16].map(v => ({ value: v, label: String(v) })), value: tp, onChange: v => { tp = v; draw(); } });
+    w.controls.appendChild(c1);
+    const tS = slider(w.controls, { label: "Tokens per step (T)", min: 0, max: 14, step: 1, value: 0, fmt: v => String(2 ** v) + (v === 0 ? " (one decode token)" : ""), onInput: draw });
+    select(w.controls, { label: "Link between TP ranks", options: Object.entries(LINKS).map(([k, v]) => ({ value: k, label: v.l })), value: link, onChange: v => { link = v; draw(); } });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [1, 16384], y: [0.01, 1e4], logx: true, logy: true, xlabel: "tokens per forward step (T)", ylabel: "time per step", xfmt: tickN, yfmt: tickMs, margin: { l: 62 } });
+    const set = stats(w.body, [{ key: "comp", label: "Compute / weight reads" }, { key: "comm", label: "TP communication" }, { key: "eff", label: "Efficiency" }, { key: "spd", label: "Speedup vs 1 GPU" }, { key: "mem", label: "Weights per GPU" }]);
+    const msg = el("p", { class: "small", style: { margin: "10px 0 0" } }); w.body.appendChild(msg);
+    function effLink(t) {
+      if (t > 8 && link !== "ib") return { L: LINKS.ib, cross: true };
+      return { L: LINKS[link], cross: link === "ib" };
+    }
+    const comp = (M, t, T) => Math.max(2 * M.N * T / (t * GPU.F), M.N * 2 / (t * GPU.HBM));
+    const comm = (M, t, T, L) => t === 1 ? 0 : 2 * M.L * (2 * (t - 1) / t * T * M.d * 2 / L.bw + 2 * (t - 1) * L.a);
+    function draw() {
+      const M = MODELS[mk], T = 2 ** tS.value, { L, cross } = effLink(tp);
+      const c = comp(M, tp, T), m = comm(M, tp, T, L), tot = c + m;
+      const c1v = comp(M, 1, T);
+      const lo = Math.min(comp(M, tp, 1), tp > 1 ? comm(M, tp, 1, L) : Infinity), hi = Math.max(comp(M, tp, 16384), comm(M, tp, 16384, L));
+      P.y = logRange(lo * 1e3 * 0.7, hi * 1e3 * 1.3);
+      const layers = [{ fn: x => comp(M, tp, x) * 1e3, color: palette.green, width: 2.2, label: "compute / weight reads per GPU" }];
+      if (tp > 1) layers.push({ fn: x => comm(M, tp, x, L) * 1e3, color: palette.brick, width: 2.2, label: "all-reduce time (2 per layer)" });
+      layers.push({ fn: x => (comp(M, tp, x) + comm(M, tp, x, L)) * 1e3, color: palette.ink, width: 1.4, dash: "4 3", label: "total" });
+      layers.push({ marker: [T, tot * 1e3], color: palette.ink, label: fT(tot) });
+      P.draw(layers);
+      const eff = c / tot;
+      const wpg = M.N * 2 / tp;
+      set("comp", fT(c), null, 2 * M.N * T / (tp * GPU.F) > M.N * 2 / (tp * GPU.HBM) ? "compute-bound" : "bandwidth-bound (weight reads)");
+      set("comm", tp === 1 ? "none" : fT(m), tp === 1 ? "good" : m / c > 0.5 ? "bad" : m / c > 0.2 ? "warn" : "good", tp === 1 ? "single GPU" : `${2 * M.L} all-reduces of ${fB(T * M.d * 2)}`);
+      set("eff", fmtNum(eff * 100, 0) + "%", eff > 0.8 ? "good" : eff > 0.55 ? "warn" : "bad", "compute ÷ (compute + comm)");
+      set("spd", fmtNum(c1v / tot, 2) + "×", c1v / tot > tp * 0.7 ? "good" : c1v / tot > tp * 0.4 ? "warn" : "bad", `ideal ${tp}×` + (M.N * 2 > GPU.mem * 0.9 ? " (TP=1 wouldn't fit)" : ""));
+      set("mem", fB(wpg), wpg < GPU.mem * 0.6 ? "good" : wpg < GPU.mem * 0.9 ? "warn" : "bad", wpg < GPU.mem * 0.9 ? `of 80 GB; rest is KV room` : "doesn't fit in 80 GB");
+      const notes = [];
+      if (cross) notes.push(`<b style="color:${palette.brick}">Ring crosses the network.</b> Each all-reduce now runs at ~50 GB/s per GPU with higher latency, about 9× less bandwidth than NVLink.`);
+      if (M.h % tp) notes.push(`<b style="color:${palette.brick}">${M.h} query heads don't divide by TP=${tp}.</b> Engines will refuse this layout.`);
+      if (tp > M.kv) notes.push(`<b style="color:${palette.gold}">TP=${tp} exceeds the ${M.kv} KV heads.</b> KV heads get replicated, so KV memory per GPU stops shrinking.`);
+      if ((link === "pcie5" || link === "pcie4") && tp >= 4) notes.push(`Over PCIe the all-reduce bandwidth is a fraction of NVLink's; compare against more replicas at TP=2, or pipeline parallelism, before choosing this.`);
+      if (!notes.length) notes.push(tp === 1 ? "One GPU: no communication. Raise TP to see what splitting costs." : "Try T = 1 (decode) versus T = 4096 (prefill): decode is latency-bound, prefill bandwidth-bound.");
+      msg.innerHTML = notes.join(" ");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: pipeline timeline */
+  (function () {
+    const s = document.getElementById("fig-pp");
+    const p = 4, slots = 12, x0 = 92, sw = (860 - x0) / slots, rh = 22;
+    const MB = ["A", "B", "C", "D"];
+    function panel(y0, m, title) {
+      tx(s, 10, y0 - 12, title, { "text-anchor": "start", "font-size": 12.5, "font-weight": 600 });
+      for (let st = 0; st < p; st++) {
+        const y = y0 + st * (rh + 3);
+        tx(s, x0 - 10, y + 15, "stage " + st, { "text-anchor": "end", "font-size": 11, class: "mono", fill: palette.muted });
+        for (let t = 0; t < slots; t++) {
+          const x = x0 + t * sw;
+          let mb = -1, tok = 0;
+          if (t >= st) {
+            const k = t - st;
+            if (m === 1) { if (k % p === 0) { mb = 0; tok = k / p + 1; } }
+            else { mb = k % p; tok = Math.floor(k / p) + 1; if (mb >= m) mb = -1; }
+          }
+          if (mb < 0) { bx(s, x + 1, y, sw - 2, rh, { rx: 3, fill: "rgba(176,67,46,.10)", stroke: "none" }); continue; }
+          bx(s, x + 1, y, sw - 2, rh, { rx: 3, fill: alpha(GC[mb], 0.3), stroke: alpha(GC[mb], 0.7), "stroke-width": 1 });
+          tx(s, x + sw / 2, y + 15, MB[mb] + tok, { "font-size": 10.5, class: "mono" });
+        }
+      }
+    }
+    panel(34, 1, "1 micro-batch: utilization 25%, each stage idle 3 of every 4 slots");
+    panel(176, 4, "4 micro-batches: utilization ~100% once full; per-token latency unchanged");
+    for (let t = 0; t <= slots; t += 2) tx(s, x0 + t * sw, 296, "t" + t, { "font-size": 10, class: "mono", fill: palette.faint });
+    tx(s, 10, 296, "time slots →", { "text-anchor": "start", "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- fig: MoE dispatch/combine */
+  (function () {
+    const s = document.getElementById("fig-moe");
+    marker(s, "arr-moe", palette.muted);
+    const ys = [48, 118, 188, 258], bh = 54;
+    const L = 30, Mx = 360, Rx = 700, bw = 150;
+    // destination GPU of each token, per source GPU (GPU 1 is hot)
+    const toks = [[1, 0, 1, 2, 1, 3], [1, 1, 0, 1, 2, 1], [3, 1, 2, 1, 0, 1], [1, 2, 3, 1, 1, 0]];
+    tx(s, L + bw / 2, 22, "tokens after attention + router", { "font-size": 11.5, "font-weight": 600 });
+    tx(s, Mx + bw / 2, 22, "experts (grouped GEMM)", { "font-size": 11.5, "font-weight": 600 });
+    tx(s, Rx + bw / 2, 22, "outputs, weighted sum", { "font-size": 11.5, "font-weight": 600 });
+    tx(s, (L + bw + Mx) / 2, 36, "all-to-all: dispatch", { "font-size": 11, fill: palette.brick, class: "mono" });
+    tx(s, (Mx + bw + Rx) / 2, 36, "all-to-all: combine", { "font-size": 11, fill: palette.muted, class: "mono" });
+    const recv = [0, 0, 0, 0];
+    toks.forEach(r => r.forEach(d => recv[d]++));
+    // lines first
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+      const n = toks[i].filter(d => d === j).length;
+      if (!n) continue;
+      const y1 = ys[i] + bh / 2 + (j - 1.5) * 6, y2 = ys[j] + bh / 2 + (i - 1.5) * 6;
+      pth(s, `M${L + bw},${y1} C ${L + bw + 90},${y1} ${Mx - 90},${y2} ${Mx},${y2}`, { stroke: alpha(GC[j], 0.75), "stroke-width": 1 + n * 1.3 });
+      pth(s, `M${Mx + bw},${y2} C ${Mx + bw + 90},${y2} ${Rx - 90},${y1} ${Rx},${y1}`, { stroke: alpha(GC[j], 0.5), "stroke-width": 1 + n * 0.9, "stroke-dasharray": "4 3" });
+    }
+    for (let g = 0; g < 4; g++) {
+      bx(s, L, ys[g], bw, bh, { rx: 8, fill: "#fbfaf7" });
+      tx(s, L + 10, ys[g] + 16, "GPU " + g, { "text-anchor": "start", "font-size": 11, class: "mono", fill: palette.muted });
+      toks[g].forEach((d, k) => bx(s, L + 12 + k * 22, ys[g] + 24, 16, 16, { rx: 3, fill: alpha(GC[d], 0.55), stroke: GC[d], "stroke-width": 1 }));
+      const hot = recv[g] === Math.max(...recv);
+      bx(s, Mx, ys[g], bw, bh, { rx: 8, fill: hot ? "rgba(176,67,46,.10)" : "#fbfaf7", stroke: hot ? "rgba(176,67,46,.6)" : "rgba(28,27,25,.25)" });
+      tx(s, Mx + bw / 2, ys[g] + 22, `GPU ${g}: E${2 * g}, E${2 * g + 1}`, { "font-size": 12, "font-weight": 600 });
+      tx(s, Mx + bw / 2, ys[g] + 40, recv[g] + " tokens in" + (hot ? " (hot)" : ""), { "font-size": 11, class: "mono", fill: hot ? palette.brick : palette.muted });
+      bx(s, Rx, ys[g], bw, bh, { rx: 8, fill: "#fbfaf7" });
+      tx(s, Rx + bw / 2, ys[g] + 32, "GPU " + g + ": Σ gᵢ · Eᵢ(x)", { "font-size": 11.5, class: "mono" });
+    }
+  })();
+
+  /* ---------------------------------------------------------- widget: MoE load */
+  (function () {
+    const w = widget("w-moe", { title: "Expert parallelism: where do the tokens land?", kicker: "Simulation", note: "Each token picks top-k distinct experts, sampled in proportion to a Zipf-shaped popularity (skew 0 = uniform, higher = a few hot experts). Hot experts are scattered randomly over GPUs, which own contiguous blocks of E/EP experts. Real routers are deterministic functions of the token, but the load statistics look like this. Seeded, so the same settings give the same picture." });
+    const ES = [8, 16, 32, 64, 128, 256], EPS = [1, 2, 4, 8, 16, 32, 64];
+    const eS = slider(w.controls, { label: "Experts (E)", min: 0, max: ES.length - 1, step: 1, value: 3, fmt: i => String(ES[i]), onInput: draw });
+    const kS = slider(w.controls, { label: "Top-k", min: 1, max: 8, step: 1, value: 2, onInput: draw });
+    const pS = slider(w.controls, { label: "EP degree (GPUs)", min: 0, max: EPS.length - 1, step: 1, value: 3, fmt: i => String(EPS[i]), onInput: draw });
+    const tS = slider(w.controls, { label: "Tokens per step", min: 4, max: 14, step: 1, value: 12, fmt: v => String(2 ** v), onInput: draw });
+    const sS = slider(w.controls, { label: "Routing skew", min: 0, max: 1.5, step: 0.05, value: 0.6, fmt: v => v.toFixed(2), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const B = bars(wrap, { width: 760, height: 220 });
+    const strip = svg("svg", { viewBox: "0 0 760 56" });
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "8px" } }, strip); w.body.appendChild(wrap2);
+    const set = stats(w.body, [{ key: "imb", label: "GPU imbalance max/mean" }, { key: "hot", label: "Hottest expert ÷ mean" }, { key: "drop", label: "Over capacity at c_f = 1.25" }, { key: "net", label: "Assignments leaving their GPU" }]);
+    function simulate(E, k, T, skew, seed) {
+      const R = rng(seed);
+      const perm = Array.from({ length: E }, (_, i) => i);
+      for (let i = E - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)); const t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+      const wgt = new Array(E);
+      for (let r = 0; r < E; r++) wgt[perm[r]] = 1 / Math.pow(r + 1, skew);
+      const tot = wgt.reduce((a, b) => a + b, 0);
+      const cdf = []; let c = 0;
+      for (let e = 0; e < E; e++) { c += wgt[e] / tot; cdf.push(c); }
+      cdf[E - 1] = 1;
+      const load = new Array(E).fill(0), chosen = new Int32Array(E).fill(-1);
+      const pick = () => { const u = R(); let lo = 0, hi = E - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (cdf[m] < u) lo = m + 1; else hi = m; } return lo; };
+      for (let t = 0; t < T; t++) {
+        let got = 0, tries = 0;
+        while (got < k && tries < 200) { const e = pick(); tries++; if (chosen[e] !== t) { chosen[e] = t; load[e]++; got++; } }
+        for (let e = 0; e < E && got < k; e++) if (chosen[e] !== t) { chosen[e] = t; load[e]++; got++; }
+      }
+      return load;
+    }
+    function draw() {
+      const E = ES[eS.value], k = Math.min(kS.value, E), T = 2 ** tS.value, skew = sS.value;
+      let EP = EPS[pS.value];
+      if (EP > E) EP = E;
+      const load = simulate(E, k, T, skew, 1234 + E);
+      const per = E / EP;
+      const g = Array.from({ length: EP }, (_, i) => load.slice(i * per, (i + 1) * per).reduce((a, b) => a + b, 0));
+      const mean = T * k / EP, mx = Math.max(...g), imax = g.indexOf(mx);
+      B.draw(g.map((_, i) => "G" + i), g, { colors: g.map((v, i) => i === imax ? palette.brick : v > mean * 1.15 ? palette.gold : palette.green), fmt: v => fmtNum(v, 0), max: Math.max(mx, mean * 1.5) });
+      // expert strip
+      while (strip.firstChild) strip.removeChild(strip.firstChild);
+      const cw = 740 / E, lmax = Math.max(...load);
+      for (let e = 0; e < E; e++) strip.appendChild(svg("rect", { x: 10 + e * cw, y: 8, width: Math.max(cw - (E > 64 ? 0 : 1), 0.5), height: 22, fill: heat(load[e] / lmax, "brick") }));
+      for (let i = 1; i < EP; i++) strip.appendChild(svg("line", { x1: 10 + i * per * cw, x2: 10 + i * per * cw, y1: 4, y2: 34, stroke: palette.ink, "stroke-width": 1.2 }));
+      strip.appendChild(svg("text", { x: 10, y: 48, "font-size": 11, fill: palette.muted, text: `per-expert load, ${E} experts (darker = hotter); vertical lines separate GPUs (${per} expert${per > 1 ? "s" : ""} each)` }));
+      const meanE = T * k / E, hot = Math.max(...load) / meanE;
+      const Cap = Math.ceil(1.25 * meanE), over = load.reduce((a, v) => a + Math.max(0, v - Cap), 0);
+      set("imb", fmtNum(mx / mean, 2) + "×", mx / mean < 1.15 ? "good" : mx / mean < 1.5 ? "warn" : "bad", `mean ${fmtNum(mean, 0)}, max ${fmtNum(mx, 0)} on G${imax}`);
+      set("hot", fmtNum(hot, 2) + "×", hot < 1.25 ? "good" : hot < 2 ? "warn" : "bad", "capacity factor needed to fit it");
+      set("drop", fmtNum(100 * over / (T * k), 1) + "%", over === 0 ? "good" : over / (T * k) < 0.05 ? "warn" : "bad", `of ${fmtNum(T * k, 0)} assignments; C = ${Cap}`);
+      set("net", fmtNum(100 * (1 - 1 / EP), 0) + "%", null, EP === 1 ? "all local" : "tokens spread evenly over GPUs");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: layout chooser */
+  (function () {
+    const w = widget("w-layout", { title: "Pick a layout: TP × PP × DP", kicker: "Planner", note: "A rule-of-thumb planner, not an engine. Usable memory per GPU = 90% minus ~2 GB of overhead. Instance sizes are rounded up to powers of two. Real planners also check that heads divide by TP, how many KV heads there are, activation memory at your max batch, and measured latency." });
+    const SIZES = [1, 3, 8, 14, 32, 70, 123, 235, 405, 671, 1000];
+    let bits = 16, gmem = 80, gpn = 8, intra = "nvlink", policy = "keep";
+    const nS = slider(w.controls, { label: "Parameters", min: 0, max: SIZES.length - 1, step: 1, value: 5, fmt: i => SIZES[i] + "B", onInput: draw });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Weight precision" })));
+    seg(c1, { options: [{ value: 16, label: "bf16" }, { value: 8, label: "fp8" }, { value: 4.5, label: "int4 (~4.5)" }], value: 16, onChange: v => { bits = v; draw(); } });
+    w.controls.appendChild(c1);
+    const kvS = slider(w.controls, { label: "KV budget per instance", min: 0, max: 800, step: 10, value: 80, fmt: v => v + " GB", onInput: draw });
+    select(w.controls, { label: "GPU memory", options: [{ value: 24, label: "24 GB (L4 / RTX 4090 class)" }, { value: 48, label: "48 GB (L40S class)" }, { value: 80, label: "80 GB (A100 / H100)" }, { value: 141, label: "141 GB (H200)" }, { value: 192, label: "~180–192 GB (B200 / MI300X class)" }], value: "80", onChange: v => { gmem = +v; draw(); } });
+    const c2 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "GPUs per node" })));
+    seg(c2, { options: [1, 2, 4, 8].map(v => ({ value: v, label: String(v) })), value: 8, onChange: v => { gpn = v; draw(); } });
+    w.controls.appendChild(c2);
+    select(w.controls, { label: "Link inside a node", options: [{ value: "nvlink", label: "NVLink / NVSwitch" }, { value: "pcie", label: "PCIe only" }], value: "nvlink", onChange: v => { intra = v; draw(); } });
+    const gS = slider(w.controls, { label: "GPUs available", min: 1, max: 64, step: 1, value: 16, onInput: draw });
+    const c3 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "When one node isn't enough" })));
+    seg(c3, { options: [{ value: "keep", label: "PP across nodes" }, { value: "force", label: "stretch TP across nodes" }], value: "keep", onChange: v => { policy = v; draw(); } });
+    w.controls.appendChild(c3);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const pic = svg("svg", { viewBox: "0 0 760 200" }); wrap.appendChild(pic);
+    const set = stats(w.body, [{ key: "need", label: "Memory per instance" }, { key: "min", label: "Min GPUs (TP-only)" }, { key: "lay", label: "Suggested instance" }, { key: "dp", label: "DP replicas" }, { key: "kv", label: "KV room per instance" }]);
+    const msg = el("p", { class: "small", style: { margin: "10px 0 0" } }); w.body.appendChild(msg);
+    const pow2 = n => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
+    function draw() {
+      const N = SIZES[nS.value] * 1e9, Wb = N * bits / 8, KV = kvS.value * 1e9, G = gS.value;
+      const usable = gmem * 1e9 * 0.9 - 2e9;
+      const shards = pow2(Math.ceil((Wb + KV) / usable));
+      const maxTP = intra === "nvlink" ? gpn : Math.min(2, gpn);
+      let TP, PP, crosses = false;
+      if (shards <= maxTP) { TP = shards; PP = 1; }
+      else if (shards <= gpn) { TP = maxTP; PP = shards / maxTP; }
+      else if (policy === "force") { TP = shards; PP = 1; crosses = true; }
+      else { TP = maxTP; PP = Math.ceil(shards / TP); }
+      const inst = TP * PP, DP = Math.floor(G / inst);
+      const room = inst * usable - Wb;
+      set("need", fB(Wb + KV), null, `${fB(Wb)} weights + ${fB(KV)} KV`);
+      set("min", String(shards), null, `at ${fB(usable)} usable per GPU`);
+      set("lay", `TP${TP} × PP${PP}`, crosses ? "bad" : PP > 1 ? "warn" : "good", `${inst} GPU${inst > 1 ? "s" : ""} per instance`);
+      set("dp", String(DP), DP >= 1 ? "good" : "bad", DP >= 1 ? `${DP * inst} of ${G} GPUs used` : `need ${inst} GPUs, have ${G}`);
+      set("kv", fB(room), room >= KV ? "good" : "warn", room >= KV ? "≥ budget (rounding gives extra)" : "below budget");
+      // picture
+      while (pic.firstChild) pic.removeChild(pic.firstChild);
+      const cell = G > 32 ? 16 : 22, gapc = 3, nodeW = gpn * (cell + gapc) + 10, perRow = Math.max(1, Math.floor(740 / (nodeW + 8)));
+      const nodes = Math.ceil(G / gpn), rowsN = Math.ceil(nodes / perRow), rowH = cell + 30;
+      pic.setAttribute("viewBox", `0 0 760 ${Math.max(70, rowsN * rowH + 30)}`);
+      for (let nd = 0; nd < nodes; nd++) {
+        const nx = 10 + (nd % perRow) * (nodeW + 8), ny = 8 + Math.floor(nd / perRow) * rowH;
+        pic.appendChild(svg("rect", { x: nx, y: ny, width: nodeW, height: cell + 12, rx: 6, fill: "#fbfaf7", stroke: "rgba(28,27,25,.2)" }));
+        pic.appendChild(svg("text", { x: nx + 4, y: ny + cell + 24, "font-size": 9.5, class: "mono", fill: palette.faint, text: "node " + nd }));
+        for (let k = 0; k < gpn; k++) {
+          const gi = nd * gpn + k; if (gi >= G) break;
+          const r = Math.floor(gi / inst), used = r < DP, local = gi % inst, stage = Math.floor(local / TP);
+          const c = used ? C.series[r % C.series.length] : palette.faint;
+          pic.appendChild(svg("rect", { x: nx + 5 + k * (cell + gapc), y: ny + 6, width: cell, height: cell, rx: 3, fill: used ? alpha(c, stage % 2 ? 0.35 : 0.7) : "rgba(28,27,25,.06)", stroke: used ? c : "rgba(28,27,25,.15)", "stroke-width": 1 }));
+          if (used && PP > 1 && cell >= 20) pic.appendChild(svg("text", { x: nx + 5 + k * (cell + gapc) + cell / 2, y: ny + 6 + cell / 2 + 4, "text-anchor": "middle", "font-size": 9, class: "mono", fill: palette.ink, text: "s" + stage }));
+        }
+      }
+      const yl = Math.max(70, rowsN * rowH + 30) - 6;
+      pic.appendChild(svg("text", { x: 10, y: yl, "font-size": 10.5, fill: palette.muted, text: "colour = DP replica · s# = pipeline stage · grey = unused" }));
+      const notes = [];
+      if (crosses) notes.push(`<b style="color:${palette.brick}">TP=${TP} spans ${TP / gpn} nodes.</b> Every layer's two all-reduces now cross the network (~50 GB/s per GPU instead of ~450 on NVLink). Expect a large slowdown; PP across nodes usually wins.`);
+      if (intra === "pcie" && shards > 2) notes.push("No NVLink: TP is capped at 2 and the rest becomes pipeline stages, because PCIe all-reduces are expensive.");
+      if (DP < 1) notes.push(`<b style="color:${palette.brick}">Not enough GPUs</b> for one instance. Quantize, shrink the KV budget, or add GPUs.`);
+      if (PP > 1 && !crosses && shards > gpn) notes.push(`Instance spans ${Math.ceil(inst / gpn)} nodes: TP inside each node, ${PP} pipeline stages across them. Needs ≥ ${PP} micro-batches in flight to keep stages busy.`);
+      if (!notes.length) notes.push(inst === 1 ? "Fits on one GPU: serve as independent replicas." : `Fits inside one node with TP=${TP}. Leftover GPUs become replicas.`);
+      msg.innerHTML = notes.join(" ");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: disaggregation */
+  (function () {
+    const s = document.getElementById("fig-disagg");
+    marker(s, "arr-dis", palette.ink);
+    bx(s, 20, 42, 100, 48, { rx: 8, fill: "#fbfaf7" }); tx(s, 70, 70, "requests", { "font-size": 12, "font-weight": 600 });
+    bx(s, 150, 42, 110, 48, { rx: 8, fill: "#fbfaf7" }); tx(s, 205, 63, "router", { "font-size": 12, "font-weight": 600 }); tx(s, 205, 79, "picks P and D", { "font-size": 10, fill: palette.muted });
+    ln(s, 120, 66, 147, 66, { "marker-end": "url(#arr-dis)" });
+    bx(s, 290, 16, 210, 100, { rx: 10, fill: "rgba(154,123,34,.08)", stroke: "rgba(154,123,34,.55)" });
+    tx(s, 395, 34, "prefill pool", { "font-size": 12.5, "font-weight": 600 });
+    for (let i = 0; i < 4; i++) bx(s, 306 + i * 46, 44, 38, 30, { rx: 4, fill: "rgba(154,123,34,.25)", stroke: "rgba(154,123,34,.6)" });
+    tx(s, 395, 94, "compute-bound · TP for fast TTFT", { "font-size": 10.5, fill: palette.muted });
+    tx(s, 395, 108, "little KV memory needed", { "font-size": 10.5, fill: palette.muted });
+    ln(s, 260, 66, 287, 66, { "marker-end": "url(#arr-dis)" });
+    bx(s, 600, 16, 260, 100, { rx: 10, fill: "rgba(47,93,138,.07)", stroke: "rgba(47,93,138,.5)" });
+    tx(s, 730, 34, "decode pool", { "font-size": 12.5, "font-weight": 600 });
+    for (let i = 0; i < 8; i++) bx(s, 612 + i * 30, 44, 24, 30, { rx: 4, fill: "rgba(47,93,138,.22)", stroke: "rgba(47,93,138,.55)" });
+    tx(s, 730, 94, "bandwidth-bound · big batches", { "font-size": 10.5, fill: palette.muted });
+    tx(s, 730, 108, "most of the KV memory", { "font-size": 10.5, fill: palette.muted });
+    ln(s, 502, 60, 597, 60, { "stroke-width": 2.5, stroke: palette.brick, "marker-end": "url(#arr-dis)" });
+    tx(s, 550, 52, "KV cache", { "font-size": 11, fill: palette.brick, "font-weight": 600 });
+    tx(s, 550, 76, "RDMA / NVLink", { "font-size": 10, fill: palette.brick, class: "mono" });
+    ln(s, 730, 116, 730, 140, { "marker-end": "url(#arr-dis)" });
+    tx(s, 730, 154, "tokens streamed to the user", { "font-size": 10.5, fill: palette.muted });
+    // timelines
+    const x0 = 160, x1 = 860, y0 = 190, rh = 26;
+    const rows = [["colocated GPU", "co"], ["decode pool", "d"], ["prefill pool", "p"]];
+    rows.forEach(([lab, kind], r) => {
+      const y = y0 + r * (rh + 12);
+      tx(s, x0 - 10, y + 17, lab, { "text-anchor": "end", "font-size": 11.5, class: "mono", fill: palette.muted });
+      ln(s, x0, y + rh + 3, x1, y + rh + 3, { stroke: "rgba(28,27,25,.12)", "stroke-width": 1 });
+      if (kind === "co") {
+        let x = x0;
+        for (let i = 0; i < 6; i++) { bx(s, x, y, 26, rh, { rx: 3, fill: "rgba(47,93,138,.3)", stroke: "none" }); x += 30; }
+        bx(s, x, y, 240, rh, { rx: 3, fill: "rgba(154,123,34,.35)", stroke: "none" }); tx(s, x + 120, y + 17, "long prefill: decode stalls", { "font-size": 10.5 });
+        x += 244;
+        for (let i = 0; i < 9; i++) { bx(s, x, y, 26, rh, { rx: 3, fill: "rgba(47,93,138,.3)", stroke: "none" }); x += 30; }
+      } else if (kind === "d") {
+        for (let x = x0; x + 26 <= x1; x += 30) bx(s, x, y, 26, rh, { rx: 3, fill: "rgba(47,93,138,.3)", stroke: "none" });
+      } else {
+        [[x0 + 20, 240], [x0 + 270, 150], [x0 + 430, 260]].forEach(([x, wd]) => bx(s, x, y, wd, rh, { rx: 3, fill: "rgba(154,123,34,.35)", stroke: "none" }));
+      }
+    });
+    tx(s, x0, 316, "blue = one decode step for the running batch · gold = a prefill", { "text-anchor": "start", "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- models shared by the KV widgets */
+  const KVM = {
+    l8: { l: "Llama-3.1-8B · 128 KB/token", N: 8e9, L: 32, da: 4096, kv: 131072 },
+    l70: { l: "Llama-3.1-70B · 320 KB/token", N: 70.6e9, L: 80, da: 8192, kv: 327680 },
+    ds3: { l: "DeepSeek-V3 (MLA, ~37B active) · ~69 KB/token", N: 37e9, L: 61, da: 20480, kv: 70272 },
+    mha7: { l: "7B with full MHA, no GQA · 512 KB/token", N: 6.7e9, L: 32, da: 4096, kv: 524288 }
+  };
+  const prefillFlops = (M, P) => 2 * M.N * P + 2 * M.L * M.da * P * P;
+
+  /* ---------------------------------------------------------- widget: KV transfer in disaggregation */
+  (function () {
+    const w = widget("w-disagg", { title: "Is the KV transfer hidden behind prefill?", kicker: "Calculator", note: "Prefill FLOPs = 2·N·P + 2·L·d<sub>attn</sub>·P² (causal attention). Link bandwidths are ideal per-direction figures; real RDMA reaches most of them, TCP much less. \"Layer-streamed\" assumes each layer's KV is sent as soon as it's computed, so only the part that outlasts prefill, plus one layer's worth, shows up in TTFT. DeepSeek-V3's attention width is approximated." });
+    const LK = {
+      nvlink: { bw: 450e9, l: "NVLink, same node · ~450 GB/s" },
+      ib8: { bw: 400e9, l: "8 × 400 Gb/s NICs in parallel (KV sharded over TP=8) · ~400 GB/s" },
+      ib: { bw: 50e9, l: "One InfiniBand 400 Gb/s NIC · ~50 GB/s" },
+      eth: { bw: 12.5e9, l: "100 GbE · ~12.5 GB/s" },
+      eth25: { bw: 3.1e9, l: "25 GbE · ~3 GB/s" }
+    };
+    let mk = "l70", lk = "ib";
+    select(w.controls, { label: "Model", options: Object.entries(KVM).map(([k, v]) => ({ value: k, label: v.l })), value: mk, onChange: v => { mk = v; draw(); } });
+    select(w.controls, { label: "Link prefill → decode", options: Object.entries(LK).map(([k, v]) => ({ value: k, label: v.l })), value: lk, onChange: v => { lk = v; draw(); } });
+    const pS = slider(w.controls, { label: "Prompt length", min: 7, max: 17, step: 0.5, value: 13, fmt: v => fmtNum(Math.round(2 ** v), 0) + " tokens", onInput: draw });
+    const fS = slider(w.controls, { label: "Prefill instance compute", min: 100, max: 4000, step: 50, value: 1600, fmt: v => v + " TFLOP/s", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 280, x: [128, 131072], y: [0.01, 1e5], logx: true, logy: true, xlabel: "prompt length (tokens)", ylabel: "time", xfmt: tickN, yfmt: tickMs, margin: { l: 62 } });
+    const set = stats(w.body, [{ key: "kv", label: "KV to move" }, { key: "x", label: "Transfer time" }, { key: "p", label: "Prefill time" }, { key: "bulk", label: "Added TTFT, bulk copy" }, { key: "str", label: "Added TTFT, layer-streamed" }]);
+    function draw() {
+      const M = KVM[mk], BW = LK[lk].bw, F = fS.value * 1e12, Pn = Math.round(2 ** pS.value);
+      const xf = p => p * M.kv / BW, pf = p => prefillFlops(M, p) / F;
+      const x = xf(Pn), pr = pf(Pn);
+      const streamed = Math.max(0, x - pr) + x / M.L;
+      P.y = logRange(Math.min(xf(128), pf(128)) * 1e3 * 0.7, Math.max(xf(131072), pf(131072)) * 1e3 * 1.3);
+      P.draw([
+        { fn: p => pf(p) * 1e3, color: palette.gold, width: 2.2, label: "prefill time" },
+        { fn: p => xf(p) * 1e3, color: palette.brick, width: 2.2, label: "KV transfer time" },
+        { vline: Pn, color: palette.muted, dash: "3 3" },
+        { marker: [Pn, x * 1e3], color: palette.brick, label: fT(x) },
+        { marker: [Pn, pr * 1e3], color: palette.gold, label: fT(pr) }
+      ]);
+      set("kv", fB(Pn * M.kv), null, `${fmtNum(Pn, 0)} × ${fB(M.kv)}`);
+      set("x", fT(x), null, fmtNum(100 * x / pr, 0) + "% of prefill time");
+      set("p", fT(pr), null, "at " + fS.value + " TFLOP/s achieved");
+      set("bulk", fT(x), x < 0.05 * pr ? "good" : x < 0.25 * pr ? "warn" : "bad", "copy starts after prefill ends");
+      set("str", fT(streamed), streamed < 0.05 * pr ? "good" : streamed < 0.25 * pr ? "warn" : "bad", x <= pr ? "hidden behind compute" : "link is the bottleneck");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: storage tiers */
+  (function () {
+    const s = document.getElementById("fig-tiers");
+    marker(s, "arr-tier", palette.muted);
+    const tiers = [
+      ["GPU HBM", "80–192 GB per GPU", "~3–8 TB/s", 0.85],
+      ["CPU DRAM", "0.5–2 TB per node", "~50 GB/s per GPU (PCIe Gen5 x16)", 0.6],
+      ["local NVMe", "several to tens of TB per node", "~7–14 GB/s per drive", 0.38],
+      ["remote / pooled store", "shared across the cluster", "NIC-bound: ~12 GB/s (100 GbE) to ~50 GB/s (400 Gb/s)", 0.2]
+    ];
+    const cx = 440, y0 = 22, h = 46;
+    tiers.forEach(([name, cap, bw, op], i) => {
+      const wd = 260 + i * 120, x = cx - wd / 2, y = y0 + i * (h + 10);
+      bx(s, x, y, wd, h, { rx: 8, fill: alpha(palette.green, op * 0.35), stroke: alpha(palette.green, 0.6) });
+      tx(s, cx, y + 19, name, { "font-size": 12.5, "font-weight": 600 });
+      tx(s, cx, y + 36, cap + "  ·  " + bw, { "font-size": 10.5, fill: palette.ink, class: "mono" });
+    });
+    ln(s, 70, 30, 70, 236, { stroke: palette.muted, "marker-end": "url(#arr-tier)" });
+    tx(s, 60, 134, "evict", { "font-size": 11, fill: palette.muted, transform: "rotate(-90 60 134)" });
+    ln(s, 810, 236, 810, 30, { stroke: palette.muted, "marker-end": "url(#arr-tier)" });
+    tx(s, 826, 134, "reload on reuse", { "font-size": 11, fill: palette.muted, transform: "rotate(90 826 134)" });
+    tx(s, cx, 258, "bigger and cheaper going down; slower to reload going down", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- widget: reload vs recompute */
+  (function () {
+    const w = widget("w-offload", { title: "Reload cached KV, or recompute it?", kicker: "Calculator", note: "Reload time = prefix bytes ÷ tier bandwidth, assuming it isn't overlapped with anything. Recompute time = prefill FLOPs ÷ achieved compute. Tier bandwidths are rough per-GPU figures; striping over several NVMe drives or NICs raises them." });
+    const TIERS = {
+      peer: { bw: 450e9, l: "peer GPU HBM over NVLink · ~450 GB/s", c: palette.teal },
+      dram: { bw: 50e9, l: "CPU DRAM over PCIe Gen5 · ~50 GB/s", c: palette.blue },
+      rdma: { bw: 45e9, l: "remote store over 400 Gb/s RDMA · ~45 GB/s", c: palette.plum },
+      eth: { bw: 10e9, l: "remote store over 100 GbE · ~10 GB/s", c: palette.gold },
+      nvme: { bw: 7e9, l: "one local NVMe drive · ~7 GB/s", c: palette.brick }
+    };
+    let mk = "l8", tier = "dram";
+    select(w.controls, { label: "Model", options: Object.entries(KVM).map(([k, v]) => ({ value: k, label: v.l })), value: mk, onChange: v => { mk = v; draw(); } });
+    select(w.controls, { label: "Where the KV sits", options: Object.entries(TIERS).map(([k, v]) => ({ value: k, label: v.l })), value: tier, onChange: v => { tier = v; draw(); } });
+    const pS = slider(w.controls, { label: "Cached prefix length", min: 8, max: 18, step: 0.5, value: 15, fmt: v => fmtNum(Math.round(2 ** v), 0) + " tokens", onInput: draw });
+    const fS = slider(w.controls, { label: "Prefill compute (achieved)", min: 100, max: 3000, step: 50, value: 400, fmt: v => v + " TFLOP/s", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [256, 262144], y: [0.01, 1e5], logx: true, logy: true, xlabel: "cached prefix length (tokens)", ylabel: "time", xfmt: tickN, yfmt: tickMs, margin: { l: 62 } });
+    const set = stats(w.body, [{ key: "b", label: "KV bytes" }, { key: "r", label: "Reload" }, { key: "c", label: "Recompute" }, { key: "w", label: "Winner" }, { key: "be", label: "Break-even bandwidth" }]);
+    function draw() {
+      const M = KVM[mk], F = fS.value * 1e12, Pn = Math.round(2 ** pS.value), T = TIERS[tier];
+      const rc = p => prefillFlops(M, p) / F;
+      const r = Pn * M.kv / T.bw, c = rc(Pn);
+      P.y = logRange(Math.min(256 * M.kv / 450e9, rc(256)) * 1e3 * 0.7, Math.max(262144 * M.kv / 7e9, rc(262144)) * 1e3 * 1.3);
+      const layers = Object.entries(TIERS).map(([k, v]) => ({ fn: p => p * M.kv / v.bw * 1e3, color: v.c, width: k === tier ? 2.6 : 1, dash: k === tier ? null : "3 3", label: k === tier ? "reload from " + v.l.split(" ·")[0] : null }));
+      layers.push({ fn: p => rc(p) * 1e3, color: palette.green, width: 2.6, label: "recompute (prefill)" });
+      layers.push({ marker: [Pn, r * 1e3], color: T.c, label: fT(r) });
+      layers.push({ marker: [Pn, c * 1e3], color: palette.green, label: fT(c) });
+      P.draw(layers);
+      const be = Pn * M.kv / c;
+      set("b", fB(Pn * M.kv), null, fmtNum(Pn, 0) + " tokens");
+      set("r", fT(r), r < c ? "good" : "bad", T.l.split(" ·")[0]);
+      set("c", fT(c), c < r ? "good" : "bad", fmtNum(prefillFlops(M, Pn) / 1e15, 2) + " PFLOP");
+      set("w", r < c ? "reload " + fmtNum(c / r, 1) + "×" : "recompute " + fmtNum(r / c, 1) + "×", r < c ? "good" : "warn", "faster option");
+      set("be", fB(be) + "/s", null, "any tier faster than this wins");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- fig: ring attention */
+  (function () {
+    const s = document.getElementById("fig-ringattn");
+    marker(s, "arr-ra", palette.ink);
+    const p = 4, x0 = 110, y0 = 44, c = 52;
+    tx(s, x0 + p * c / 2, 22, "KV chunk j", { "font-size": 12, "font-weight": 600 });
+    for (let j = 0; j < p; j++) tx(s, x0 + j * c + c / 2, 38, "KV" + j, { "font-size": 11, class: "mono", fill: palette.muted });
+    for (let i = 0; i < p; i++) {
+      tx(s, x0 - 10, y0 + i * c + c / 2 + 4, "GPU " + i + " · Q" + i, { "text-anchor": "end", "font-size": 11, class: "mono", fill: palette.muted });
+      for (let j = 0; j < p; j++) {
+        const step = ((i - j) % p + p) % p;
+        const x = x0 + j * c, y = y0 + i * c;
+        if (j > i) { bx(s, x + 2, y + 2, c - 4, c - 4, { rx: 4, fill: "rgba(28,27,25,.06)", stroke: "rgba(28,27,25,.12)" }); tx(s, x + c / 2, y + c / 2 + 4, "skip", { "font-size": 10, fill: palette.faint }); continue; }
+        bx(s, x + 2, y + 2, c - 4, c - 4, { rx: 4, fill: alpha(GC[j], 0.28), stroke: alpha(GC[j], 0.7), "stroke-width": 1 });
+        if (j === i) s.appendChild(svg("path", { d: `M${x + c - 2},${y + 2} L${x + c - 2},${y + c - 2} L${x + 2},${y + 2} Z`, fill: "rgba(247,246,242,.85)" }));
+        tx(s, x + c / 2 - (j === i ? 8 : 0), y + c / 2 + (j === i ? 12 : 4), "step " + step, { "font-size": 10.5, class: "mono" });
+      }
+    }
+    tx(s, x0 + p * c / 2, y0 + p * c + 22, "query chunk i (rows) × key/value chunk j (columns)", { "font-size": 11, fill: palette.muted });
+    // ring on the right
+    const cx = 600, cy = 150, R = 90;
+    const pos = i => { const a = -Math.PI / 2 + i * 2 * Math.PI / p; return [cx + R * Math.cos(a), cy + R * Math.sin(a)]; };
+    for (let i = 0; i < p; i++) {
+      const [x1, y1] = pos(i), [x2, y2] = pos((i + 1) % p);
+      const sh = 0.28;
+      ln(s, x1 + (x2 - x1) * sh, y1 + (y2 - y1) * sh, x1 + (x2 - x1) * (1 - sh), y1 + (y2 - y1) * (1 - sh), { "stroke-width": 1.6, "marker-end": "url(#arr-ra)" });
+    }
+    for (let i = 0; i < p; i++) {
+      const [x, y] = pos(i);
+      s.appendChild(svg("circle", { cx: x, cy: y, r: 28, fill: alpha(GC[i], 0.16), stroke: GC[i], "stroke-width": 1.4 }));
+      tx(s, x, y - 2, "GPU " + i, { "font-size": 11.5, "font-weight": 600, class: "mono" });
+      tx(s, x, y + 13, "Q" + i + " stays", { "font-size": 9.5, fill: palette.muted, class: "mono" });
+    }
+    tx(s, cx, cy - 4, "K, V chunks", { "font-size": 11, fill: palette.ink });
+    tx(s, cx, cy + 12, "move one hop", { "font-size": 11, fill: palette.ink });
+    tx(s, cx, cy + 28, "per step", { "font-size": 11, fill: palette.ink });
+    tx(s, 790, 70, "while computing", { "font-size": 11, fill: palette.muted, "text-anchor": "start" });
+    tx(s, 790, 86, "on chunk j, send", { "font-size": 11, fill: palette.muted, "text-anchor": "start" });
+    tx(s, 790, 102, "it onward and", { "font-size": 11, fill: palette.muted, "text-anchor": "start" });
+    tx(s, 790, 118, "receive the next", { "font-size": 11, fill: palette.muted, "text-anchor": "start" });
+  })();
+
+  /* ---------------------------------------------------------- fig: multi-node topology */
+  (function () {
+    const s = document.getElementById("fig-topo");
+    const nodesX = [20, 460], nw = 400;
+    nodesX.forEach((nx, n) => {
+      bx(s, nx, 14, nw, 186, { rx: 12, fill: "#fbfaf7", stroke: "rgba(28,27,25,.2)" });
+      tx(s, nx + 12, 32, "node " + n, { "text-anchor": "start", "font-size": 12, "font-weight": 600 });
+      tx(s, nx + nw - 12, 32, "NVLink domain", { "text-anchor": "end", "font-size": 10.5, fill: palette.green, class: "mono" });
+      bx(s, nx + 20, 108, nw - 40, 18, { rx: 4, fill: "rgba(26,122,82,.22)", stroke: "rgba(26,122,82,.6)" });
+      tx(s, nx + nw / 2, 121, "NVSwitch", { "font-size": 10.5, class: "mono" });
+      for (let k = 0; k < 8; k++) {
+        const gx = nx + 16 + k * 47;
+        ln(s, gx + 20, 82, gx + 20, 108, { stroke: palette.green, "stroke-width": 2 });
+        bx(s, gx, 44, 40, 38, { rx: 5, fill: "rgba(26,122,82,.12)", stroke: "rgba(26,122,82,.55)" });
+        tx(s, gx + 20, 67, "G" + k, { "font-size": 11, class: "mono" });
+        ln(s, gx + 20, 126, gx + 20, 158, { stroke: palette.blue, "stroke-width": 1, "stroke-dasharray": "3 2" });
+        bx(s, gx + 4, 158, 32, 20, { rx: 4, fill: "rgba(47,93,138,.15)", stroke: "rgba(47,93,138,.55)" });
+        tx(s, gx + 20, 172, "NIC", { "font-size": 9.5, class: "mono" });
+      }
+      tx(s, nx + nw / 2, 194, "GPU → PCIe switch → its own NIC (GPUDirect RDMA)", { "font-size": 10, fill: palette.muted });
+    });
+    const rails = 8, rx0 = 150, rwid = 580 / rails;
+    for (let k = 0; k < rails; k++) {
+      const x = rx0 + k * rwid;
+      bx(s, x + 4, 248, rwid - 8, 24, { rx: 4, fill: "rgba(47,93,138,.10)", stroke: "rgba(47,93,138,.5)" });
+      tx(s, x + rwid / 2, 264, "rail " + k, { "font-size": 9.5, class: "mono" });
+      nodesX.forEach(nx => ln(s, nx + 16 + k * 47 + 20, 178, x + rwid / 2, 248, { stroke: alpha(palette.blue, 0.45), "stroke-width": 1 }));
+    }
+    tx(s, 440, 292, "leaf switches, one per rail: InfiniBand or RoCE, ~400 Gb/s per NIC", { "font-size": 10.5, fill: palette.muted });
+  })();
+})();
+</script>
+</body>
+</html>

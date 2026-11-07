@@ -1,0 +1,1689 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Labs &amp; study plan — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<style>
+.lab{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);margin:22px auto;overflow:hidden;scroll-margin-top:24px}
+.lab .lab-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid var(--line-soft);background:#fbfaf7}
+.lab .lab-id{font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.06em;color:var(--green-deep);background:var(--green-tint);border-radius:6px;padding:2px 8px}
+.lab[data-track="inf"] .lab-id{color:var(--blue);background:var(--blue-tint)}
+.lab h4{font-family:var(--serif);font-size:21px;font-weight:500;margin:0}
+.lab .lab-meta{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.lab .lab-status{margin-left:auto;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.lab .lab-status.done{color:var(--green-deep)}
+.lab .lab-body{padding:14px 20px 16px;display:grid;grid-template-columns:104px minmax(0,1fr);gap:8px 16px;font-size:15px;color:var(--ink-soft)}
+.lab .lab-body > .lk{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);padding-top:3px}
+.lab .lab-body p{margin:0}
+.lab .lab-body ol{margin:0;padding-left:20px}
+.lab .lab-body li{margin:3px 0}
+.lab ul.exit{list-style:none;padding:0;margin:0}
+.lab ul.exit li{position:relative;padding-left:24px;cursor:pointer;color:var(--ink)}
+.lab ul.exit li::before{content:"";position:absolute;left:2px;top:6px;width:11px;height:11px;border:1.5px solid var(--green);border-radius:3px;background:var(--card)}
+.lab ul.exit li.ok::before{background:var(--green)}
+.lab ul.exit li.ok{color:var(--muted)}
+.lab .code{margin:0 20px 16px}
+@media (max-width:640px){.lab .lab-body{grid-template-columns:1fr}}
+.pbar{height:9px;background:#e4e2da;border-radius:5px;overflow:hidden;margin:4px 0 2px}
+.pbar > i{display:block;height:100%;background:var(--green);width:0;transition:width .3s}
+.tlist{max-height:560px;overflow-y:auto;border:1px solid var(--line-soft);border-radius:10px;margin-top:14px;background:var(--paper)}
+.trow{display:flex;align-items:center;gap:10px;padding:8px 14px;border-top:1px solid var(--line-soft)}
+.trow:first-child{border-top:0}
+.trow label{display:flex;align-items:center;gap:9px;flex:1;cursor:pointer;font-size:14.5px}
+.trow input,.tcrit input,.ctl-check input{accent-color:#1a7a52;width:15px;height:15px}
+.trow .tid{font-family:var(--mono);font-size:11.5px;font-weight:600;min-width:30px}
+.trow .tcount{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.tcrit{padding:2px 14px 10px 54px}
+.tcrit label{display:flex;gap:9px;align-items:flex-start;font-size:13.5px;color:var(--ink-soft);margin:5px 0;cursor:pointer}
+.tcrit input{margin-top:3px;flex:none}
+.gaps{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-top:12px}
+.gapc{border:1px solid var(--line-soft);border-radius:10px;padding:10px 14px;background:var(--paper);font-size:14px;color:var(--ink-soft)}
+.gapc .gk{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--brick);font-weight:600}
+.gapc .gt{font-family:var(--serif);font-size:18px;color:var(--ink);margin:2px 0 4px}
+.radar-wrap{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:16px;align-items:start}
+@media (max-width:820px){.radar-wrap{grid-template-columns:1fr}}
+.ctl-check{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--ink-soft);cursor:pointer;margin-top:18px}
+.cheat{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:24px auto}
+.cheat .formula{margin:0}
+.cheat .formula dl.legend{grid-template-columns:1fr}
+.cheat .formula .tex{font-size:1.08em}
+@media (max-width:860px){.cheat{grid-template-columns:1fr}}
+.plan-scroll{max-height:440px;overflow-y:auto;border-radius:12px;margin-top:12px}
+.plan-scroll table.t{margin:0}
+</style>
+</head>
+<body data-module="22">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 22 · Practice</p>
+<h1 class="title">Labs &amp; study plan: learn it by <span class="it">measuring</span> it</h1>
+<p class="lede">Reading the first 22 modules gives you the vocabulary. The nineteen labs here turn it into skill. Each one ends in a number you either hit or can explain. You get a week-by-week plan for an Apple Silicon Mac plus a few dozen rented GPU hours, trackers that remember where you are, and the formulas you'll reach for most, on one page.</p>
+<div class="meta"><span class="tag">~1 hour to read · ~150 hours with reading, labs and a capstone</span><span class="tag n">prereqs: 00</span><span class="tag g">hands-on: Mac + rented NVIDIA GPU</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Run any lab through the predict → build → measure → explain loop, and write an exit criterion a sceptical reviewer would accept.</li>
+    <li>Set up a Mac for PyTorch (MPS), MLX and llama.cpp, and choose a rented GPU that fits the CUDA, Triton, vLLM and multi-GPU labs.</li>
+    <li>Time GPU work so the number means something: warmup, synchronization, medians, p95, and open-loop load.</li>
+    <li>Follow an 18-week plan at 6–8 hours a week, or re-flow it for the hours you actually have.</li>
+    <li>Pick a capstone and fix its success metric before writing any code.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="loop">How to use the labs</h2>
+
+<p>Every lab runs the same four-step loop. You write down what you expect before touching the keyboard. You build the smallest thing that can test that expectation. You measure carefully. Then you explain the gap between the two numbers. The explanation is the part that sticks. A lab you "ran" without a prediction teaches you a command; a lab where you predicted 90 tok/s, measured 31, and found out why teaches you how the machine works.</p>
+
+<figure class="fig"><svg viewBox="0 0 760 330" id="fig-loop"></svg>
+<figcaption>The lab loop. Each lab card below lists its exit criteria: concrete numbers plus one explanation you should be able to give out loud. If the measured value lands far from your prediction, that isn't failure. It's the most useful result a lab can produce, as long as you chase it down.</figcaption></figure>
+
+<h3>Exit criteria are numbers</h3>
+<p>"Trained a LoRA" isn't an exit criterion. "LoRA scores 0.86 exact-match on 200 held-out examples against 0.71 for the best few-shot prompt, and the paired bootstrap interval for the difference excludes zero" is. Every lab card ends with two or three criteria of that shape. They stop you from quitting at the first plausible output, and they force you to build the measurement harness, which is most of the real engineering. The table you're left with gets reused the next time someone asks "how fast would this run on our hardware?"</p>
+
+<p>Most criteria compare a measurement against a ceiling you computed first. One ratio captures that:</p>
+
+<div class="formula" data-name="Efficiency against the napkin ceiling">
+  <div class="tex">$$\htmlClass{t1}{\eta} = \frac{\htmlClass{t2}{x_{\text{measured}}}}{\htmlClass{t3}{x_{\text{ceiling}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\eta\)</dt><dd>efficiency: the fraction of the theoretical limit you actually got</dd></div>
+    <div data-t="t2"><dt>\(x_{\text{measured}}\)</dt><dd>what you timed: tok/s, TFLOP/s, GB/s</dd></div>
+    <div data-t="t3"><dt>\(x_{\text{ceiling}}\)</dt><dd>what the formula allows: bandwidth ÷ bytes per token, datasheet peak FLOP/s, link bandwidth</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Divide what you got by what physics allows. The ratio tells you where to look next.</p>
+  <p class="why"><b>Why it matters</b>Rule of thumb, not a law: large well-tuned kernels and engines land around 0.6–0.85. Between 0.3 and 0.6, look for overhead such as Python, kernel launches, small batches or the wrong dtype. Below 0.3, a different resource is the bottleneck, and your model of the system is missing something.</p>
+</div>
+
+<h3>Make the measurement trustworthy</h3>
+<p>GPU timing goes wrong in quiet ways. On CUDA and on MPS, kernel launches return before the work finishes, so a naive timer measures the launch. MLX is lazy: <code>a @ b</code> builds a graph and nothing runs until <code>mx.eval</code>. The first few calls pay for compilation, memory allocation and cache warmup. A fanless MacBook Air throttles after a minute or two of sustained load, and Low Power Mode caps the clocks. The figure shows what a raw timing trace looks like.</p>
+
+<figure class="fig"><div id="fig-noise"></div>
+<figcaption>Sixty timed iterations of the same kernel, simulated to show the typical shape. The first few are slow (allocation, compilation, caches) and must be discarded. After that the times cluster tightly with occasional spikes from other processes. Report the median for "typical" and p95 for "bad case". A mean computed over all sixty would be inflated by the warmup and is the wrong summary.</figcaption></figure>
+
+<div class="code" data-lang="python" data-title="bench.py · reuse this in every lab"><pre><code>
+import statistics, time
+import torch
+
+def _sync(device):
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
+
+def bench(fn, device, warmup=10, iters=50):
+    """Time fn() on a GPU correctly: warm up, synchronize, report median and p95 in ms."""
+    for _ in range(warmup):
+        fn()
+    _sync(device)
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        fn()
+        _sync(device)                      # wait for the GPU before reading the clock
+        times.append((time.perf_counter() - t0) * 1e3)
+    times.sort()
+    return {"median_ms": statistics.median(times), "p95_ms": times[int(0.95 * (len(times) - 1))]}
+
+# MLX equivalent: wrap the work so it ends in mx.eval(result); MLX is lazy and nothing runs before that.
+</code></pre></div>
+
+<div class="pitfall"><b>Pitfall · measuring the wrong thing</b>
+<p>Before trusting any speed number, check four things. Is the tensor actually on the GPU (<code>x.device</code>)? Is the dtype what you think, and not silently fp32? Did the machine swap? Watch Activity Monitor's memory pressure, because a model that spills out of unified memory runs 10–100× slower. And is anything else hammering the GPU, such as a browser tab playing video or a second notebook you forgot about?</p>
+</div>
+
+<p>Quality metrics have their own noise: a score measured on a finite eval set is an estimate. Before you claim one configuration beats another, check how wide the error bars are.</p>
+
+<div class="formula" data-name="How noisy is a measured rate?">
+  <div class="tex">$$\htmlClass{t1}{\text{SE}} = \sqrt{\frac{\htmlClass{t2}{p}\,(1-\htmlClass{t2}{p})}{\htmlClass{t3}{n}}}, \qquad \text{95\% CI} \approx \htmlClass{t2}{p} \pm 1.96\,\htmlClass{t1}{\text{SE}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>SE</dt><dd>standard error of the measured rate</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>measured accuracy, pass rate, recall or win rate</dd></div>
+    <div data-t="t3"><dt>\(n\)</dt><dd>number of independent eval items</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>With 200 items at 70% accuracy, SE ≈ 0.032, so the 95% interval is about ±6.4 points. Two systems 3 points apart on that set are indistinguishable.</p>
+  <p class="why"><b>Why it matters</b>This sets the size of your eval sets. Comparing two systems on the <em>same</em> items (a paired test, Module 13) is tighter than comparing two independent intervals, so always keep per-item results.</p>
+</div>
+
+<details class="think"><summary>Think first: you predicted 60 tok/s for a 3B model at 4-bit on your Mac and measured 18. What do you check, in order?</summary>
+<div>First the cheap, embarrassing causes: is it running on the GPU, and is the model really 4-bit (file size ≈ N × 4.5 / 8 bytes)? Next, memory: if the Mac is swapping, everything else is noise. Then overhead: at batch 1 on a small model, per-token Python and launch costs can dominate. Compare <code>llama-bench</code> (C++, no Python) with your script. Finally, context: at long prompts, KV-cache reads add to the bytes per token (Module 08). Write down which one it was. Next time your prediction will include it.</div>
+</details>
+
+<table class="t">
+  <thead><tr><th>Lab record field</th><th>Example (L6, quantization sweep)</th></tr></thead>
+  <tbody>
+    <tr><td>Question</td><td>How much faster is Q4_K_M than bf16 for token generation on this Mac, and what does it cost in quality?</td></tr>
+    <tr><td>Prediction + formula</td><td>tg speedup ≈ bytes ratio = 16 / 4.85 ≈ 3.3×; pp speedup ≈ 1×, since prefill is compute-bound</td></tr>
+    <tr><td>Setup</td><td>Chip, RAM, macOS, llama.cpp build number, model, prompt and generation lengths, power adapter connected</td></tr>
+    <tr><td>Measurement</td><td>tg128: 3.0× faster; pp512: 1.1× faster; mean KLD vs bf16 recorded per quant</td></tr>
+    <tr><td>Explanation of the gap</td><td>Slightly under 3.3× because the KV cache and non-quantized tensors (embeddings, norms) don't shrink</td></tr>
+    <tr><td>Next question</td><td>Where does the curve bend at Q3? Does KLD track my task metric?</td></tr>
+  </tbody>
+</table>
+<p class="small muted">The numbers in the example column show the format and are not measurements. Fill in yours.</p>
+
+<!-- ================================================================== -->
+<h2 id="setup">Environment setup</h2>
+
+<p>All thirteen core labs run on an Apple Silicon Mac, and so do L16 and L19 if you use small models. L14 needs a cloud GPU for half of its measurements. L15, L17 and L18 need NVIDIA hardware outright, because CUDA, Triton, vLLM and NCCL don't run on Apple GPUs. Rent that hardware by the hour rather than buying it.</p>
+
+<h3>On the Mac</h3>
+<p>Use <a href="https://docs.astral.sh/uv/">uv</a> for Python. It creates environments and installs packages fast enough that keeping a separate environment per lab costs nothing. PyTorch's standard macOS wheels include the MPS backend. MLX is Apple's array framework and is usually the fastest way to run and fine-tune models on a Mac. llama.cpp gives you the C++ inference engine and its benchmarking tools.</p>
+
+<div class="code" data-lang="bash" data-title="Mac setup"><pre><code>
+# 1. Python toolchain: one virtual environment for the course
+brew install uv                         # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+mkdir mle-labs &amp;&amp; cd mle-labs
+uv venv --python 3.12 &amp;&amp; source .venv/bin/activate
+
+# 2. PyTorch (macOS wheels include MPS) and the libraries the labs use
+uv pip install torch torchvision torchaudio numpy pandas matplotlib jupyterlab
+uv pip install transformers datasets accelerate peft trl tiktoken sentencepiece
+uv pip install sentence-transformers rank_bm25 faiss-cpu jiwer open_clip_torch diffusers httpx
+
+# 3. The MLX family: core arrays, LLMs, vision-language models, speech
+uv pip install mlx mlx-lm mlx-vlm mlx-whisper
+
+# 4. llama.cpp: binaries from Homebrew, the HF-to-GGUF converter from the repo
+brew install llama.cpp                  # llama-cli, llama-server, llama-bench, llama-quantize, llama-perplexity
+git clone https://github.com/ggml-org/llama.cpp
+uv venv llama.cpp/.venv --python 3.12      # separate env: the converter pins its own torch
+uv pip install --python llama.cpp/.venv/bin/python -r llama.cpp/requirements.txt
+# later: llama.cpp/.venv/bin/python llama.cpp/convert_hf_to_gguf.py ./some-hf-model --outtype bf16
+
+# 5. Smoke tests
+mlx_lm.generate --model mlx-community/Qwen2.5-0.5B-Instruct-4bit --prompt "Say hi in five words." --max-tokens 20
+llama-server -hf ggml-org/gemma-3-1b-it-GGUF --port 8080   # then open http://localhost:8080
+</code></pre></div>
+
+<div class="code" data-lang="python" data-title="check_mac.py · confirm both GPU paths work and get your first ceiling"><pre><code>
+import platform, time
+import torch
+import mlx.core as mx
+
+print(platform.platform(), "| torch", torch.__version__, "| MPS:", torch.backends.mps.is_available())
+n = 4096
+
+x = torch.randn(n, n, device="mps", dtype=torch.float16)
+for _ in range(3):
+    y = x @ x
+torch.mps.synchronize()
+t0 = time.perf_counter()
+for _ in range(20):
+    y = x @ x
+torch.mps.synchronize()
+dt = (time.perf_counter() - t0) / 20
+print(f"PyTorch MPS fp16 matmul: {2 * n**3 / dt / 1e12:.1f} TFLOP/s")
+
+a = mx.random.normal((n, n)).astype(mx.float16)
+mx.eval(a)
+for _ in range(3):
+    mx.eval(a @ a)
+t0 = time.perf_counter()
+for _ in range(20):
+    mx.eval(a @ a)                      # MLX is lazy: eval forces the work
+dt = (time.perf_counter() - t0) / 20
+print(f"MLX fp16 matmul:         {2 * n**3 / dt / 1e12:.1f} TFLOP/s")
+</code></pre></div>
+
+<table class="t">
+  <thead><tr><th>Unified memory</th><th>Inference, comfortably</th><th>Fine-tuning (LoRA)</th><th>Labs that get tight</th></tr></thead>
+  <tbody>
+    <tr><td>16 GB</td><td>Up to 7–8B at 4-bit (~5 GB) with moderate context</td><td>0.5–3B, 4-bit base</td><td>L7 at 7B, L13's largest runs, L8 above 0.5B</td></tr>
+    <tr><td>32–36 GB</td><td>14B at 4-bit; 8B at 8-bit</td><td>7–8B, 4-bit base</td><td>L8 at 1.5B+ in PyTorch</td></tr>
+    <tr><td>64 GB+</td><td>8B in bf16; 32B at 4-bit; 70B at 4-bit with short contexts</td><td>7–14B comfortably</td><td>None for this course</td></tr>
+  </tbody>
+</table>
+<div class="flag"><b>Rule of thumb</b>
+<p>By default macOS lets the GPU wire roughly two-thirds to three-quarters of unified memory; the rest stays with the OS. Use the memory formula from Module 09 with that limit, not the RAM on the box. The table assumes nothing else large is running.</p>
+</div>
+
+<h3>Renting a cloud NVIDIA GPU</h3>
+<p>The inference-engineering labs need about 30–35 GPU-hours in total: under ten hours on one GPU for L14, L15 and L17, about four hours on a two-GPU machine for L19, and about two hours on an 8-GPU node for L18, which alone is half the GPU-hours. Marketplace-style GPU clouds and the large providers both work. The details below decide whether a rental is usable for these labs, so check them before you pay.</p>
+
+<table class="t">
+  <thead><tr><th>What to check</th><th>What you want</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>GPU type</td><td>H100 or H200 for everything; A100 80 GB for all but FP8; L4, L40S or RTX 4090 for L14–L16 on a budget</td><td>FP8 tensor cores need Hopper (H100/H200) or Ada (L4, L40S, 4090). Triton and vLLM run on all of them. SXM and PCIe H100s differ in power, clocks and memory bandwidth, so write down which one you got.</td></tr>
+    <tr><td>Memory</td><td>80 GB for L17; 24 GB is enough for L14–L16</td><td>An 8B model is 16 GB in bf16. What's left becomes KV cache, and KV cache caps concurrency (Module 19).</td></tr>
+    <tr><td>Interconnect</td><td>For L18: an SXM node with NVLink/NVSwitch</td><td>On a PCIe-only box, tensor parallelism looks far worse than it is on real serving hardware. <code>nvidia-smi topo -m</code> should show <code>NV#</code> between GPUs, not <code>PHB</code> or <code>SYS</code>.</td></tr>
+    <tr><td>Disk</td><td>≥ 200 GB of local NVMe</td><td>Weights plus the Hugging Face cache plus conversions add up fast (70B in bf16 is 140 GB). Network volumes can take minutes to load a checkpoint.</td></tr>
+    <tr><td>Hourly price and billing</td><td>Per-second or per-minute billing; on-demand for multi-hour runs</td><td>Spot instances are cheaper but can vanish mid-sweep. A stopped instance may still bill for its disk.</td></tr>
+    <tr><td>Software image</td><td>Recent NVIDIA driver, CUDA 12.x, PyTorch preinstalled, root/SSH</td><td>Current vLLM and PyTorch wheels need a recent driver. If the host runs you inside a container, NCCL needs a large <code>/dev/shm</code> (<code>--ipc=host</code> or <code>--shm-size</code>).</td></tr>
+  </tbody>
+</table>
+
+<div class="code" data-lang="bash" data-title="First ten minutes on a rented GPU"><pre><code>
+nvidia-smi                               # GPU model, memory, driver and CUDA version
+nvidia-smi topo -m                       # NV# = NVLink between GPUs; PHB/SYS = PCIe through the host
+df -h                                    # is there local disk for the weights?
+
+curl -LsSf https://astral.sh/uv/install.sh | sh &amp;&amp; source $HOME/.local/bin/env
+uv venv --python 3.12 &amp;&amp; source .venv/bin/activate
+uv pip install vllm                      # pulls a matching torch and triton
+python -c "import torch, triton; print(torch.__version__, torch.version.cuda, triton.__version__, torch.cuda.get_device_name())"
+
+# nccl-tests for L18 (needs the CUDA toolkit; set NCCL_HOME if NCCL isn't under /usr)
+git clone https://github.com/NVIDIA/nccl-tests &amp;&amp; make -C nccl-tests -j
+./nccl-tests/build/all_reduce_perf -b 8 -e 4G -f 2 -g 8
+
+# when you're done: copy results off, then terminate (not just stop) the instance
+</code></pre></div>
+
+<div class="mle"><b>MLE angle · budget the rental like a deployment</b>
+<p>Use the cost formula from the cheat sheet in reverse. List each cloud lab's GPU-hours, multiply by the hourly price, and add 50% for setup and mistakes. In 2025, single-H100 list prices on GPU clouds were commonly in the low single-digit dollars per hour, with L4-class cards under a dollar. Prices move quickly, so check before you plan. Script your setup, so a fresh instance is productive in five minutes instead of forty.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="plan">The study plan</h2>
+
+<p>The plan has two tracks. <strong>Core</strong> covers modules 00–16 and labs L1–L13 in twelve weeks: how models are built, trained, adapted, evaluated and run. <strong>Inference engineering</strong> covers modules 17–21 and labs L14–L19 in six weeks: the GPU, kernels, engines, multi-GPU serving and the platform around them. At 6–8 hours a week that comes to about 90 hours for core, about 40 for inference, and about 20 for a capstone.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 990 300" id="fig-timeline"></svg>
+<figcaption>The 18-week plan, with a three-week capstone after it. Each cell is one week: the modules to read on top, the lab to build below, and the estimated hours at the bottom. If you're already fluent with Parts I–III, read 00, 06, 08 and 13 as a refresher and start directly on the inference track.</figcaption></figure>
+
+<table class="t">
+  <thead><tr><th>Week</th><th>Read</th><th>Build</th><th class="num">≈ h</th><th>Checkpoint: by the end you can…</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>00, 01, 02</td><td>Mac setup, <code>check_mac.py</code></td><td class="num">8</td><td>predict a decode ceiling and measure your Mac's matmul TFLOP/s</td></tr>
+    <tr><td>2</td><td>03</td><td>L1 micrograd</td><td class="num">6.5</td><td>backprop through any expression by hand and in code</td></tr>
+    <tr><td>3</td><td>04, 05</td><td>L2 bigram → MLP</td><td class="num">8.5</td><td>read a loss curve in nats and spot over- or underfitting</td></tr>
+    <tr><td>4</td><td>06</td><td>L4 BPE trainer</td><td class="num">6</td><td>explain why a prompt costs what it costs in tokens</td></tr>
+    <tr><td>5</td><td>07</td><td>L3 nanoGPT</td><td class="num">8</td><td>train a transformer and estimate its MFU</td></tr>
+    <tr><td>6</td><td>08</td><td>L5 KV cache; launch L13 runs</td><td class="num">7</td><td>size a KV cache and explain prefill versus decode</td></tr>
+    <tr><td>7</td><td>09, 10</td><td>L6 quantization sweep</td><td class="num">8</td><td>pick a quant for a device and prove it didn't hurt</td></tr>
+    <tr><td>8</td><td>10 (cont.)</td><td>L7 LoRA, L8 DPO</td><td class="num">7</td><td>show a fine-tune beat prompting, with error bars</td></tr>
+    <tr><td>9</td><td>11</td><td>L9 RAG with evals</td><td class="num">7</td><td>measure retrieval separately from generation</td></tr>
+    <tr><td>10</td><td>12</td><td>L10 agent + harness</td><td class="num">6.5</td><td>report pass@1 and pass^k with cost per task</td></tr>
+    <tr><td>11</td><td>13, 14</td><td>L11 CLIP + Whisper</td><td class="num">7.5</td><td>reproduce a published number before trusting your own</td></tr>
+    <tr><td>12</td><td>15, 16</td><td>L12 diffusion; L13 fit</td><td class="num">9.5</td><td>predict a bigger run's loss from smaller ones</td></tr>
+    <tr><td>13</td><td>17</td><td>cloud setup, L14 roofline</td><td class="num">7</td><td>place any kernel on a roofline before profiling it</td></tr>
+    <tr><td>14</td><td>18</td><td>L15 Triton softmax</td><td class="num">7.5</td><td>write a fused kernel and report GB/s as % of peak</td></tr>
+    <tr><td>15</td><td>19</td><td>L16 mini engine (start)</td><td class="num">6.5</td><td>explain a scheduler step line by line</td></tr>
+    <tr><td>16</td><td>19 (cont.)</td><td>L16 finish, L17 vLLM sweep</td><td class="num">5.5</td><td>tune an engine against a stated SLO</td></tr>
+    <tr><td>17</td><td>20</td><td>L18 TP + nccl-tests</td><td class="num">6</td><td>predict all-reduce cost and decide when TP pays</td></tr>
+    <tr><td>18</td><td>21</td><td>L19 serving platform</td><td class="num">8</td><td>draw a throughput–latency curve and find its knee</td></tr>
+    <tr><td>19–21</td><td>(revisit as needed)</td><td>Capstone</td><td class="num">20</td><td>ship one end-to-end result with a number attached</td></tr>
+  </tbody>
+</table>
+
+<p>Week 12 is the heaviest; the diffusers sweep in L12 can run unattended while you fit L13. If a week slips, push the whole plan rather than skipping a lab's exit criteria. A half-measured lab teaches about as much as an unread module. The planner below re-flows the same items for any weekly budget, and it can skip labs you've already marked complete in the tracker.</p>
+
+<div id="w-planner"></div>
+
+<!-- ================================================================== -->
+<h2 id="core-labs">Core labs (L1–L13)</h2>
+
+<p>The core labs follow the book's order. Several build on earlier ones. Your nanoGPT from L3 gets a KV cache in L5 and becomes the subject of the scaling sweep in L13, and your L5 cache is the starting point for the mini engine in L16. The map shows which labs to finish first.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 1040 330" id="fig-deps"></svg>
+<figcaption>Lab dependency map. An arrow means "do this first; you'll reuse its code". Green labs run on a Mac. Blue labs need an NVIDIA GPU, except L16 and L19, which also run on a Mac with small models and <code>llama-server</code>. Capstones (gold) combine several labs. The ones each capstone builds on are listed inside its box.</figcaption></figure>
+
+<p class="small muted">Click any exit criterion on a card to mark it met. Progress is saved in this browser and shows up in the tracker further down.</p>
+
+<!-- L1 -->
+<div class="lab wide" id="lab-L1" data-lab="L1" data-track="core">
+  <div class="lab-head"><span class="lab-id">L1</span><h4>micrograd: autograd from scratch</h4><span class="lab-meta">~4 h · Mac CPU · <a href="02-calculus.html#chain">02</a>, <a href="04-neural-nets.html#backprop">04</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Build a scalar automatic-differentiation engine and a tiny neural net on top of it, so backpropagation stops being a black box.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Write a <code>Value</code> class that stores data, grad, its parents and a local <code>_backward</code> closure for <code>+</code>, <code>*</code>, <code>**</code>, <code>tanh</code>, <code>exp</code> and <code>relu</code>.</li>
+      <li>Implement <code>backward()</code> with a topological sort. Accumulate with <code>+=</code>, because a node used twice must receive both gradients.</li>
+      <li>Build <code>Neuron</code>, <code>Layer</code> and <code>MLP</code>, then train on 100 two-moons points with SGD and a hinge or cross-entropy loss.</li>
+      <li>Write a gradient check that rebuilds the same expressions in PyTorch float64 and compares every leaf's gradient.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p><code>engine.py</code>, <code>nn.py</code>, a test file and a decision-boundary plot. The reference is Karpathy's <a href="https://github.com/karpathy/micrograd">micrograd</a>; write yours before reading it.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Max |your grad − PyTorch grad| ≤ 1e-6 on the test expression below and on 50 random expressions of 20+ nodes, each reusing at least one node.</li>
+      <li>The MLP reaches ≥ 95% training accuracy on two-moons.</li>
+      <li>You can explain what breaks if gradients are assigned with <code>=</code> instead of <code>+=</code>, and why the topological order matters.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="python" data-title="test_engine.py · the reference expression checked against PyTorch"><pre><code>
+import torch
+from engine import Value                      # your implementation
+
+a, b = Value(-4.0), Value(2.0)
+c = a + b; d = a * b + b**3
+c += c + 1; c += 1 + c + (-a)
+d += d * 2 + (b + a).relu(); d += 3 * d + (b - a).relu()
+e = c - d; f = e**2; g = f / 2.0; g += 10.0 / f
+g.backward()
+
+A = torch.tensor(-4.0, dtype=torch.float64, requires_grad=True)
+B = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
+C = A + B; D = A * B + B**3
+C = C + C + 1; C = C + 1 + C + (-A)
+D = D + D * 2 + (B + A).relu(); D = D + 3 * D + (B - A).relu()
+E = C - D; F = E**2; G = F / 2.0; G = G + 10.0 / F
+G.backward()
+
+assert abs(g.data - G.item()) &lt; 1e-6
+assert abs(a.grad - A.grad.item()) &lt; 1e-6 and abs(b.grad - B.grad.item()) &lt; 1e-6
+print("forward and gradients match")
+</code></pre></div>
+</div>
+
+<!-- L2 -->
+<div class="lab wide" id="lab-L2" data-lab="L2" data-track="core">
+  <div class="lab-head"><span class="lab-id">L2</span><h4>Bigram → MLP character model</h4><span class="lab-meta">~3 h · Mac · <a href="03-probability.html#cross-entropy">03</a>, <a href="04-neural-nets.html#mlp">04</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Train character-level language models of increasing capacity and read every improvement in nats.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Use the ~32k-name list from Karpathy's <a href="https://github.com/karpathy/makemore">makemore</a>; split 80/10/10 with a fixed seed.</li>
+      <li>Count bigrams, add-one smooth, and compute the dev-set negative log-likelihood per character.</li>
+      <li>Train the same bigram as a 27×27 weight matrix with softmax and cross-entropy. It should converge to the counting solution.</li>
+      <li>Replace it with an MLP over a 3-character context (embedding → tanh hidden layer → logits), in the style of Bengio et al. (2003), and sweep embedding size and width.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A table of train and dev NLL for counted bigram, neural bigram and 2–3 MLP sizes, plus 20 samples from each.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Neural-bigram dev NLL within 0.01 nats of the counted bigram.</li>
+      <li>Best MLP beats the bigram by ≥ 0.2 nats on the dev split. As a rough guide, the bigram sits near 2.45 on this dataset and a small MLP reaches about 2.1–2.2.</li>
+      <li>You report the train–dev gap for each model and say whether it's over- or underfitting.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L3 -->
+<div class="lab wide" id="lab-L3" data-lab="L3" data-track="core">
+  <div class="lab-head"><span class="lab-id">L3</span><h4>nanoGPT on Tiny Shakespeare</h4><span class="lab-meta">~5 h · Mac (MPS) · <a href="06-transformer.html#stack">06</a>, <a href="07-training.html#compute">07</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Train a small GPT end to end and connect its loss, speed and FLOPs to the formulas.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Clone <a href="https://github.com/karpathy/nanoGPT">nanoGPT</a> and prepare the character-level Shakespeare data.</li>
+      <li>Train on MPS with a config sized to finish in under an hour (command below).</li>
+      <li>Log tokens/s. Compute achieved FLOP/s with \(6N\) per token plus the attention term, and compare it with the matmul TFLOP/s from <code>check_mac.py</code>.</li>
+      <li>Run one ablation (context length, width or learning rate). Write your prediction down before the run.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>Run log with config, loss curves, tokens/s, MFU estimate and generated samples.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Validation loss ≤ 1.70 nats per character. nanoGPT's README reports about 1.47 for its 6-layer, 384-wide config on an A100. Smaller Mac configs land higher.</li>
+      <li>MFU computed from the \(6ND\) formula against your measured matmul peak, with one sentence on what limits it.</li>
+      <li>One ablation with prediction, result and explanation.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="bash" data-title="nanoGPT on a Mac"><pre><code>
+git clone https://github.com/karpathy/nanoGPT &amp;&amp; cd nanoGPT
+uv pip install numpy tiktoken requests
+python data/shakespeare_char/prepare.py
+python train.py config/train_shakespeare_char.py --device=mps --compile=False \
+  --n_layer=4 --n_head=4 --n_embd=256 --block_size=128 --batch_size=32 \
+  --max_iters=3000 --lr_decay_iters=3000 --eval_interval=250 --eval_iters=50 --dropout=0.1
+python sample.py --out_dir=out-shakespeare-char --device=mps
+</code></pre></div>
+</div>
+
+<!-- L4 -->
+<div class="lab wide" id="lab-L4" data-lab="L4" data-track="core">
+  <div class="lab-head"><span class="lab-id">L4</span><h4>A byte-level BPE trainer</h4><span class="lab-meta">~3 h · Mac · <a href="05-tokens.html#bpe">05</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Implement BPE training, encoding and decoding over raw bytes, then compare compression with production tokenizers.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Train merges on about 10 MB of text, working on UTF-8 bytes with a GPT-2-style regex pre-split.</li>
+      <li>Implement <code>encode</code> (apply merges by rank) and <code>decode</code>.</li>
+      <li>Train vocabularies of 1k, 4k and 16k tokens.</li>
+      <li>Measure bytes per token on held-out in-domain text, Python code and a non-English sample, alongside <a href="https://github.com/openai/tiktoken">tiktoken</a>'s <code>cl100k_base</code> and <code>o200k_base</code>.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A compression table (tokenizers × text types) and a short note on the worst-compressed strings you found. Karpathy's <a href="https://github.com/karpathy/minbpe">minbpe</a> is a good reference after you're done.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li><code>decode(encode(x)) == x</code> byte-for-byte on 100% of held-out files, including emoji and mixed scripts.</li>
+      <li>Bytes/token reported for 3 of your vocab sizes and 2 tiktoken encodings across all 3 text types.</li>
+      <li>You explain where your tokenizer beats or loses to <code>cl100k_base</code> in terms of vocab size and training-domain mismatch.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L5 -->
+<div class="lab wide" id="lab-L5" data-lab="L5" data-track="core">
+  <div class="lab-head"><span class="lab-id">L5</span><h4>Add a KV cache, then benchmark it</h4><span class="lab-meta">~3 h · Mac · <a href="08-inference.html#kvcache">08</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Give your L3 model (or a GPT-2 implementation) a KV cache and measure exactly what it buys.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Store K and V per layer. On each decode step, feed only the newest token, offset its position, and attend over the cache.</li>
+      <li>Check that greedy outputs match the no-cache path.</li>
+      <li>Time per-token latency at positions 1 to 1024, with and without the cache, using <code>bench.py</code>.</li>
+      <li>Compute the cache size from the formula and compare it with the bytes your tensors actually hold.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A latency-vs-position plot (two lines) and a memory table.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Token-identical greedy output for 256 tokens in fp32, with and without the cache.</li>
+      <li>Per-token latency with the cache grows ≤ 2× from position 64 to 1024, while the no-cache version grows roughly linearly.</li>
+      <li>Measured cache bytes match \(2 \cdot L \cdot H_{kv} \cdot d_h \cdot T \cdot b\) within 1%.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L6 -->
+<div class="lab wide" id="lab-L6" data-lab="L6" data-track="core">
+  <div class="lab-head"><span class="lab-id">L6</span><h4>llama.cpp quantization sweep</h4><span class="lab-meta">~2.5 h · Mac · <a href="09-quantization.html#handson">09</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Quantize one 1–8B model to five formats and measure size, quality and speed for each.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Convert a Hugging Face checkpoint to bf16 GGUF and make Q8_0, Q6_K, Q5_K_M, Q4_K_M and Q3_K_M variants with <code>llama-quantize</code>. Module 09's hands-on section has the exact commands.</li>
+      <li>Save base logits from the bf16 model with <code>llama-perplexity --kl-divergence-base</code>, then compute mean KL divergence for each quant.</li>
+      <li>Run <code>llama-bench -p 512 -n 128</code> on every file.</li>
+      <li>Before you look at the results, predict the tg and pp speedups from the bytes ratio.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A table: quant · file size · bits per weight · mean KLD · pp512 tok/s · tg128 tok/s.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Bits/weight computed as 8 × file bytes ÷ parameter count for every row, with any gap from the format's nominal figure explained (tensors such as embeddings kept at higher precision, file metadata).</li>
+      <li>Measured tg speedup over the 16-bit file within ±25% of the bytes-ratio prediction for Q8_0 and Q4_K_M; pp speedup explained as compute-bound. If bf16 runs slowly on your chip, convert to F16 for the baseline instead.</li>
+      <li>You name the smallest quant whose mean KLD stays below a threshold you wrote down before measuring.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L7 -->
+<div class="lab wide" id="lab-L7" data-lab="L7" data-track="core">
+  <div class="lab-head"><span class="lab-id">L7</span><h4>LoRA with mlx-lm that beats prompting</h4><span class="lab-meta">~3.5 h · Mac · <a href="10-finetuning.html#lora">10</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Fine-tune a small instruct model on a narrow task and show, with error bars, that it beats the best prompt you can write.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Pick a task with an automatic metric, such as JSON field extraction, classification or a fixed output format. Build <code>train/valid/test.jsonl</code> with at least 500 / 100 / 200 examples, deduplicated across splits.</li>
+      <li>Baseline: tune a few-shot prompt on the validation set only, then score it once on test.</li>
+      <li>Train a LoRA adapter with <code>mlx_lm.lora</code>, then score it on the same test set with the same decoding settings.</li>
+      <li>Run a 50-question general-ability check before and after, to catch forgetting.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>Per-item results for both systems, the metric table, and the adapter.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>The LoRA beats the prompted baseline on the 200-example held-out test, and the 95% paired-bootstrap interval of the difference excludes zero.</li>
+      <li>Zero overlap between train and test after normalizing whitespace and case.</li>
+      <li>General-ability score drops by no more than a tolerance you set before training.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="bash" data-title="LoRA on a Mac with mlx-lm"><pre><code>
+# data/ holds train.jsonl, valid.jsonl, test.jsonl with one {"messages": [...]} object per line
+mlx_lm.lora --model mlx-community/Qwen2.5-1.5B-Instruct-4bit --train --data ./data \
+  --iters 600 --batch-size 4 --num-layers 16 --learning-rate 1e-4 --adapter-path adapters
+mlx_lm.lora --model mlx-community/Qwen2.5-1.5B-Instruct-4bit --adapter-path adapters --data ./data --test
+mlx_lm.generate --model mlx-community/Qwen2.5-1.5B-Instruct-4bit --adapter-path adapters \
+  --prompt "Extract the fields from: ..." --max-tokens 200
+</code></pre></div>
+</div>
+
+<!-- L8 -->
+<div class="lab wide" id="lab-L8" data-lab="L8" data-track="core">
+  <div class="lab-head"><span class="lab-id">L8</span><h4>DPO, judged fairly</h4><span class="lab-meta">~3.5 h · Mac (0.5B) or cloud GPU · <a href="10-finetuning.html#preference">10</a>, <a href="13-eval-production.html#judge">13</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Preference-tune an SFT model with DPO and measure the win rate with a judge that can't be gamed by answer order.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Start from an instruct model or your own SFT checkpoint. Use a few thousand preference pairs, for example from <code>trl-lib/ultrafeedback_binarized</code>.</li>
+      <li>Train with TRL's <code>DPOTrainer</code> (β = 0.1 to start).</li>
+      <li>Generate answers from SFT and DPO for 200 held-out prompts.</li>
+      <li>Have a judge compare each pair twice, once in each order. A verdict that flips with the order counts as a tie.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>Win/tie/loss counts, judge consistency, and average response length for both models.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>DPO win rate vs SFT ≥ 55% on 200 prompts, with ties counted as half a win, judged in both orders.</li>
+      <li>Judge position-consistency (same verdict in both orders) reported as a percentage.</li>
+      <li>If DPO answers average more than 1.3× the SFT length, you also report a length-controlled win rate.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="python" data-title="dpo.py · TRL"><pre><code>
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOConfig, DPOTrainer
+
+name = "Qwen/Qwen2.5-0.5B-Instruct"            # or your SFT checkpoint
+model = AutoModelForCausalLM.from_pretrained(name)
+tok = AutoTokenizer.from_pretrained(name)
+train = load_dataset("trl-lib/ultrafeedback_binarized", split="train").shuffle(seed=0).select(range(4000))
+
+args = DPOConfig(output_dir="dpo-out", beta=0.1, learning_rate=5e-7, per_device_train_batch_size=2,
+                 gradient_accumulation_steps=8, num_train_epochs=1, max_length=1024, logging_steps=10)
+trainer = DPOTrainer(model=model, args=args, train_dataset=train, processing_class=tok)
+trainer.train()
+trainer.save_model("dpo-out/final")
+</code></pre></div>
+</div>
+
+<!-- L9 -->
+<div class="lab wide" id="lab-L9" data-lab="L9" data-track="core">
+  <div class="lab-head"><span class="lab-id">L9</span><h4>RAG with real evals</h4><span class="lab-meta">~4 h · Mac · <a href="11-rag.html#hybrid">11</a>, <a href="11-rag.html#eval">11 evals</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Build retrieval four ways on a corpus you know, and measure retrieval and generation separately.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Pick 200–2,000 documents you can judge (your notes, a docs site). Write at least 100 questions with gold chunk IDs. LLM-drafted questions are fine if you review each one.</li>
+      <li>Implement dense retrieval (e.g. <code>BAAI/bge-small-en-v1.5</code>), BM25 (<code>rank_bm25</code>), hybrid via reciprocal rank fusion with \(k = 60\), and hybrid + cross-encoder reranking of the top 50.</li>
+      <li>Generate answers from the best configuration and score claim-level faithfulness with an LLM judge.</li>
+      <li>Hand-label 30 answers yourself to check the judge.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A retrieval table (4 configs × recall@5, MRR, p50 latency) and a faithfulness report. Module 11's hands-on section has a minimal pipeline to start from.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Recall@5 for all four configurations on ≥ 100 questions, each with a bootstrap 95% interval.</li>
+      <li>Faithfulness scored on ≥ 50 answers, with judge–human agreement ≥ 85% on your 30 hand-labelled answers.</li>
+      <li>A one-paragraph decision: which configuration you'd ship, and what the reranker costs in latency.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L10 -->
+<div class="lab wide" id="lab-L10" data-lab="L10" data-track="core">
+  <div class="lab-head"><span class="lab-id">L10</span><h4>A tool-using agent and its eval harness</h4><span class="lab-meta">~4 h · Mac or API · <a href="12-agents.html#evals">12</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Write the agent loop yourself, then build the harness that tells you whether a change made it better or worse.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Implement the loop with three tools (e.g. calculator, file search, a local mock HTTP API), a step limit, and tool errors returned to the model as observations.</li>
+      <li>Write 30 tasks, each with a programmatic checker on the final answer or the final state.</li>
+      <li>Run every task 3 times and log tokens, tool calls, wall time and cost.</li>
+      <li>Plant a regression (degrade one tool description) and rerun.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A harness that prints a results table for any agent version, plus a failure log with one category per failure.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>pass@1 and pass^3 over 30 tasks × 3 trials, with mean tokens and cost per task.</li>
+      <li>The harness detects your planted regression as a drop larger than the run-to-run noise you measured.</li>
+      <li>Every failure carries one label: bad plan, wrong tool, bad arguments, gave up, or hallucinated result.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L11 -->
+<div class="lab wide" id="lab-L11" data-lab="L11" data-track="core">
+  <div class="lab-head"><span class="lab-id">L11</span><h4>CLIP zero-shot and Whisper WER</h4><span class="lab-meta">~2.5 h · Mac · <a href="14-multimodal.html#clip">14</a>, <a href="14-multimodal.html#whisper">14 Whisper</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Reproduce two published multimodal numbers on your own machine before trusting any variation of your own.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Run CLIP (e.g. ViT-B/32 via <code>open_clip</code>) zero-shot on the CIFAR-10 test set with the prompt "a photo of a {label}.", then with a prompt ensemble.</li>
+      <li>Transcribe about 200 LibriSpeech test-clean utterances with <code>mlx-whisper</code>.</li>
+      <li>Normalize references and hypotheses with Whisper's English text normalizer (shipped in the <code>openai-whisper</code> package), then compute WER with <code>jiwer</code>.</li>
+      <li>Measure the real-time factor: processing time ÷ audio duration.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>Two small tables: CLIP accuracy per prompt strategy, and WER before/after normalization with RTF.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>CLIP accuracy within 2 points of the number reported for your checkpoint (CLIP paper or the open_clip results table), and the gain from prompt ensembling reported.</li>
+      <li>WER within 1 point (absolute) of the published test-clean figure for your Whisper size (a 200-utterance subset adds some noise of its own), and the raw-vs-normalized WER gap explained.</li>
+      <li>Real-time factor &lt; 1 on your Mac for the model you used.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L12 -->
+<div class="lab wide" id="lab-L12" data-lab="L12" data-track="core">
+  <div class="lab-head"><span class="lab-id">L12</span><h4>2D diffusion/flow toy, then a diffusers sweep</h4><span class="lab-meta">~3 h · Mac · <a href="15-generative-media.html#sampler">15</a>, <a href="15-generative-media.html#cfg">15 CFG</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Train a generative model small enough to see completely, then map the steps × guidance trade-off on a real image model.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Train a small MLP as a DDPM noise predictor or a flow-matching velocity field on 2D two-moons data.</li>
+      <li>Sample 2,000 points at 1, 2, 5, 10, 20, 50 and 100 steps and compute the sliced Wasserstein distance to held-out data.</li>
+      <li>With <code>diffusers</code>, fix 8 prompts and seeds and sweep steps {10, 20, 30, 50} × guidance {1, 3, 5, 7.5, 10} on a model that fits your Mac (an SD-1.5-class model is fine on 16 GB).</li>
+      <li>Score every cell with CLIP score and seconds per image.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A distance-vs-steps plot for the toy and a 20-cell grid table for the real model.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Toy samples reach a sliced Wasserstein distance within 2× of the data-vs-data baseline (two independent draws from the dataset).</li>
+      <li>Grid table filled with CLIP score and latency for all 20 cells.</li>
+      <li>You name the cheapest cell within 1% of the best CLIP score and explain why very high guidance gets worse.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L13 -->
+<div class="lab wide" id="lab-L13" data-lab="L13" data-track="core">
+  <div class="lab-head"><span class="lab-id">L13</span><h4>Fit a scaling law to your own runs</h4><span class="lab-meta">~3 h + background compute · Mac or cloud · <a href="07-training.html#scaling">07</a>, <a href="16-progress.html#scaling">16</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Find out whether you can predict a bigger model's loss from smaller ones, which is the whole point of a scaling law.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Pick a corpus large enough not to repeat (TinyStories or an OpenWebText slice; Tiny Shakespeare is too small).</li>
+      <li>Train 5–6 nanoGPT sizes spanning about 30× in non-embedding parameters, each at roughly 20 tokens per parameter, with the same tokenizer, data order and cosine schedule shape.</li>
+      <li>Record final validation loss and compute \(C = 6ND\) per run.</li>
+      <li>Fit \(L(C) = a\,C^{-\alpha} + E\) on all runs except the largest, then predict it.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A log-log plot of loss vs compute with the fitted curve and the held-out prediction marked.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>The prediction for the held-out largest run lands within 0.05 nats of its measured loss.</li>
+      <li>The fitted exponent \(\alpha\) is reported with a bootstrap interval over runs.</li>
+      <li>Each run's learning-rate schedule decays fully by its own end (not a truncated longer schedule), and you can say why that matters.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="inference-labs">Inference engineering labs (L14–L19)</h2>
+
+<p>These labs make you measure the machine directly. You'll need rented NVIDIA hardware for L14, L15, L17 and L18. L16 and L19 can run on a Mac with small models, but the numbers become more interesting on a datacenter GPU. Rough GPU-hours are in each card. They assume your scripts are ready <em>before</em> the instance starts.</p>
+
+<!-- L14 -->
+<div class="lab wide" id="lab-L14" data-lab="L14" data-track="inf">
+  <div class="lab-head"><span class="lab-id">L14</span><h4>Roofline benchmark: MPS, MLX and a cloud GPU</h4><span class="lab-meta">~3 h (≈1 GPU-h) · <a href="17-gpus.html#roofline">17</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Measure achieved TFLOP/s against matrix size on three backends and explain the curve's shape with the roofline.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Time square matmuls for \(n = 128 \ldots 8192\) in fp16/bf16 with warmup and synchronization (script below), on PyTorch MPS, on MLX, and on one cloud GPU.</li>
+      <li>Compute FLOP/s \(= 2n^3 / t\) and the ideal arithmetic intensity \(2n^3 / (3 n^2 b)\).</li>
+      <li>Measure achievable bandwidth with a large copy (\(\geq\) 1 GB), counting bytes read plus bytes written.</li>
+      <li>Plot achieved FLOP/s against intensity, with the datasheet peak and your measured bandwidth as the roof.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>One roofline plot with three backends, and a table of n, intensity, TFLOP/s and % of peak.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>On the cloud GPU, the largest sizes reach ≥ 60% of the dense datasheet peak for that dtype.</li>
+      <li>Measured copy bandwidth ≥ 70% of the datasheet memory bandwidth on the cloud GPU.</li>
+      <li>You locate the knee for each backend and explain why it sits to the right of the ideal ridge point (launch overhead, tile quantization, too few tiles to fill the SMs). Apple doesn't publish a matmul peak for every chip, so use your best measured value as the Mac ceiling and say so.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="python" data-title="roofline.py"><pre><code>
+import time, torch
+
+dev = "cuda" if torch.cuda.is_available() else "mps"
+dtype = torch.bfloat16 if dev == "cuda" else torch.float16
+sync = torch.cuda.synchronize if dev == "cuda" else torch.mps.synchronize
+
+for n in [128, 256, 512, 1024, 2048, 4096, 8192]:
+    a = torch.randn(n, n, device=dev, dtype=dtype)
+    b = torch.randn(n, n, device=dev, dtype=dtype)
+    for _ in range(5):
+        a @ b
+    sync()
+    iters = min(5000, max(10, int(2e11 / (2 * n**3))))   # more repeats for tiny sizes
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        c = a @ b
+    sync()
+    dt = (time.perf_counter() - t0) / iters
+    ai = 2 * n**3 / (3 * n * n * a.element_size())        # FLOPs per byte with perfect reuse
+    print(f"n={n:5d}  AI={ai:7.1f} FLOP/B  {2 * n**3 / dt / 1e12:8.2f} TFLOP/s")
+</code></pre></div>
+</div>
+
+<!-- L15 -->
+<div class="lab wide" id="lab-L15" data-lab="L15" data-track="inf">
+  <div class="lab-head"><span class="lab-id">L15</span><h4>A fused softmax in Triton</h4><span class="lab-meta">~4 h (≈3 GPU-h) · <a href="18-kernels.html#triton">18</a>, <a href="18-kernels.html#softmax">18 softmax</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Write a row-wise softmax kernel that reads each element once, and measure how close it gets to the memory-bandwidth limit.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>One program per row: load the row with a mask for non-power-of-two widths, subtract the max, exponentiate, sum, divide, store.</li>
+      <li>Check correctness against <code>torch.softmax</code> on random fp16 inputs, including widths like 1000 and 3001.</li>
+      <li>Benchmark M = 4096 rows for N = 256 … 16384 against <code>torch.softmax</code> and a naive eager version (<code>x - x.max</code>, <code>exp</code>, <code>sum</code>, divide as separate ops).</li>
+      <li>Convert time to effective bandwidth: bytes read plus bytes written over time.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A GB/s-vs-N plot with three lines and a horizontal line for the datasheet bandwidth. The <a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a> include a fused softmax; compare with it only after yours works.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Max absolute error ≤ 1e-3 against <code>torch.softmax</code> in fp16 at every width tested, including non-powers of two.</li>
+      <li>Faster than the naive eager version at every N; where <code>torch.softmax</code> wins, you say why.</li>
+      <li>Effective bandwidth ≥ 60% of the GPU's datasheet HBM bandwidth for N ≥ 4096. Smaller problems finish in a few microseconds, so launch overhead hides the bandwidth.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="python" data-title="measuring a memory-bound kernel"><pre><code>
+import torch, triton
+
+x = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
+ms = triton.testing.do_bench(lambda: my_softmax(x), return_mode="median")   # warmup + sync handled
+gbps = 2 * x.numel() * x.element_size() / (ms * 1e-3) / 1e9                 # read x once, write y once
+err = (my_softmax(x) - torch.softmax(x, dim=-1)).abs().max().item()
+print(f"{ms:.3f} ms  {gbps:.0f} GB/s  max err {err:.2e}")
+</code></pre></div>
+</div>
+
+<!-- L16 -->
+<div class="lab wide" id="lab-L16" data-lab="L16" data-track="inf">
+  <div class="lab-head"><span class="lab-id">L16</span><h4>A mini engine with continuous batching</h4><span class="lab-meta">~5 h · Mac or cloud · <a href="19-engines.html#continuous">19</a>, <a href="19-engines.html#build">19 build</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Turn your L5 KV-cache model into a tiny serving engine and show why continuous batching beats static batching.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Write a step loop with a waiting queue and a running batch. Each step: admit waiting requests into free slots, run one decode step for every running sequence (padded KV with masks is fine), and retire finished sequences.</li>
+      <li>Implement a static-batching baseline that waits for the whole batch to finish before admitting more.</li>
+      <li>Workload: 200 requests with output lengths drawn from a long-tailed distribution between 16 and 512 tokens, arriving as a Poisson process.</li>
+      <li>Measure output tokens/s, mean slot utilization and per-request latency for both schedulers at the same maximum batch size.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>An engine of a few hundred lines, a comparison table, and a timeline plot of slot occupancy.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Every request's output is identical to running it alone (greedy, fp32).</li>
+      <li>Continuous batching delivers ≥ 1.5× the output tokens/s of static batching on the long-tailed workload.</li>
+      <li>Measured static-batch slot utilization matches the Module 19 formula (sum of lengths ÷ (batch size × longest), averaged over batches) within 10%.</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L17 -->
+<div class="lab wide" id="lab-L17" data-lab="L17" data-track="inf">
+  <div class="lab-head"><span class="lab-id">L17</span><h4>vLLM tuning sweep against an SLO</h4><span class="lab-meta">~3.5 h (≈4 GPU-h) · <a href="19-engines.html#tuning">19</a>, <a href="19-engines.html#chunked">19 budgets</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Find the vLLM configuration with the highest throughput that still meets a latency SLO you set in advance.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Write the SLO first, e.g. p95 TTFT ≤ 1 s and p95 ITL ≤ 50 ms.</li>
+      <li>Serve a 7–8B model on one GPU. Build a workload in which requests share a 2k-token system prompt and have varied user turns.</li>
+      <li>Sweep <code>--max-num-batched-tokens</code> ∈ {2048, 8192, 16384} × prefix caching on/off × 3 request rates.</li>
+      <li>Record throughput, p50/p95 TTFT and p50/p95 ITL, and read the prefix-cache hit rate from the server's <code>/metrics</code> endpoint.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>An 18-row results table and a recommended configuration with its justification.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>All 18 cells measured, each with at least 300 requests after warmup.</li>
+      <li>You name the configuration with maximum throughput that meets the SLO, or show that none does at the highest rate.</li>
+      <li>The TTFT gain from prefix caching is explained with the measured hit rate and cached-token fraction; the ITL change across token budgets is explained with chunked prefill.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="bash" data-title="vLLM sweep, one cell"><pre><code>
+# prefix caching is on by default in recent vLLM; turn it off for the A/B with --no-enable-prefix-caching
+vllm serve Qwen/Qwen2.5-7B-Instruct --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 &amp;
+
+# synthetic load at a fixed Poisson rate (flag names drift between releases: check --help)
+vllm bench serve --model Qwen/Qwen2.5-7B-Instruct --dataset-name random \
+  --random-input-len 2048 --random-output-len 256 --num-prompts 400 --request-rate 6 \
+  --percentile-metrics ttft,itl --metric-percentiles 50,95
+# for the shared-prefix workload, point your L19 load generator at the same server
+</code></pre></div>
+</div>
+
+<!-- L18 -->
+<div class="lab wide" id="lab-L18" data-lab="L18" data-track="inf">
+  <div class="lab-head"><span class="lab-id">L18</span><h4>Tensor-parallel scaling and nccl-tests</h4><span class="lab-meta">~3 h (≈2 h on an 8-GPU node) · <a href="20-distributed-inference.html#tp">20</a>, <a href="20-distributed-inference.html#collectives">20 collectives</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Measure the interconnect directly, then see how its cost shows up in tensor-parallel decode.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Confirm the topology with <code>nvidia-smi topo -m</code>.</li>
+      <li>Run <code>all_reduce_perf</code> from 8 B to 4 GB on 2, 4 and 8 GPUs; record algbw and busbw.</li>
+      <li>Serve an 8B model with <code>--tensor-parallel-size</code> 1, 2 and 4, and measure batch-1 ITL and maximum throughput per GPU.</li>
+      <li>Predict the per-token all-reduce time (two all-reduces per layer, ring formula) and compare it with a profiler trace.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>A busbw-vs-message-size plot (one line per GPU count) and a TP scaling table.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>Large-message busbw reported as a fraction of the per-GPU NVLink bandwidth, and the message size where busbw reaches half its plateau read off the curve.</li>
+      <li>TP table: batch-1 ITL and throughput per GPU at TP = 1, 2, 4, with scaling efficiency.</li>
+      <li>Predicted all-reduce time per token within 2× of the trace, or a written explanation of the gap (latency term, small messages, overlap).</li>
+    </ul></div>
+  </div>
+</div>
+
+<!-- L19 -->
+<div class="lab wide" id="lab-L19" data-lab="L19" data-track="inf">
+  <div class="lab-head"><span class="lab-id">L19</span><h4>A serving platform: replicas, a router, open-loop load</h4><span class="lab-meta">~5 h (≈4 h on 2 GPUs, or a Mac) · <a href="21-serving-platform.html">21</a></span><span class="lab-status"></span></div>
+  <div class="lab-body">
+    <div class="lk">Goal</div><div><p>Find the knee of a throughput–latency curve, and measure what prefix-aware routing buys over round-robin.</p></div>
+    <div class="lk">Steps</div><div><ol>
+      <li>Run two replicas: vLLM on two GPUs, or two <code>llama-server</code> processes with a small model on a Mac.</li>
+      <li>Write a router of about 100 lines that proxies streaming requests. Policy A is round-robin. Policy B is prefix affinity: hash the conversation ID or the first few hundred prompt characters to a replica, and fall back to the less-loaded one when the in-flight imbalance exceeds a threshold.</li>
+      <li>Drive it with an open-loop Poisson load generator (below), using a multi-turn workload whose turns share prefixes.</li>
+      <li>Step the request rate up until p95 TTFT passes your SLO, for each policy.</li>
+    </ol></div>
+    <div class="lk">Deliverable</div><div><p>Two throughput-vs-p95-TTFT curves on one plot, plus per-replica cache hit rates.</p></div>
+    <div class="lk">Exit criteria</div><div><ul class="exit">
+      <li>At least 6 offered-load points per policy, with the knee identified.</li>
+      <li>At the same sub-saturation load, prefix affinity shows lower p95 TTFT and a higher cache hit rate than round-robin, with both numbers reported.</li>
+      <li>The generator is verifiably open-loop: the achieved arrival rate stays within 5% of the target even past saturation.</li>
+    </ul></div>
+  </div>
+  <div class="code" data-lang="python" data-title="loadgen.py · open-loop, streaming, OpenAI-compatible"><pre><code>
+import asyncio, random, time
+import httpx
+
+URL, MODEL = "http://localhost:9000/v1/completions", "served-model-name"
+
+async def one(client, prompt, out):
+    t0, first, last, gaps = time.perf_counter(), None, None, []
+    body = {"model": MODEL, "prompt": prompt, "max_tokens": 128, "stream": True}
+    async with client.stream("POST", URL, json=body) as r:
+        async for line in r.aiter_lines():
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            now = time.perf_counter()
+            if first is None:
+                first = now
+            else:
+                gaps.append(now - last)               # chunk gaps approximate ITL
+            last = now
+    if first is not None:
+        out.append({"ttft": first - t0, "itl": gaps, "e2e": last - t0})
+
+async def run(rate, n, prompts):
+    out, tasks = [], []
+    async with httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None)) as client:
+        start = next_t = time.perf_counter()
+        for _ in range(n):
+            next_t += random.expovariate(rate)        # schedule arrivals on an absolute clock
+            await asyncio.sleep(max(0.0, next_t - time.perf_counter()))
+            tasks.append(asyncio.create_task(one(client, random.choice(prompts), out)))
+        sent_rate = n / (time.perf_counter() - start) # must stay near `rate`, even when the server is slow
+        await asyncio.gather(*tasks)
+    ttft = sorted(o["ttft"] for o in out)
+    p95 = ttft[int(0.95 * (len(ttft) - 1))]
+    print(f"target {rate:.1f}/s  sent {sent_rate:.2f}/s  p95 TTFT {p95 * 1e3:.0f} ms  completed {len(out)}")
+
+# asyncio.run(run(rate=4.0, n=400, prompts=my_prompts))
+</code></pre></div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="tracker">Track your progress</h2>
+
+<p>The tracker reads the exit criteria straight from the cards above, so the two always agree. Tick a lab to mark all its criteria at once, or tick criteria one at a time as you meet them. Everything is stored in this browser's local storage. Nothing leaves your machine.</p>
+
+<div id="w-tracker"></div>
+
+<div class="mle"><b>MLE angle · the notebook is the portfolio</b>
+<p>When you finish a lab, paste its results table and the explanation of the gap into one running document. After 19 labs, that document beats a list of course certificates: anyone reading it can see that you predict, measure and explain. Keep the tables in the same column order each time so they're easy to compare later.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="capstone">Capstone options</h2>
+
+<p>Pick one capstone and spend about three weeks on it. Write the success metric and the baseline before starting, then hold yourself to them. Changing the metric halfway through to match what you got is the most common way a capstone quietly fails.</p>
+
+<div class="grid3">
+  <div class="card"><div class="k">A · Serving</div><h4>Serve a fine-tuned model at an SLO for the lowest $/1M tokens</h4><p>Take your L7 adapter (or train one on a 7–8B model), then compare at least three serving configurations: bf16, FP8 or AWQ weights, and a different GPU class or an FP8 KV cache.</p><p><b>Success metric:</b> cost per 1M output tokens at the load where p95 TTFT ≤ 800 ms and p95 ITL ≤ 40 ms, with task quality within 1 point of the bf16 model on your held-out set.</p></div>
+  <div class="card blue"><div class="k">B · Product</div><h4>A RAG product with evals that gate releases</h4><p>Build on L9 and L10: a question-answering service over a real corpus, with an eval suite that runs on every change and blocks regressions.</p><p><b>Success metric:</b> a 200+ question eval reporting recall@5, faithfulness and answer correctness with intervals; a check that fails when a metric drops by more than its interval; p95 end-to-end latency ≤ 2.5 s; cost per query reported.</p></div>
+  <div class="card warn"><div class="k">C · Kernels</div><h4>Write and benchmark a custom kernel</h4><p>Pick one: fused RMSNorm + residual add, an int4 dequantize-GEMV for batch-1 decode, or split-K decode attention. Write it in Triton (or CUDA), test it across shapes, and plug it into a model.</p><p><b>Success metric:</b> correct to a stated tolerance on every tested shape; ≥ 70% of the roofline bound for its regime; an end-to-end tokens/s gain in a real model, reported with an interval, even if it's only a few percent.</p></div>
+</div>
+
+<div class="intuition"><b>Choosing</b>
+<p>Pick the capstone closest to the job you want next. Serving work wants A, applied-ML product work wants B, and kernel or performance teams look for C. Whichever you pick, the write-up should open with the metric table, then the predictions you made, then what surprised you.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="skills">Skills self-assessment</h2>
+
+<p>Rate yourself on each area using the rubric, save a baseline, and come back every few weeks. The two target profiles are illustrative, not job requirements. An applied MLE leans on evaluation, adaptation and retrieval. An inference engineer leans on the machine and the serving stack. Both need the transformer and the inference basics in solid shape.</p>
+
+<table class="t">
+  <thead><tr><th class="num">Score</th><th>Meaning</th><th>Evidence that counts</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td>New to it</td><td>None yet</td></tr>
+    <tr><td class="num">1</td><td>Can define it</td><td>You could write a glossary entry</td></tr>
+    <tr><td class="num">2</td><td>Can explain it</td><td>You could whiteboard it for a colleague, including the formula</td></tr>
+    <tr><td class="num">3</td><td>Have built a toy version</td><td>The related lab's exit criteria are met</td></tr>
+    <tr><td class="num">4</td><td>Can tune and debug it in a real system</td><td>You've fixed a real problem in it, with before/after numbers</td></tr>
+    <tr><td class="num">5</td><td>Can predict and teach it</td><td>You predict its numbers before measuring, and you're usually right</td></tr>
+  </tbody>
+</table>
+
+<div id="w-radar"></div>
+
+<!-- ================================================================== -->
+<h2 id="cheatsheet">Formula cheat sheet</h2>
+
+<p>These twelve formulas answer most sizing questions you'll get: will it fit, how fast can it go, what will it cost, and is the result real? Each links to the module that derives it. Example numbers are worked from the formulas, not measured.</p>
+
+<div class="cheat wide">
+
+<div class="formula" data-name="Weight memory">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{w}}} = \htmlClass{t2}{N}\cdot\frac{\htmlClass{t3}{b}}{8}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{w}}\)</dt><dd>bytes of weights</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameter count</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>bits per weight, including scale overhead</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>8B at 16 bits is 16 GB; at 4.5 bits, 4.5 GB.</p>
+  <p class="why"><b>Module</b><a href="09-quantization.html#why">09 · Why quantize at all</a></p>
+</div>
+
+<div class="formula" data-name="KV cache bytes">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{KV}}} = 2\,\htmlClass{t2}{L}\,\htmlClass{t3}{H_{kv}}\,\htmlClass{t4}{d_h}\,\htmlClass{t5}{b}\,\htmlClass{t6}{T}\,\htmlClass{t7}{B}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{KV}}\)</dt><dd>total cache bytes (the 2 is K and V)</dd></div>
+    <div data-t="t2"><dt>\(L\)</dt><dd>layers</dd></div>
+    <div data-t="t3"><dt>\(H_{kv}\)</dt><dd>KV heads (fewer than query heads under GQA)</dd></div>
+    <div data-t="t4"><dt>\(d_h\)</dt><dd>head dimension</dd></div>
+    <div data-t="t5"><dt>\(b\)</dt><dd>bytes per element (2 for bf16)</dd></div>
+    <div data-t="t6"><dt>\(T\)</dt><dd>tokens of context</dd></div>
+    <div data-t="t7"><dt>\(B\)</dt><dd>concurrent sequences</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Llama-3-8B: 2 × 32 × 8 × 128 × 2 B = 128 KiB per token, so 4 GiB for one 32k-token conversation.</p>
+  <p class="why"><b>Module</b><a href="08-inference.html#kvcache">08 · The KV cache</a></p>
+</div>
+
+<div class="formula" data-name="Decode ceiling (batch 1)">
+  <div class="tex">$$\htmlClass{t1}{\text{tok/s}} \lesssim \frac{\htmlClass{t2}{B_{\text{mem}}}}{\htmlClass{t3}{M_{\text{w}}} + \htmlClass{t4}{M_{\text{KV}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>tok/s</dt><dd>upper bound on generation speed for one sequence</dd></div>
+    <div data-t="t2"><dt>\(B_{\text{mem}}\)</dt><dd>memory bandwidth in bytes/s</dd></div>
+    <div data-t="t3"><dt>\(M_{\text{w}}\)</dt><dd>weight bytes read per token (active params for MoE)</dd></div>
+    <div data-t="t4"><dt>\(M_{\text{KV}}\)</dt><dd>cache bytes read per token</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>400 GB/s over a 4.5 GB model caps decode near 89 tok/s; expect 60–85% of that.</p>
+  <p class="why"><b>Module</b><a href="00-start.html#mental-model">00 · Bytes and FLOPs per token</a></p>
+</div>
+
+<div class="formula" data-name="Training compute">
+  <div class="tex">$$\htmlClass{t1}{C} \approx 6\,\htmlClass{t2}{N}\,\htmlClass{t3}{D}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(C\)</dt><dd>total training FLOPs</dd></div>
+    <div data-t="t2"><dt>\(N\)</dt><dd>parameters</dd></div>
+    <div data-t="t3"><dt>\(D\)</dt><dd>training tokens</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>2 FLOPs per parameter per token forward, 4 backward. 8B on 15T tokens ≈ 7.2 × 10²³ FLOPs.</p>
+  <p class="why"><b>Module</b><a href="07-training.html#compute">07 · Training compute</a></p>
+</div>
+
+<div class="formula" data-name="Scaled dot-product attention">
+  <div class="tex">$$\mathrm{Attn}(\htmlClass{t1}{Q},\htmlClass{t2}{K},\htmlClass{t3}{V}) = \mathrm{softmax}\!\left(\frac{\htmlClass{t1}{Q}\htmlClass{t2}{K}^{\top}}{\sqrt{\htmlClass{t4}{d_k}}} + \htmlClass{t5}{M}\right)\htmlClass{t3}{V}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(Q\)</dt><dd>queries: what each position is looking for</dd></div>
+    <div data-t="t2"><dt>\(K\)</dt><dd>keys: what each position offers</dd></div>
+    <div data-t="t3"><dt>\(V\)</dt><dd>values: what gets mixed into the output</dd></div>
+    <div data-t="t4"><dt>\(d_k\)</dt><dd>head dimension; the square root keeps scores at unit scale</dd></div>
+    <div data-t="t5"><dt>\(M\)</dt><dd>mask: \(-\infty\) above the diagonal for causal models</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Score every key against every query, turn scores into weights, average the values.</p>
+  <p class="why"><b>Module</b><a href="06-transformer.html#sdpa">06 · Scaled dot-product attention</a></p>
+</div>
+
+<div class="formula" data-name="Cross-entropy (next-token loss)">
+  <div class="tex">$$\htmlClass{t1}{\mathcal{L}} = -\frac{1}{\htmlClass{t2}{T}}\sum_{t=1}^{\htmlClass{t2}{T}} \log \htmlClass{t3}{p_\theta}\big(\htmlClass{t4}{x_t} \mid \htmlClass{t5}{x_{\lt t}}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(\mathcal{L}\)</dt><dd>mean loss in nats per token; perplexity is \(e^{\mathcal{L}}\)</dd></div>
+    <div data-t="t2"><dt>\(T\)</dt><dd>tokens scored</dd></div>
+    <div data-t="t3"><dt>\(p_\theta\)</dt><dd>the model's predicted distribution</dd></div>
+    <div data-t="t4"><dt>\(x_t\)</dt><dd>the token that actually came next</dd></div>
+    <div data-t="t5"><dt>\(x_{\lt t}\)</dt><dd>everything before it</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Average surprise at the true next token. Uniform over 27 characters gives ln 27 ≈ 3.30.</p>
+  <p class="why"><b>Module</b><a href="03-probability.html#cross-entropy">03 · Cross-entropy</a></p>
+</div>
+
+<div class="formula" data-name="LoRA trainable parameters">
+  <div class="tex">$$\htmlClass{t1}{P_{\text{LoRA}}} = \htmlClass{t2}{r}\,\big(\htmlClass{t3}{d_{\text{in}}} + \htmlClass{t4}{d_{\text{out}}}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(P_{\text{LoRA}}\)</dt><dd>trainable parameters for one adapted matrix</dd></div>
+    <div data-t="t2"><dt>\(r\)</dt><dd>rank</dd></div>
+    <div data-t="t3"><dt>\(d_{\text{in}}\)</dt><dd>input dimension (columns of A's input)</dd></div>
+    <div data-t="t4"><dt>\(d_{\text{out}}\)</dt><dd>output dimension</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>r = 16 on a 4096 × 4096 matrix: 131k parameters instead of 16.8M, under 1%.</p>
+  <p class="why"><b>Module</b><a href="10-finetuning.html#lora">10 · LoRA</a></p>
+</div>
+
+<div class="formula" data-name="Reciprocal rank fusion">
+  <div class="tex">$$\htmlClass{t1}{\text{RRF}(d)} = \sum_{\htmlClass{t2}{r}\in R} \frac{1}{\htmlClass{t3}{k} + \htmlClass{t4}{\text{rank}_r(d)}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>RRF(d)</dt><dd>fused score of document \(d\)</dd></div>
+    <div data-t="t2"><dt>\(r\)</dt><dd>one ranked list (BM25, dense, …) in the set \(R\)</dd></div>
+    <div data-t="t3"><dt>\(k\)</dt><dd>damping constant, conventionally 60</dd></div>
+    <div data-t="t4"><dt>rank</dt><dd>1-based position of \(d\) in list \(r\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Fuse rankings by position only, so incompatible score scales never need calibrating.</p>
+  <p class="why"><b>Module</b><a href="11-rag.html#hybrid">11 · Hybrid search</a></p>
+</div>
+
+<div class="formula" data-name="Unbiased pass@k">
+  <div class="tex">$$\htmlClass{t1}{\text{pass@}k} = 1 - \frac{\binom{\htmlClass{t2}{n}-\htmlClass{t3}{c}}{\htmlClass{t4}{k}}}{\binom{\htmlClass{t2}{n}}{\htmlClass{t4}{k}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>pass@k</dt><dd>chance at least one of \(k\) samples is correct (averaged over tasks)</dd></div>
+    <div data-t="t2"><dt>\(n\)</dt><dd>samples drawn per task</dd></div>
+    <div data-t="t3"><dt>\(c\)</dt><dd>samples that passed</dd></div>
+    <div data-t="t4"><dt>\(k\)</dt><dd>attempts you're allowed</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>One minus the chance that a random size-\(k\) subset contains no correct sample.</p>
+  <p class="why"><b>Module</b><a href="13-eval-production.html#passk">13 · pass@k</a></p>
+</div>
+
+<div class="formula" data-name="Roofline ridge point">
+  <div class="tex">$$\htmlClass{t1}{AI^{*}} = \frac{\htmlClass{t2}{P_{\text{peak}}}}{\htmlClass{t3}{BW}}, \qquad \htmlClass{t4}{P_{\text{att}}} = \min\big(\htmlClass{t2}{P_{\text{peak}}},\ \htmlClass{t5}{AI}\cdot\htmlClass{t3}{BW}\big)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(AI^{*}\)</dt><dd>ridge point: FLOPs per byte needed to become compute-bound</dd></div>
+    <div data-t="t2"><dt>\(P_{\text{peak}}\)</dt><dd>peak FLOP/s for the dtype</dd></div>
+    <div data-t="t3"><dt>\(BW\)</dt><dd>memory bandwidth, bytes/s</dd></div>
+    <div data-t="t4"><dt>\(P_{\text{att}}\)</dt><dd>best FLOP/s this kernel can reach</dd></div>
+    <div data-t="t5"><dt>\(AI\)</dt><dd>the kernel's arithmetic intensity</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>H100 SXM: 989 TFLOP/s ÷ 3.35 TB/s ≈ 295 FLOP/byte. Batch-1 decode sits near 1.</p>
+  <p class="why"><b>Module</b><a href="17-gpus.html#roofline">17 · Roofline deep dive</a></p>
+</div>
+
+<div class="formula" data-name="Ring all-reduce time">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{AR}}} \approx 2\,\frac{\htmlClass{t2}{p}-1}{\htmlClass{t2}{p}}\cdot\frac{\htmlClass{t3}{S}}{\htmlClass{t4}{BW}} + 2(\htmlClass{t2}{p}-1)\,\htmlClass{t5}{\alpha}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{AR}}\)</dt><dd>time for one all-reduce</dd></div>
+    <div data-t="t2"><dt>\(p\)</dt><dd>GPUs in the ring</dd></div>
+    <div data-t="t3"><dt>\(S\)</dt><dd>message size in bytes</dd></div>
+    <div data-t="t4"><dt>\(BW\)</dt><dd>per-GPU link bandwidth, one direction</dd></div>
+    <div data-t="t5"><dt>\(\alpha\)</dt><dd>per-step latency (microseconds)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each GPU sends and receives about 2S regardless of p. For small decode messages the latency term dominates.</p>
+  <p class="why"><b>Module</b><a href="20-distributed-inference.html#collectives">20 · Collectives</a></p>
+</div>
+
+<div class="formula" data-name="Cost per 1M tokens (self-hosted)">
+  <div class="tex">$$\htmlClass{t1}{c_{1\text{M}}} = \frac{\htmlClass{t2}{n_{\text{GPU}}}\cdot\htmlClass{t3}{p_{\text{hr}}}}{3600\cdot\htmlClass{t4}{\Theta}}\times 10^{6}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(c_{1\text{M}}\)</dt><dd>dollars per million output tokens</dd></div>
+    <div data-t="t2"><dt>\(n_{\text{GPU}}\)</dt><dd>GPUs serving</dd></div>
+    <div data-t="t3"><dt>\(p_{\text{hr}}\)</dt><dd>price per GPU-hour</dd></div>
+    <div data-t="t4"><dt>\(\Theta\)</dt><dd>aggregate tokens/s sustained <em>at your SLO</em></dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>One GPU at $2.50/h sustaining 2,500 tok/s: about $0.28 per 1M tokens, at full utilization.</p>
+  <p class="why"><b>Module</b><a href="13-eval-production.html#cost">13 · Cost and caching</a>, also <a href="21-serving-platform.html">21</a></p>
+</div>
+
+</div>
+
+<!-- ================================================================== -->
+<h2 id="reading">Reading list</h2>
+
+<p>Read papers with a lab open. Most of these come with a number you can reproduce at small scale, and reproducing it teaches more than a second read-through. The "Lab" column says where each paper pays off.</p>
+
+<h3>Transformers and scaling</h3>
+<table class="t">
+  <thead><tr><th>Paper</th><th>Authors</th><th>Why read it</th><th>Lab</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a></td><td>Vaswani et al., 2017</td><td>The architecture everything else modifies</td><td>L3</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2005.14165">Language Models are Few-Shot Learners (GPT-3)</a></td><td>Brown et al., 2020</td><td>In-context learning appears with scale; the prompt-baseline idea behind L7</td><td>L7</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2001.08361">Scaling Laws for Neural Language Models</a></td><td>Kaplan et al., 2020</td><td>Loss as a power law in N, D and C</td><td>L13</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2203.15556">Training Compute-Optimal Large Language Models (Chinchilla)</a></td><td>Hoffmann et al., 2022</td><td>Why about 20 tokens per parameter</td><td>L13</td></tr>
+  </tbody>
+</table>
+
+<h3>Adapting models</h3>
+<table class="t">
+  <thead><tr><th>Paper</th><th>Authors</th><th>Why read it</th><th>Lab</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2106.09685">LoRA</a></td><td>Hu et al., 2021</td><td>Low-rank updates and why they work</td><td>L7</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2305.14314">QLoRA</a></td><td>Dettmers et al., 2023</td><td>NF4, double quantization, paged optimizers</td><td>L7</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2203.02155">Training language models to follow instructions (InstructGPT)</a></td><td>Ouyang et al., 2022</td><td>The SFT → reward model → RL pipeline</td><td>L8</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2305.18290">Direct Preference Optimization</a></td><td>Rafailov et al., 2023</td><td>Preference tuning without a reward model or RL loop</td><td>L8</td></tr>
+  </tbody>
+</table>
+
+<h3>Retrieval and agents</h3>
+<table class="t">
+  <thead><tr><th>Paper</th><th>Authors</th><th>Why read it</th><th>Lab</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2005.11401">Retrieval-Augmented Generation</a></td><td>Lewis et al., 2020</td><td>The original retriever + generator setup</td><td>L9</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2307.03172">Lost in the Middle</a></td><td>Liu et al., 2023</td><td>Where in the context retrieved text gets used</td><td>L9</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2210.03629">ReAct</a></td><td>Yao et al., 2022</td><td>Interleaving reasoning and tool calls</td><td>L10</td></tr>
+  </tbody>
+</table>
+
+<h3>Inference, quantization and kernels</h3>
+<table class="t">
+  <thead><tr><th>Paper</th><th>Authors</th><th>Why read it</th><th>Lab</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2205.14135">FlashAttention</a></td><td>Dao et al., 2022</td><td>IO-aware attention: tiling plus online softmax</td><td>L15</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2307.08691">FlashAttention-2</a></td><td>Dao, 2023</td><td>Better work partitioning across warps and blocks</td><td>L15</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2210.17323">GPTQ</a></td><td>Frantar et al., 2022</td><td>Second-order post-training quantization</td><td>L6</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2306.00978">AWQ</a></td><td>Lin et al., 2023</td><td>Activation-aware scaling of salient channels</td><td>L6</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2211.17192">Fast Inference from Transformers via Speculative Decoding</a></td><td>Leviathan et al., 2023</td><td>Draft-then-verify with exact output distribution</td><td>L5, L16</td></tr>
+  </tbody>
+</table>
+
+<h3>Serving and distributed inference</h3>
+<table class="t">
+  <thead><tr><th>Paper</th><th>Authors</th><th>Why read it</th><th>Lab</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for LLM Serving with PagedAttention (vLLM)</a></td><td>Kwon et al., 2023</td><td>Paged KV cache and the case for continuous batching</td><td>L16, L17</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2312.07104">SGLang</a></td><td>Zheng et al., 2023</td><td>RadixAttention prefix sharing and structured programs</td><td>L17, L19</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2403.02310">Sarathi-Serve</a></td><td>Agrawal et al., 2024</td><td>Chunked prefill and stall-free batching</td><td>L17</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/1909.08053">Megatron-LM</a></td><td>Shoeybi et al., 2019</td><td>Tensor parallelism for transformer layers</td><td>L18</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2401.09670">DistServe</a></td><td>Zhong et al., 2024</td><td>Disaggregating prefill and decode for goodput</td><td>L19</td></tr>
+  </tbody>
+</table>
+
+<h3>Multimodal and generative</h3>
+<table class="t">
+  <thead><tr><th>Paper</th><th>Authors</th><th>Why read it</th><th>Lab</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2010.11929">An Image is Worth 16x16 Words (ViT)</a></td><td>Dosovitskiy et al., 2020</td><td>Images as patch tokens</td><td>L11</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2103.00020">Learning Transferable Visual Models from Natural Language Supervision (CLIP)</a></td><td>Radford et al., 2021</td><td>Contrastive image–text training and zero-shot classification</td><td>L11</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2212.04356">Robust Speech Recognition via Large-Scale Weak Supervision (Whisper)</a></td><td>Radford et al., 2022</td><td>Encoder–decoder ASR; the normalizer matters for WER</td><td>L11</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2006.11239">Denoising Diffusion Probabilistic Models</a></td><td>Ho et al., 2020</td><td>The noise-prediction objective</td><td>L12</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2112.10752">High-Resolution Image Synthesis with Latent Diffusion Models</a></td><td>Rombach et al., 2021</td><td>Diffusion in a VAE latent space</td><td>L12</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2210.02747">Flow Matching for Generative Modeling</a></td><td>Lipman et al., 2022</td><td>Regressing a velocity field along straight paths</td><td>L12</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2212.09748">Scalable Diffusion Models with Transformers (DiT)</a></td><td>Peebles &amp; Xie, 2022</td><td>The transformer denoiser behind most current image and video models</td><td>L12</td></tr>
+  </tbody>
+</table>
+
+<h3>Courses and books</h3>
+<table class="t">
+  <thead><tr><th>Resource</th><th>Best for</th><th>Pairs with</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://karpathy.ai/zero-to-hero.html">Neural Networks: Zero to Hero</a> (Andrej Karpathy)</td><td>Building micrograd, makemore and GPT from a blank file, on video</td><td>L1–L3</td></tr>
+    <tr><td><a href="https://stanford-cs336.github.io/">Stanford CS336: Language Modeling from Scratch</a></td><td>Tokenizers, training, systems and scaling, with demanding assignments</td><td>L3, L4, L13, L14</td></tr>
+    <tr><td><a href="https://web.stanford.edu/class/cs224n/">Stanford CS224N: NLP with Deep Learning</a></td><td>Broader NLP grounding and lecture notes</td><td>Modules 04–06</td></tr>
+    <tr><td><a href="https://d2l.ai">Dive into Deep Learning (d2l.ai)</a></td><td>A free textbook with runnable code for every chapter</td><td>Modules 01–07</td></tr>
+    <tr><td><a href="https://jax-ml.github.io/scaling-book/">How to Scale Your Model</a></td><td>Rooflines, sharding and collective costs for transformers, worked out in numbers</td><td>L14, L18</td></tr>
+    <tr><td><a href="https://github.com/chiphuyen/aie-book">AI Engineering</a> (Chip Huyen, 2025)</td><td>Evaluation, RAG, agents and deployment from the application side</td><td>L9, L10, capstone B</td></tr>
+    <tr><td><a href="https://github.com/rasbt/LLMs-from-scratch">Build a Large Language Model (From Scratch)</a> (Sebastian Raschka)</td><td>A GPT plus fine-tuning, step by step in PyTorch</td><td>L3, L7</td></tr>
+    <tr><td>Programming Massively Parallel Processors (Hwu, Kirk &amp; El Hajj, 4th ed.)</td><td>The standard CUDA text: memory hierarchy, tiling, reductions</td><td>L14, L15, capstone C</td></tr>
+    <tr><td><a href="https://github.com/gpu-mode/lectures">GPU MODE lectures</a></td><td>Community lectures on CUDA, Triton, profiling and kernel case studies</td><td>L15, capstone C</td></tr>
+    <tr><td><a href="https://huggingface.co/learn">Hugging Face courses</a></td><td>Practical courses on transformers, diffusion, agents and more</td><td>L7–L12</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="habits">Habits of strong MLEs and inference engineers</h2>
+
+<p>Talent matters less here than routine. The people who get very good at this work tend to repeat a small set of behaviours until they're automatic. Most of them are the lab loop applied to everyday work.</p>
+
+<table class="t">
+  <thead><tr><th>Habit</th><th>What it looks like on a normal Tuesday</th></tr></thead>
+  <tbody>
+    <tr><td>Predict before you run</td><td>A comment above the benchmark call: <code># expect ~85 tok/s (bandwidth-bound)</code>. The gap gets investigated, not ignored.</td></tr>
+    <tr><td>Know the datasheet by heart</td><td>Memory bandwidth, peak FLOP/s per dtype, memory size and link bandwidth for the two or three chips you use most, so sizing questions get answered in a meeting rather than after one.</td></tr>
+    <tr><td>Eval first, model second</td><td>The test set and its scorer exist before the first fine-tuning run, and per-item results are kept so paired comparisons are possible.</td></tr>
+    <tr><td>One change at a time</td><td>A sweep script and a results table instead of a notebook edited in place. Every row records the git commit and library versions.</td></tr>
+    <tr><td>Profile, then optimize</td><td>A trace (Nsight Systems, the PyTorch profiler, Instruments on a Mac) before touching code. Time goes to the kernel the trace points at, not the one that looks slow.</td></tr>
+    <tr><td>Reproduce, then extend</td><td>A paper's headline number at small scale before your own variant. If you can't reproduce the baseline, your improvement means nothing yet.</td></tr>
+    <tr><td>Read the engine's source</td><td>When vLLM or llama.cpp does something surprising, the answer is in the scheduler or the kernel dispatch code, and reading it is faster than guessing.</td></tr>
+    <tr><td>Watch the units</td><td>GB vs GiB, tokens vs characters, per-GPU vs aggregate throughput, p50 vs p95. Most "impossible" results are unit mistakes.</td></tr>
+    <tr><td>Cost is a metric</td><td>Every serving result carries a $/1M-token figure next to its latency, and cloud instances shut themselves down when idle.</td></tr>
+    <tr><td>Write it down short</td><td>A half-page note per experiment: question, prediction, result, explanation. These notes become the design docs and interview stories later.</td></tr>
+  </tbody>
+</table>
+
+<div class="flag"><b>A caution about pace</b>
+<p>The 18-week plan assumes steady weeks. Real weeks aren't steady. When one slips, finish the current lab's exit criteria before starting the next module. Momentum comes from closed loops, not from pages read.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="22-main" data-title="Check yourself · Lab design and measurement">
+  <div class="q" data-answer="2"><p>You wrap <code>c = a @ b</code> (two 4096×4096 fp16 tensors on MPS) in <code>time.perf_counter()</code> calls and get 0.02 ms. That works out to about 6,900 TFLOP/s. What happened?</p>
+    <ol><li>MPS used a sparse kernel that skipped zeros</li><li>The result was cached from an earlier identical call</li><li>The GPU runs asynchronously, so you timed the launch, not the work. Synchronize before reading the clock</li><li><code>perf_counter</code> only has millisecond resolution on macOS</li></ol>
+    <div class="explain">2 × 4096³ ≈ 1.37 × 10¹¹ FLOPs in 2 × 10⁻⁵ s is about 6.9 × 10¹⁵ FLOP/s, about seven times an H100's dense bf16 peak and hundreds of times what a laptop GPU can do. The call returned as soon as the kernel was queued. Call <code>torch.mps.synchronize()</code> (or <code>torch.cuda.synchronize()</code>, or <code>mx.eval</code> in MLX) before stopping the timer, and discard warmup iterations.</div></div>
+  <div class="q" data-answer="0"><p>Your load generator runs 32 workers, each sending its next request only after the previous one finishes. As you push the server toward saturation, p95 TTFT barely moves. Why is this curve misleading?</p>
+    <ol><li>A closed loop slows its own arrival rate when the server slows down, so queues never build the way real, independent traffic would build them</li><li>32 workers is too few samples to estimate a p95</li><li>TTFT has to be measured on the server, not the client</li><li>Streaming responses hide when the first token arrives</li></ol>
+    <div class="explain">Real users don't wait for each other. In a closed loop, a slow server automatically receives fewer requests, which hides the queueing delay you're trying to measure (often called coordinated omission). L19 requires an open-loop generator whose achieved arrival rate stays on target past saturation.</div></div>
+  <div class="q" data-answer="1"><p>In L14, a 4096×4096 bf16 matmul takes 0.25 ms on an H100 SXM (dense bf16 peak ≈ 989 TFLOP/s). What fraction of peak is that?</p>
+    <ol><li>About 28%</li><li>About 56%</li><li>About 111%</li><li>About 14%</li></ol>
+    <div class="explain">2 × 4096³ = 1.374 × 10¹¹ FLOPs; ÷ 0.25 × 10⁻³ s = 550 TFLOP/s; ÷ 989 ≈ 0.56. Forgetting the factor of 2 gives 28%. A result over 100% means a timing bug, like the one in the first question. This run would miss L14's 60% exit criterion, so try larger n or check clocks and power limits.</div></div>
+  <div class="q" data-answer="3"><p>In L8 a judge compares DPO and SFT answers on 200 prompts, once in each order. DPO wins consistently 120 times, SFT wins consistently 50 times, and 30 verdicts flip with the order. Counting flipped verdicts as ties (half a win each), what is DPO's win rate?</p>
+    <ol><li>60.0%</li><li>70.6%</li><li>85.0%</li><li>67.5%</li></ol>
+    <div class="explain">(120 + 0.5 × 30) / 200 = 135 / 200 = 67.5%. 60% ignores the ties entirely, 70.6% drops them from the denominator (which hides the judge's indecision), and 85% is the judge's position-consistency rate, (120 + 50) / 200.</div></div>
+  <div class="q" data-answer="2"><p>Your L7 LoRA scores 0.78 accuracy and the prompted baseline 0.74, both on the same 100 test examples. Have you met the exit criterion?</p>
+    <ol><li>Yes: a 4-point gain is a clear win</li><li>No: a LoRA has to beat prompting by at least 10 points</li><li>Not shown yet. Each score's 95% interval is about ±8 points, so run a paired test on per-item results or grow the test set</li><li>Yes, provided the training loss went down</li></ol>
+    <div class="explain">SE ≈ √(0.76 × 0.24 / 100) ≈ 0.043, so ±1.96 SE ≈ ±8.4 points per system. A paired comparison over the same items (bootstrap or McNemar) is tighter because both systems face identical questions, but 4 points on 100 items rarely clears it. That's why the lab asks for 200+ test items and a paired interval that excludes zero.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, seg, stats, plot, widget, fmtNum, rng, palette, clamp, store } = C;
+
+  const arrowDefs = (s, id, color) => {
+    const defs = svg("defs");
+    defs.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color })));
+    s.appendChild(defs);
+  };
+  const T = (s, x, y, text, o) => s.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, text }, o || {})));
+
+  /* ---------------------------------------------------------- lab data shared by tracker + planner */
+  const cards = Array.from(document.querySelectorAll(".lab[data-lab]"));
+  const LABS = cards.map(c => ({
+    id: c.dataset.lab,
+    track: c.dataset.track,
+    title: c.querySelector("h4").textContent,
+    lis: Array.from(c.querySelectorAll("ul.exit > li")),
+    card: c,
+    status: c.querySelector(".lab-status")
+  }));
+  const LAB_KEY = "22:labs";
+  function labState() { return store.get(LAB_KEY, {}); }
+  function critOf(state, lab) {
+    const a = Array.isArray(state[lab.id]) ? state[lab.id].slice(0, lab.lis.length) : [];
+    while (a.length < lab.lis.length) a.push(false);
+    return a;
+  }
+  function labDone(state, lab) { return critOf(state, lab).every(Boolean); }
+
+  /* ---------------------------------------------------------- fig: the lab loop */
+  (function () {
+    const s = document.getElementById("fig-loop");
+    arrowDefs(s, "arr-loop", palette.ink);
+    const nodes = [
+      { x: 290, y: 18, t: "1 · Predict", c: palette.green, l: ["Write the number first:", "formula, units, a ± range"] },
+      { x: 540, y: 128, t: "2 · Build", c: palette.blue, l: ["The smallest version that", "can answer the question"] },
+      { x: 290, y: 238, t: "3 · Measure", c: palette.gold, l: ["Warm up, synchronize, repeat;", "report median and p95"] },
+      { x: 40, y: 128, t: "4 · Explain", c: palette.plum, l: ["η = measured ÷ predicted;", "name the cause of the gap"] }
+    ];
+    nodes.forEach(n => {
+      s.appendChild(svg("rect", { x: n.x, y: n.y, width: 180, height: 74, rx: 10, fill: "#fff", stroke: n.c, "stroke-width": 1.6 }));
+      s.appendChild(svg("rect", { x: n.x, y: n.y, width: 6, height: 74, rx: 3, fill: n.c }));
+      T(s, n.x + 90, n.y + 24, n.t, { "text-anchor": "middle", "font-size": 14, "font-weight": 600, fill: n.c });
+      n.l.forEach((line, i) => T(s, n.x + 90, n.y + 44 + i * 15, line, { "text-anchor": "middle", "font-size": 11.5, fill: palette.muted }));
+    });
+    [["M470,55 Q630,55 630,124"], ["M630,202 Q630,275 474,275"], ["M290,275 Q130,275 130,206"], ["M130,128 Q130,55 286,55"]].forEach(([d]) =>
+      s.appendChild(svg("path", { d, fill: "none", stroke: palette.ink, "stroke-width": 1.4, "marker-end": "url(#arr-loop)" })));
+    T(s, 380, 148, "EXIT CRITERION", { "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.muted, "letter-spacing": "1.5" });
+    T(s, 380, 170, "a number you hit", { "text-anchor": "middle", "font-size": 15, class: "serif" });
+    T(s, 380, 190, "+ a gap you can explain", { "text-anchor": "middle", "font-size": 15, class: "serif" });
+  })();
+
+  /* ---------------------------------------------------------- fig: timing noise */
+  (function () {
+    const host = document.getElementById("fig-noise");
+    const R = rng(5);
+    const warm = [46, 29, 17.5, 12.6, 11.1];
+    const pts = [];
+    for (let i = 1; i <= 60; i++) {
+      let v = i <= warm.length ? warm[i - 1] : 10 + 0.35 * R.normal();
+      if ([17, 33, 34, 51].includes(i)) v += 3 + 3 * R();
+      pts.push([i, v]);
+    }
+    const timed = pts.slice(warm.length).map(p => p[1]).sort((a, b) => a - b);
+    const med = timed[Math.floor(timed.length / 2)];
+    const p95 = timed[Math.floor(0.95 * (timed.length - 1))];
+    const mean = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    const P = plot(host, { width: 760, height: 330, x: [0, 88], y: [0, 50], xlabel: "iteration", ylabel: "time per call (ms)", xticks: [1, 10, 20, 30, 40, 50, 60], yticks: [0, 10, 20, 30, 40, 50] });
+    P.draw([
+      { band: [0, 5.5], color: palette.brick, opacity: 0.1 },
+      { points: pts.slice(0, warm.length), color: palette.brick, dots: true, dotsOnly: true, r: 4 },
+      { points: pts.slice(warm.length), color: palette.green, dots: true, dotsOnly: true, r: 3.2 },
+      { hline: med, color: palette.green, dash: "none" },
+      { hline: p95, color: palette.gold },
+      { hline: mean, color: palette.brick, dash: "2 4" },
+      { text: [62, p95 + 0.7], label: "p95 " + p95.toFixed(1) + " ms", color: palette.gold },
+      { text: [62, mean + 0.35], label: "mean incl. warmup: " + mean.toFixed(1) + " ms", color: palette.brick, size: 10.5 },
+      { text: [62, med - 2.1], label: "median " + med.toFixed(1) + " ms", color: palette.green },
+      { text: [7, 47.5], label: "warmup: discard", color: palette.brick }
+    ]);
+  })();
+
+  /* ---------------------------------------------------------- fig: timeline */
+  const PLAN_CORE = [
+    ["W1", "00·01·02", ["env"], 8], ["W2", "03", ["L1"], 6.5], ["W3", "04·05", ["L2"], 8.5], ["W4", "06", ["L4"], 6],
+    ["W5", "07", ["L3"], 8], ["W6", "08", ["L5"], 7], ["W7", "09·10", ["L6"], 8], ["W8", "10", ["L7", "L8"], 7],
+    ["W9", "11", ["L9"], 7], ["W10", "12", ["L10"], 6.5], ["W11", "13·14", ["L11"], 7.5], ["W12", "15·16", ["L12", "L13"], 9.5]
+  ];
+  const PLAN_INF = [
+    ["W13", "17", ["env", "L14"], 7], ["W14", "18", ["L15"], 7.5], ["W15", "19", ["L16"], 6.5],
+    ["W16", "19", ["L16", "L17"], 5.5], ["W17", "20", ["L18"], 6], ["W18", "21", ["L19"], 8]
+  ];
+  (function () {
+    const s = document.getElementById("fig-timeline");
+    arrowDefs(s, "arr-tl", palette.muted);
+    const x0 = 112, cw = 72, ch = 88;
+    const lane = (y, label, sub, hours, color, tint, weeks) => {
+      T(s, 8, y + 30, label, { "font-size": 12, class: "mono", "font-weight": 600, fill: color, "letter-spacing": "1" });
+      T(s, 8, y + 48, sub, { "font-size": 11, fill: palette.muted });
+      T(s, 8, y + 64, hours, { "font-size": 11, fill: palette.muted });
+      weeks.forEach(([wk, mods, labs, h], i) => {
+        const x = x0 + i * cw;
+        s.appendChild(svg("rect", { x: x + 2, y, width: cw - 4, height: ch, rx: 8, fill: tint, stroke: color, "stroke-opacity": 0.35 }));
+        T(s, x + 8, y + 14, wk, { "font-size": 10, class: "mono", fill: palette.faint });
+        T(s, x + cw / 2, y + 36, mods, { "font-size": 12.5, class: "mono", "text-anchor": "middle" });
+        const widths = labs.map(l => l.length * 6.6 + 10);
+        const total = widths.reduce((a, b) => a + b, 0) + (labs.length - 1) * 3;
+        let lx = x + cw / 2 - total / 2;
+        labs.forEach((l, k) => {
+          const isSetup = l === "env";
+          s.appendChild(svg("rect", { x: lx, y: y + 46, width: widths[k], height: 17, rx: 8.5, fill: isSetup ? "#fff" : color, "fill-opacity": isSetup ? 1 : 0.85, stroke: color }));
+          T(s, lx + widths[k] / 2, y + 58.5, l, { "font-size": 10.5, class: "mono", "text-anchor": "middle", fill: isSetup ? color : "#fff" });
+          lx += widths[k] + 3;
+        });
+        T(s, x + cw / 2, y + 80, h + " h", { "font-size": 10, class: "mono", "text-anchor": "middle", fill: palette.muted });
+      });
+    };
+    lane(34, "CORE", "modules 00–16", "≈ 90 h · 12 wk", palette.green, "rgba(26,122,82,.06)", PLAN_CORE);
+    lane(176, "INFERENCE", "modules 17–21", "≈ 41 h · 6 wk", palette.blue, "rgba(47,93,138,.06)", PLAN_INF);
+    // capstone block
+    const cx = x0 + 6 * cw;
+    s.appendChild(svg("rect", { x: cx + 2, y: 176, width: 3 * cw - 4, height: ch, rx: 8, fill: "rgba(154,123,34,.07)", stroke: palette.gold, "stroke-dasharray": "5 4" }));
+    T(s, cx + 1.5 * cw, 206, "Capstone", { "text-anchor": "middle", "font-size": 15, class: "serif", fill: palette.gold });
+    T(s, cx + 1.5 * cw, 226, "W19–21 · ≈ 20 h", { "text-anchor": "middle", "font-size": 11, class: "mono", fill: palette.muted });
+    T(s, cx + 1.5 * cw, 244, "pick A, B or C", { "text-anchor": "middle", "font-size": 11, fill: palette.muted });
+    // continuation arrow
+    s.appendChild(svg("path", { d: `M${x0 + 12 * cw - 36},${34 + ch + 2} C ${x0 + 12 * cw - 36},160 ${x0 + 36},146 ${x0 + 36},172`, fill: "none", stroke: palette.muted, "stroke-width": 1.2, "stroke-dasharray": "4 3", "marker-end": "url(#arr-tl)" }));
+    T(s, (x0 + x0 + 12 * cw) / 2, 150, "core done → inference track", { "text-anchor": "middle", "font-size": 11, fill: palette.muted });
+    // fast-path note
+    const nx = x0 + 9 * cw + 14;
+    T(s, nx, 196, "Fluent in Parts I–III?", { "font-size": 12, "font-weight": 600 });
+    T(s, nx, 214, "Refresh 00, 06, 08, 13,", { "font-size": 11.5, fill: palette.muted });
+    T(s, nx, 230, "then start at W13.", { "font-size": 11.5, fill: palette.muted });
+    T(s, x0, 290, "Pills: green = core lab, blue = inference lab, outlined = environment setup. Hours are estimates at a 6–8 h/week pace.", { "font-size": 11, fill: palette.faint });
+  })();
+
+  /* ---------------------------------------------------------- fig: dependency map */
+  (function () {
+    const s = document.getElementById("fig-deps");
+    arrowDefs(s, "arr-deps", palette.muted);
+    const cw = 128, rh = 46, x0 = 16, y0 = 14, w = 118, h = 30;
+    const N = {
+      L1: [0, 0, "micrograd"], L2: [1, 0, "char MLP"], L13: [3, 0, "scaling fit"], L6: [5, 0, "quant sweep"],
+      L3: [2, 1, "nanoGPT"], L5: [3, 1, "KV cache"], L16: [4, 1, "mini engine"], L17: [5, 1, "vLLM sweep"],
+      L4: [1, 2, "BPE"], L18: [5, 2, "TP + NCCL"], L19: [6, 2, "platform"],
+      L14: [3, 3, "roofline"], L15: [4, 3, "Triton"],
+      L7: [1, 4, "LoRA"], L8: [2, 4, "DPO"], L9: [3, 4, "RAG evals"], L10: [4, 4, "agent evals"],
+      L11: [1, 5, "CLIP, Whisper"], L12: [2, 5, "diffusion"]
+    };
+    const inf = new Set(["L14", "L15", "L16", "L17", "L18", "L19"]);
+    const pos = id => { const [c, r] = N[id]; return { x: x0 + c * cw, y: y0 + r * rh }; };
+    const edges = [["L1", "L2"], ["L2", "L3"], ["L4", "L3"], ["L3", "L13"], ["L3", "L5"], ["L5", "L16"], ["L16", "L17"], ["L17", "L19"], ["L14", "L15"], ["L14", "L18"], ["L18", "L19"], ["L7", "L8"], ["L9", "L10"]];
+    edges.forEach(([a, b]) => {
+      const p = pos(a), q = pos(b);
+      const x1 = p.x + w, y1 = p.y + h / 2, x2 = q.x - 3, y2 = q.y + h / 2;
+      const mx = (x1 + x2) / 2;
+      s.appendChild(svg("path", { d: `M${x1},${y1} C ${mx},${y1} ${mx},${y2} ${x2},${y2}`, fill: "none", stroke: palette.muted, "stroke-width": 1.3, "marker-end": "url(#arr-deps)" }));
+    });
+    Object.keys(N).forEach(id => {
+      const p = pos(id), c = inf.has(id) ? palette.blue : palette.green;
+      const g = svg("a", { href: "#lab-" + id });
+      g.appendChild(svg("rect", { x: p.x, y: p.y, width: w, height: h, rx: 7, fill: inf.has(id) ? "rgba(47,93,138,.08)" : "rgba(26,122,82,.08)", stroke: c, "stroke-width": 1.3 }));
+      g.appendChild(svg("text", { x: p.x + 8, y: p.y + 19.5, "font-size": 11, class: "mono", "font-weight": 600, fill: c, text: id }));
+      g.appendChild(svg("text", { x: p.x + 8 + id.length * 7 + 6, y: p.y + 19.5, "font-size": 11.5, fill: palette.ink, text: N[id][2] }));
+      s.appendChild(g);
+    });
+    const caps = [["A · $/1M at SLO", "uses L6 L7 L17 L19", 0.4], ["B · RAG product", "uses L9 L10", 2.4], ["C · custom kernel", "uses L14 L15", 4.0]];
+    caps.forEach(([t, sub, r]) => {
+      const x = x0 + 7 * cw, y = y0 + r * rh;
+      s.appendChild(svg("rect", { x, y, width: w + 4, height: 52, rx: 8, fill: "rgba(154,123,34,.08)", stroke: palette.gold, "stroke-dasharray": "5 3", "stroke-width": 1.3 }));
+      T(s, x + 8, y + 21, t, { "font-size": 11.5, "font-weight": 600, fill: palette.gold });
+      T(s, x + 8, y + 39, sub, { "font-size": 10, class: "mono", fill: palette.muted });
+    });
+    const ly = 312;
+    [["core lab (Mac)", "rgba(26,122,82,.08)", palette.green, null], ["inference lab (NVIDIA GPU)", "rgba(47,93,138,.08)", palette.blue, null], ["capstone", "rgba(154,123,34,.08)", palette.gold, "5 3"]].forEach(([t, f, c, d], i) => {
+      const x = x0 + i * 230;
+      s.appendChild(svg("rect", { x, y: ly - 11, width: 22, height: 14, rx: 4, fill: f, stroke: c, "stroke-dasharray": d }));
+      T(s, x + 30, ly, t, { "font-size": 11.5, fill: palette.muted });
+    });
+    T(s, x0 + 690, ly, "→ do first, reuse its code", { "font-size": 11.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- widget: lab tracker */
+  (function () {
+    const w = widget("w-tracker", { title: "Lab progress tracker", kicker: "Saved locally", note: "Criteria are read from the lab cards on this page. A lab counts as complete when every one of its criteria is ticked. Ticking a criterion here also ticks it on the card, and the other way round. The planner above can skip completed labs." });
+    let state = labState();
+    let filter = "all";
+    const open = new Set();
+    const save = () => { store.set(LAB_KEY, state); document.dispatchEvent(new Event("labs:changed")); };
+
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Show" })));
+    seg(c1, { options: [{ value: "all", label: "all 19" }, { value: "core", label: "core L1–L13" }, { value: "inf", label: "inference L14–L19" }], value: "all", onChange: v => { filter = v; render(); } });
+    w.controls.appendChild(c1);
+    const expandBtn = el("button", { class: "btn", text: "Expand all" });
+    const resetBtn = el("button", { class: "btn", text: "Reset" });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "View" })), el("div", { class: "btnrow", style: { margin: "0" } }, [expandBtn, resetBtn])]));
+    expandBtn.addEventListener("click", () => {
+      const anyClosed = LABS.some(l => !open.has(l.id));
+      LABS.forEach(l => anyClosed ? open.add(l.id) : open.delete(l.id));
+      render();
+    });
+    let armed = null;
+    resetBtn.addEventListener("click", () => {
+      if (!armed) {
+        resetBtn.textContent = "Click again to erase";
+        armed = setTimeout(() => { armed = null; resetBtn.textContent = "Reset"; }, 3000);
+        return;
+      }
+      clearTimeout(armed); armed = null; resetBtn.textContent = "Reset";
+      state = {}; save(); render();
+    });
+
+    const barWrap = el("div");
+    const bar = el("i");
+    barWrap.appendChild(el("div", { class: "small muted", text: "Exit criteria met (filtered view)" }));
+    barWrap.appendChild(el("div", { class: "pbar" }, bar));
+    w.body.appendChild(barWrap);
+    const set = stats(w.body, [{ key: "crit", label: "Criteria met" }, { key: "labs", label: "Labs complete" }, { key: "core", label: "Core track" }, { key: "inf", label: "Inference track" }]);
+    const list = el("div", { class: "tlist" });
+    w.body.appendChild(list);
+
+    function toggleCrit(lab, j, v) {
+      const a = critOf(state, lab);
+      a[j] = v == null ? !a[j] : v;
+      state[lab.id] = a; save(); render();
+    }
+    function toggleLab(lab, v) {
+      state[lab.id] = lab.lis.map(() => v); save(); render();
+    }
+    // clickable criteria on the cards
+    LABS.forEach(lab => lab.lis.forEach((li, j) => {
+      li.title = "Click to mark this criterion met (saved in this browser)";
+      li.addEventListener("click", e => { if (e.target.closest("a")) return; toggleCrit(lab, j); });
+    }));
+
+    function syncCards() {
+      LABS.forEach(lab => {
+        const a = critOf(state, lab), n = a.filter(Boolean).length;
+        lab.lis.forEach((li, j) => li.classList.toggle("ok", a[j]));
+        if (lab.status) {
+          lab.status.textContent = n === a.length ? "complete" : n ? `${n} / ${a.length} criteria` : "";
+          lab.status.classList.toggle("done", n === a.length);
+        }
+      });
+    }
+    function render() {
+      state = labState();
+      const shown = LABS.filter(l => filter === "all" || l.track === filter);
+      let cm = 0, ct = 0;
+      shown.forEach(l => { const a = critOf(state, l); cm += a.filter(Boolean).length; ct += a.length; });
+      bar.style.width = (ct ? 100 * cm / ct : 0) + "%";
+      const doneAll = LABS.filter(l => labDone(state, l)).length;
+      const trackPct = t => {
+        const ls = LABS.filter(l => l.track === t);
+        let m = 0, tot = 0; ls.forEach(l => { const a = critOf(state, l); m += a.filter(Boolean).length; tot += a.length; });
+        return { pct: Math.round(100 * m / tot), done: ls.filter(l => labDone(state, l)).length, n: ls.length };
+      };
+      const tc = trackPct("core"), ti = trackPct("inf");
+      set("crit", `${cm} / ${ct}`, cm === ct && ct ? "good" : null, Math.round(ct ? 100 * cm / ct : 0) + "% of the filtered view");
+      set("labs", `${doneAll} / ${LABS.length}`, doneAll === LABS.length ? "good" : null, "all criteria ticked");
+      set("core", tc.pct + "%", tc.pct === 100 ? "good" : null, `${tc.done} of ${tc.n} labs complete`);
+      set("inf", ti.pct + "%", ti.pct === 100 ? "good" : null, `${ti.done} of ${ti.n} labs complete`);
+
+      list.innerHTML = "";
+      shown.forEach(lab => {
+        const a = critOf(state, lab), n = a.filter(Boolean).length;
+        const cb = el("input", { type: "checkbox" });
+        cb.checked = n === a.length; cb.indeterminate = n > 0 && n < a.length;
+        cb.addEventListener("change", () => toggleLab(lab, cb.checked));
+        const tog = el("button", { class: "btn", text: open.has(lab.id) ? "hide" : "criteria", style: { padding: "4px 9px", fontSize: "10.5px" } });
+        tog.addEventListener("click", () => { open.has(lab.id) ? open.delete(lab.id) : open.add(lab.id); render(); });
+        list.appendChild(el("div", { class: "trow" }, [
+          el("label", null, [cb, el("span", { class: "tid", text: lab.id, style: { color: lab.track === "inf" ? palette.blue : palette.green } }), el("span", { text: lab.title })]),
+          el("span", { class: "tcount", text: `${n}/${a.length}` }),
+          el("a", { href: "#lab-" + lab.id, class: "small", text: "card ↑" }),
+          tog
+        ]));
+        if (open.has(lab.id)) {
+          const box = el("div", { class: "tcrit" });
+          lab.lis.forEach((li, j) => {
+            const c = el("input", { type: "checkbox" }); c.checked = a[j];
+            c.addEventListener("change", () => toggleCrit(lab, j, c.checked));
+            box.appendChild(el("label", null, [c, el("span", { text: li.textContent.trim() })]));
+          });
+          list.appendChild(box);
+        }
+      });
+      syncCards();
+    }
+    document.addEventListener("labs:changed", syncCards);
+    render();
+  })();
+
+  /* ---------------------------------------------------------- widget: skills radar */
+  (function () {
+    const AX = [
+      ["Math & probability", "01–03", "L1"], ["Training & optimization", "02, 04, 07", "L2, L3, L13"], ["Transformers & tokens", "05, 06", "L3, L4"],
+      ["Inference & quantization", "08, 09", "L5, L6"], ["Fine-tuning & alignment", "10", "L7, L8"], ["RAG & agents", "11, 12", "L9, L10"],
+      ["Evaluation & statistics", "13", "L8–L10"], ["Multimodal & generative", "14–16", "L11, L12"], ["GPU architecture", "17", "L14"],
+      ["Kernels & compilers", "18", "L15"], ["Inference engines", "19", "L16, L17"], ["Distributed inference", "20", "L18"], ["Serving & operations", "21", "L19"]
+    ];
+    const FILES = { "01": "01-linear-algebra.html", "02": "02-calculus.html", "04": "04-neural-nets.html", "05": "05-tokens.html", "08": "08-inference.html", "10": "10-finetuning.html", "11": "11-rag.html", "13": "13-eval-production.html", "14": "14-multimodal.html", "17": "17-gpus.html", "18": "18-kernels.html", "19": "19-engines.html", "20": "20-distributed-inference.html", "21": "21-serving-platform.html" };
+    const TARGETS = {
+      mle: { label: "Applied MLE", v: [3, 4, 4, 3, 4, 4, 5, 3, 2, 2, 3, 2, 3] },
+      inf: { label: "Inference engineer", v: [3, 3, 4, 5, 2, 2, 4, 2, 5, 4, 5, 4, 5] }
+    };
+    const RUB = ["new", "can define", "can explain", "built a toy", "tuned for real", "can teach"];
+    const KEY = "22:radar";
+    const st = Object.assign({ now: AX.map(() => 1), base: null, target: "inf" }, store.get(KEY, {}));
+    if (!Array.isArray(st.now) || st.now.length !== AX.length) st.now = AX.map(() => 1);
+    const save = () => store.set(KEY, st);
+
+    const w = widget("w-radar", { title: "Skills radar", kicker: "Self-assessment", note: "Scores are saved in this browser. The target profiles are one reasonable shape for each role, not a hiring bar. Save a baseline now and compare in a month: the dashed grey outline is your baseline, the gold dashed outline is the target." });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Target profile" })));
+    seg(c1, { options: [{ value: "inf", label: "Inference engineer" }, { value: "mle", label: "Applied MLE" }, { value: "none", label: "none" }], value: st.target, onChange: v => { st.target = v; save(); draw(); } });
+    w.controls.appendChild(c1);
+    const baseBtn = el("button", { class: "btn", text: "Save as baseline" });
+    const clearBtn = el("button", { class: "btn", text: "Clear baseline" });
+    baseBtn.addEventListener("click", () => { st.base = { date: new Date().toISOString().slice(0, 10), v: st.now.slice() }; save(); draw(); });
+    clearBtn.addEventListener("click", () => { st.base = null; save(); draw(); });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Baseline" })), el("div", { class: "btnrow", style: { margin: "0" } }, [baseBtn, clearBtn])]));
+    AX.forEach(([name], i) => slider(w.controls, { label: name, min: 0, max: 5, step: 1, value: st.now[i], fmt: v => v + " · " + RUB[v], onInput: v => { st.now[i] = v; save(); draw(); } }));
+
+    const wrap = el("div", { class: "radar-wrap" });
+    const cv = el("div", { class: "canvas-wrap" });
+    const side = el("div");
+    wrap.appendChild(cv); wrap.appendChild(side); w.body.appendChild(wrap);
+    const S = svg("svg", { viewBox: "0 0 640 470" }); cv.appendChild(S);
+    const set = stats(side, [{ key: "avg", label: "Average now" }, { key: "gap", label: "Mean gap to target" }, { key: "hit", label: "Areas at target" }, { key: "base", label: "Since baseline" }]);
+    const gapsBox = el("div", { class: "gaps" }); side.appendChild(gapsBox);
+
+    const cx = 320, cy = 238, Rr = 140, n = AX.length;
+    const ang = i => -Math.PI / 2 + 2 * Math.PI * i / n;
+    const pt = (i, v) => [cx + Rr * v / 5 * Math.cos(ang(i)), cy + Rr * v / 5 * Math.sin(ang(i))];
+    const poly = vals => vals.map((v, i) => pt(i, v).map(c => c.toFixed(1)).join(",")).join(" ");
+    function moduleLinks(spec) {
+      const span = el("span");
+      const nums = spec.replace(/–/g, "-").split(/,\s*/);
+      nums.forEach((tok, k) => {
+        const first = tok.split("-")[0].trim();
+        if (k) span.appendChild(document.createTextNode(", "));
+        if (FILES[first]) span.appendChild(el("a", { href: FILES[first], text: tok.replace("-", "–") }));
+        else span.appendChild(document.createTextNode(tok));
+      });
+      return span;
+    }
+    function draw() {
+      while (S.firstChild) S.removeChild(S.firstChild);
+      for (let r = 1; r <= 5; r++) S.appendChild(svg("polygon", { points: poly(AX.map(() => r)), fill: r % 2 ? "none" : "rgba(28,27,25,.025)", stroke: palette.line, "stroke-width": r === 5 ? 1.2 : 0.8 }));
+      AX.forEach(([name], i) => {
+        const [x, y] = pt(i, 5);
+        S.appendChild(svg("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: palette.line }));
+        const [lx, ly] = pt(i, 5.6);
+        const c = Math.cos(ang(i));
+        const inf = i >= 8;
+        S.appendChild(svg("text", { x: lx, y: ly + 4, "font-size": 11.5, "text-anchor": Math.abs(c) < 0.2 ? "middle" : c > 0 ? "start" : "end", fill: inf ? palette.blue : palette.ink, text: name }));
+      });
+      [1, 2, 3, 4, 5].forEach(r => S.appendChild(svg("text", { x: cx + 4, y: cy - Rr * r / 5 + 4, "font-size": 9.5, class: "mono", fill: palette.faint, text: r })));
+      const tgt = st.target !== "none" ? TARGETS[st.target].v : null;
+      if (tgt) S.appendChild(svg("polygon", { points: poly(tgt), fill: "none", stroke: palette.gold, "stroke-width": 1.8, "stroke-dasharray": "6 4" }));
+      if (st.base) S.appendChild(svg("polygon", { points: poly(st.base.v), fill: "none", stroke: palette.muted, "stroke-width": 1.4, "stroke-dasharray": "3 3" }));
+      S.appendChild(svg("polygon", { points: poly(st.now), fill: "rgba(26,122,82,.16)", stroke: palette.green, "stroke-width": 2 }));
+      st.now.forEach((v, i) => { const [x, y] = pt(i, v); S.appendChild(svg("circle", { cx: x, cy: y, r: 3.5, fill: palette.green })); });
+      [["you now", palette.green, null], ["target", palette.gold, "6 4"], ["baseline", palette.muted, "3 3"]].forEach(([t, c, d], k) => {
+        S.appendChild(svg("line", { x1: 16, x2: 38, y1: 18 + k * 17, y2: 18 + k * 17, stroke: c, "stroke-width": 2, "stroke-dasharray": d }));
+        S.appendChild(svg("text", { x: 44, y: 22 + k * 17, "font-size": 11.5, fill: palette.muted, text: t }));
+      });
+
+      const avg = st.now.reduce((a, b) => a + b, 0) / n;
+      set("avg", avg.toFixed(1) + " / 5", null, "across " + n + " areas");
+      if (tgt) {
+        const gaps = st.now.map((v, i) => Math.max(0, tgt[i] - v));
+        const meanGap = gaps.reduce((a, b) => a + b, 0) / n;
+        const hit = gaps.filter(g => g === 0).length;
+        set("gap", meanGap.toFixed(2), meanGap < 0.3 ? "good" : meanGap < 1 ? "warn" : "bad", "vs " + TARGETS[st.target].label);
+        set("hit", hit + " / " + n, hit === n ? "good" : null, "at or above target");
+        gapsBox.innerHTML = "";
+        const order = gaps.map((g, i) => [g, i]).filter(x => x[0] > 0).sort((a, b) => b[0] - a[0] || a[1] - b[1]).slice(0, 3);
+        if (!order.length) gapsBox.appendChild(el("div", { class: "gapc", text: "No gaps against this profile. Raise the bar: pick the other profile, or aim for 5 on the areas your next job needs." }));
+        order.forEach(([g, i]) => {
+          const [name, mods, labs] = AX[i];
+          const body = el("div", null, [document.createTextNode("Read "), moduleLinks(mods), document.createTextNode(", then do " + labs + ".")]);
+          gapsBox.appendChild(el("div", { class: "gapc" }, [el("div", { class: "gk", text: "Gap " + g }), el("div", { class: "gt", text: name }), body]));
+        });
+      } else {
+        set("gap", "—", null, "no target selected"); set("hit", "—", null, "");
+        gapsBox.innerHTML = "";
+      }
+      if (st.base) {
+        const d = st.now.reduce((a, v, i) => a + v - st.base.v[i], 0);
+        set("base", (d >= 0 ? "+" : "") + d + " pts", d > 0 ? "good" : d < 0 ? "bad" : null, "baseline " + st.base.date);
+      } else set("base", "—", null, "no baseline saved");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- widget: time planner */
+  (function () {
+    const R = (label, h) => ({ label: "Read " + label, h, kind: "read" });
+    const L = (id, label, h, gpu) => ({ label: id + " · " + label, h, kind: "lab", lab: id, gpu: gpu || 0 });
+    const ITEMS = {
+      core: [
+        { label: "Set up the Mac environment", h: 1, kind: "setup" }, R("00 Start here", 1), R("01 Vectors & matrices", 3), R("02 Gradients & optimization", 3),
+        R("03 Probability & information", 2.5), L("L1", "micrograd", 4), R("04 Neural networks", 3), L("L2", "bigram → MLP", 3),
+        R("05 Tokens & embeddings", 2.5), L("L4", "BPE trainer", 3), R("06 The transformer", 3), L("L3", "nanoGPT", 5),
+        R("07 Training LLMs", 3), R("08 Inference & context", 3), L("L5", "KV cache", 3), { label: "L13 · launch the size sweep", h: 1, kind: "lab" },
+        R("09 Quantization", 2.5), L("L6", "quantization sweep", 2.5), R("10 Fine-tuning", 3), L("L7", "LoRA with mlx-lm", 3.5),
+        L("L8", "DPO", 3.5), R("11 RAG", 3), L("L9", "RAG with evals", 4), R("12 Agents", 2.5), L("L10", "agent + harness", 4),
+        R("13 Evaluation & production", 2.5), R("14 Seeing & hearing", 2.5), L("L11", "CLIP + Whisper", 2.5), R("15 Generative media", 2.5),
+        L("L12", "diffusion + sweep", 3), R("16 Why models improve", 2), L("L13", "fit and predict", 2)
+      ],
+      inf: [
+        { label: "Set up a cloud GPU account and scripts", h: 1, kind: "setup" }, R("17 GPUs & accelerators", 3), L("L14", "roofline", 3, 1),
+        R("18 Kernels & profiling", 3.5), L("L15", "Triton softmax", 4, 3), R("19 Inside an engine", 3.5), L("L16", "mini engine", 5),
+        L("L17", "vLLM sweep", 3.5, 4), R("20 Distributed inference", 3), L("L18", "TP + nccl-tests", 3, 16), R("21 Serving platform", 3), L("L19", "serving platform", 5, 8)
+      ],
+      cap: [{ label: "Capstone · scope, baseline, SLO", h: 5, kind: "lab" }, { label: "Capstone · build", h: 10, kind: "lab" }, { label: "Capstone · measure and write up", h: 5, kind: "lab" }]
+    };
+    const TRACKS = { core: ["core"], inf: ["inf"], both: ["core", "inf"], all: ["core", "inf", "cap"] };
+    const KEY = "22:planner";
+    const today = new Date();
+    const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const st = Object.assign({ hours: 7, track: "both", start: iso(today), price: 2.5, skip: true }, store.get(KEY, {}));
+    const save = () => store.set(KEY, st);
+
+    const w = widget("w-planner", { title: "Time planner", kicker: "Calculator", note: "Items keep the plan's order and are packed into weeks of your chosen size; an item that doesn't fit spills into the next week. Hour estimates are rough, so treat the finish date as a forecast to revise, not a deadline. Cloud cost = GPU-hours of the selected inference labs × price × 1.5 for setup and mistakes." });
+    const c1 = el("div", { class: "ctl" }, el("label", null, el("span", { text: "Track" })));
+    seg(c1, { options: [{ value: "core", label: "core" }, { value: "inf", label: "inference" }, { value: "both", label: "core + inference" }, { value: "all", label: "+ capstone" }], value: st.track, onChange: v => { st.track = v; save(); draw(); } });
+    w.controls.appendChild(c1);
+    slider(w.controls, { label: "Hours per week", min: 3, max: 20, step: 0.5, value: st.hours, fmt: v => v + " h", onInput: v => { st.hours = v; save(); draw(); } });
+    const dateIn = el("input", { type: "date", value: st.start });
+    dateIn.addEventListener("change", () => { if (dateIn.value) { st.start = dateIn.value; save(); draw(); } });
+    w.controls.appendChild(el("div", { class: "ctl" }, [el("label", null, el("span", { text: "Start date" })), dateIn]));
+    slider(w.controls, { label: "Cloud price per GPU-hour", min: 0.5, max: 6, step: 0.25, value: st.price, fmt: v => "$" + v.toFixed(2), onInput: v => { st.price = v; save(); draw(); } });
+    const skipCb = el("input", { type: "checkbox" }); skipCb.checked = st.skip;
+    skipCb.addEventListener("change", () => { st.skip = skipCb.checked; save(); draw(); });
+    w.controls.appendChild(el("label", { class: "ctl-check" }, [skipCb, el("span", { text: "Skip labs already complete in the tracker" })]));
+
+    const set = stats(w.body, [{ key: "hours", label: "Hours remaining" }, { key: "weeks", label: "Weeks" }, { key: "finish", label: "Projected finish" }, { key: "cost", label: "Cloud rental" }]);
+    const scroll = el("div", { class: "plan-scroll" }); w.body.appendChild(scroll);
+    document.addEventListener("labs:changed", draw);
+
+    const fmtDate = d => d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    const fmtH = h => (Math.round(h * 10) / 10).toString();
+    function draw() {
+      const state = labState();
+      const done = new Set(LABS.filter(l => labDone(state, l)).map(l => l.id));
+      const items = TRACKS[st.track].flatMap(t => ITEMS[t]).filter(it => !(st.skip && it.lab && done.has(it.lab)));
+      const H = st.hours;
+      const weeks = []; let cur = [], cap = H;
+      items.forEach(it => {
+        let rem = it.h, part = 0;
+        while (rem > 1e-9) {
+          const take = Math.min(rem, cap);
+          cur.push({ it, take, part });
+          rem -= take; cap -= take; part++;
+          if (cap <= 1e-9) { weeks.push(cur); cur = []; cap = H; }
+        }
+      });
+      if (cur.length) weeks.push(cur);
+      const total = items.reduce((a, it) => a + it.h, 0);
+      const gpuH = items.reduce((a, it) => a + (it.gpu || 0), 0);
+      const start = new Date(st.start + "T00:00:00");
+      const addDays = (d, k) => { const x = new Date(d); x.setDate(x.getDate() + k); return x; };
+      const finish = weeks.length ? addDays(start, 7 * weeks.length - 1) : start;
+      set("hours", fmtH(total) + " h", null, items.length + " items");
+      set("weeks", String(weeks.length), weeks.length <= 18 ? "good" : weeks.length <= 30 ? "warn" : "bad", "at " + H + " h/week");
+      set("finish", weeks.length ? fmtDate(finish) : "—", null, "if every week holds");
+      set("cost", gpuH ? "$" + fmtNum(gpuH * st.price * 1.5, 0) : "$0", null, gpuH ? gpuH + " GPU-h × $" + st.price.toFixed(2) + " × 1.5" : "no cloud labs selected");
+
+      scroll.innerHTML = "";
+      const table = el("table", { class: "t" });
+      table.appendChild(el("thead", null, el("tr", null, [el("th", { text: "Week" }), el("th", { text: "Starts" }), el("th", { text: "Plan" }), el("th", { class: "num", text: "h" })])));
+      const tb = el("tbody"); table.appendChild(tb);
+      if (!weeks.length) tb.appendChild(el("tr", null, el("td", { colspan: 4, text: "Nothing left in this track. Pick another track or untick the skip box." })));
+      weeks.forEach((wk, i) => {
+        const cell = el("td");
+        wk.forEach((e, k) => {
+          if (k) cell.appendChild(el("br"));
+          const partial = e.take < e.it.h - 1e-9;
+          const txt = e.it.label + (partial ? (e.part ? " (cont., " : " (") + fmtH(e.take) + " of " + fmtH(e.it.h) + " h)" : "");
+          cell.appendChild(el("span", { text: txt, style: { color: e.it.kind === "read" ? palette.ink : e.it.lab && /L1[4-9]/.test(e.it.lab) ? palette.blue : e.it.kind === "setup" ? palette.muted : palette.green, fontWeight: e.it.kind === "read" ? 400 : 550 } }));
+        });
+        const hrs = wk.reduce((a, e) => a + e.take, 0);
+        tb.appendChild(el("tr", null, [el("td", { text: String(i + 1) }), el("td", { text: addDays(start, 7 * i).toLocaleDateString("en-US", { month: "short", day: "numeric" }) }), cell, el("td", { class: "num", text: fmtH(hrs) })]));
+      });
+      scroll.appendChild(table);
+    }
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>

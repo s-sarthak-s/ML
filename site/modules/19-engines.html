@@ -1,0 +1,1516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Inside an inference engine — Inside the Machine</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="../assets/manifest.js"></script>
+</head>
+<body data-module="19">
+<div class="layout">
+<aside id="sidebar"></aside>
+<main class="content">
+
+<p class="eyebrow">Module 19 · Inference engineering II</p>
+<h1 class="title">Inside an inference <span class="it">engine</span></h1>
+<p class="lede">Module 08 explained why servers batch, page their KV cache, and reuse prefixes. This module opens the program that actually does it: a loop that runs a few hundred times a second, decides which tokens go into the next forward pass, tracks where every key and value lives, and chooses whom to evict when memory runs out. Once you can picture that loop, every engine flag becomes a lever you can reason about instead of a superstition.</p>
+<div class="meta"><span class="tag">~4 hours</span><span class="tag n">prereqs: 08, 09 (17–18 help)</span><span class="tag g">hands-on: vLLM, SGLang, llama.cpp</span></div>
+
+<div class="goals">
+  <h4>By the end you can</h4>
+  <ol>
+    <li>Draw the components and processes of a modern engine and follow one request from HTTP to streamed token.</li>
+    <li>Write out one engine step: scheduling under a token budget, the flattened input it builds, and what happens after sampling.</li>
+    <li>Predict how continuous batching, chunked prefill, and the token budget move throughput, TTFT, and inter-token latency.</li>
+    <li>Compute KV capacity, block waste, and maximum concurrency from GPU memory and a model config, and say what happens under memory pressure.</li>
+    <li>Explain how prefix caching, speculative decoding, grammar masks, and multi-LoRA are wired into the step loop, and when each one hurts.</li>
+    <li>Tune vLLM, SGLang, or llama-server one knob at a time against a fixed workload, and explain the knee in the curve you measure.</li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="anatomy">Anatomy of an engine</h2>
+
+<p>"Inference engine" sounds like one thing. It's really five or six cooperating parts, usually split across several operating-system processes. Module 08's techniques (<a href="08-inference.html#batching">continuous batching</a>, <a href="08-inference.html#paged">paged KV</a>, <a href="08-inference.html#prefix">prefix caching</a>) each live in a specific box below, and most engine bugs and tuning problems come down to one box waiting for another.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 920 500" id="fig-anatomy"></svg>
+<figcaption>Components and process layout of a modern serving engine, drawn after vLLM's V1 architecture. The API process handles HTTP, chat templates, tokenization, and incremental detokenization. The engine-core process runs a busy loop: schedule, execute, update. GPU workers (one per GPU when the model is split with tensor parallelism) build the batch tensors, run the forward pass, and sample. SGLang splits the same work differently (a tokenizer manager, a scheduler process, and a detokenizer manager), but the roles are the same.</figcaption></figure>
+
+<h3>Following one request</h3>
+<ol>
+  <li><strong>API server.</strong> An OpenAI-compatible endpoint (<code>/v1/chat/completions</code>) validates the request, applies the model's chat template (Module 10), and tokenizes. Images or audio get preprocessed here too.</li>
+  <li><strong>Request queue.</strong> The token ids cross a process boundary (vLLM uses ZeroMQ sockets) into the engine core's <em>waiting</em> queue.</li>
+  <li><strong>Scheduler.</strong> Every step it decides which requests run and how many of their tokens to compute, under a per-step token budget and a cap on concurrent sequences.</li>
+  <li><strong>KV cache manager.</strong> It owns the block allocator. The scheduler asks it for slots before admitting work; it answers yes, no, or "yes, and the first 1,200 tokens are already cached".</li>
+  <li><strong>Model runner.</strong> On each GPU it turns the scheduler's plan into tensors, launches the forward pass (replaying a captured CUDA graph when the batch shape allows), and hands logits to the <strong>sampler</strong>.</li>
+  <li><strong>Update and stream.</strong> Sampled ids go back to the engine core, which appends them, checks stop conditions, and frees finished requests' blocks. The new ids flow to the API process, which detokenizes incrementally and pushes server-sent events to the client.</li>
+</ol>
+
+<p>Why several processes? Because the Python parts compete for one interpreter lock. Tokenizing a 100K-token prompt, JSON-encoding streamed chunks for 500 clients, and running the scheduler all need CPU time. If they share a thread, the GPU waits while Python serializes JSON. Splitting them lets the engine core keep feeding the GPU while the API process deals with HTTP.</p>
+
+<div class="formula" data-name="Where a step's time goes">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{step}}} = \htmlClass{t2}{t_{\text{sched}}} + \htmlClass{t3}{t_{\text{prep}}} + \htmlClass{t4}{t_{\text{GPU}}} + \htmlClass{t5}{t_{\text{post}}}, \qquad \htmlClass{t6}{U_{\text{GPU}}} = \frac{\htmlClass{t4}{t_{\text{GPU}}}}{\htmlClass{t1}{t_{\text{step}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{step}}\)</dt><dd>wall-clock time of one engine iteration: what a streaming user sees as inter-token latency</dd></div>
+    <div data-t="t2"><dt>\(t_{\text{sched}}\)</dt><dd>CPU time to pick requests, allocate blocks, look up prefix hashes</dd></div>
+    <div data-t="t3"><dt>\(t_{\text{prep}}\)</dt><dd>building input tensors (ids, positions, block tables) and copying them to the GPU</dd></div>
+    <div data-t="t4"><dt>\(t_{\text{GPU}}\)</dt><dd>the forward pass and sampling kernels themselves</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{post}}\)</dt><dd>appending tokens, stop checks, sending outputs to the API process</dd></div>
+    <div data-t="t6"><dt>\(U_{\text{GPU}}\)</dt><dd>fraction of each step the GPU is actually busy</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A step is GPU work sandwiched between CPU bookkeeping. If the bookkeeping runs in series with the GPU, the GPU idles for that long every step.</p>
+  <p class="why"><b>Why it matters</b>For a small model the GPU part can be only a few milliseconds. Illustratively, 3 ms of GPU work plus 2 ms of serial Python gives \(U_{\text{GPU}} = 60\%\). That's why engines capture decode steps as CUDA graphs (one launch instead of hundreds, Module 18), and why SGLang's overlap scheduler and vLLM's async scheduling prepare step \(k{+}1\) on the CPU while the GPU runs step \(k\).</p>
+</div>
+
+<table class="t">
+  <thead><tr><th>Component</th><th>Owns</th><th>Symptom when it's the bottleneck</th></tr></thead>
+  <tbody>
+    <tr><td>API server</td><td>HTTP, templates, tokenize/detokenize</td><td>High TTFT with an idle GPU; one CPU core pinned at 100%</td></tr>
+    <tr><td>Scheduler</td><td>Who runs, how many tokens each</td><td>Gaps between GPU kernels in a profile; throughput flat as load rises</td></tr>
+    <tr><td>KV cache manager</td><td>Blocks, block tables, prefix hashes</td><td>Preemptions, "waiting" requests while the GPU has spare compute</td></tr>
+    <tr><td>Model runner</td><td>Input tensors, CUDA graphs, attention backend</td><td>Slow steps at batch sizes without a captured graph; slow first requests</td></tr>
+    <tr><td>Sampler</td><td>Penalties, grammar masks, top-p, spec verification</td><td>Step time grows with exotic sampling params or complex JSON schemas</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="steploop">The step loop in detail</h2>
+
+<p>Everything an engine does happens inside one loop. Read this simplified version slowly; the rest of the module zooms into its lines.</p>
+
+<div class="code" data-lang="python" data-title="engine_step.py (pseudo-code, vLLM-V1 style)"><pre><code>
+while True:
+    waiting.extend(inbox.drain())                     # newly tokenized requests from the API process
+
+    # 1. SCHEDULE under a token budget (--max-num-batched-tokens) and a seq cap (--max-num-seqs)
+    budget, plan = max_num_batched_tokens, []
+    for req in list(running):                         # running requests first: decodes and unfinished prefills
+        n = min(req.num_tokens_to_compute, budget)    # 1 for a decode, a chunk for a long prefill
+        while not kv.allocate_slots(req, n):          # needs a new block and none are free
+            victim = running.pop()                    # lowest priority / latest arrival
+            kv.free(victim); waiting.appendleft(victim)   # preempt: recompute it later
+            if victim is req: break
+        if req in running:
+            plan.append((req, n)); budget -= n
+    while waiting and budget &gt; 0 and len(running) &lt; max_num_seqs:
+        req = waiting[0]
+        cached = kv.get_computed_blocks(req)          # prefix-cache hit: skip these tokens
+        n = min(req.prompt_len - cached, budget)
+        if not kv.allocate_slots(req, n): break       # no memory: stop admitting
+        running.append(waiting.popleft()); plan.append((req, n)); budget -= n
+
+    # 2. PREPARE one flattened ("ragged") batch: no padding between requests
+    ids, positions, slot_mapping, block_tables, query_start_loc, logits_idx = prepare(plan)
+
+    # 3. FORWARD (CUDA graph replay if the batch is decode-only and a graph of that size exists)
+    hidden = model(ids, positions, kv_cache, attn_metadata)
+    logits = lm_head(hidden[logits_idx])              # only each request's LAST scheduled token
+
+    # 4. SAMPLE: penalties, grammar bitmask, temperature/top-p, speculative verification
+    tokens = sampler(logits, sampling_params, grammar_bitmask)
+
+    # 5. UPDATE: append, check stops, free finished blocks (they stay hashed for prefix reuse)
+    for (req, n), tok in zip(plan, tokens):
+        if req.still_prefilling: continue             # mid-prompt chunk: its sampled token is thrown away
+        req.append(tok)
+        if req.is_finished(): running.remove(req); kv.free(req)
+
+    # 6. STREAM new token ids to the API process for detokenization
+    outbox.send(new_tokens)
+</code></pre></div>
+
+<figure class="fig wide"><svg viewBox="0 0 900 390" id="fig-step"></svg>
+<figcaption>One step's inputs. The scheduler picked two decodes (A, B) and a 6-token prefill chunk for C. The model runner concatenates their tokens into one 8-token row with no padding, and records where each request starts (<code>query_start_loc</code>). Positions drive RoPE. The slot mapping tells the attention kernel where to write each new token's K and V, computed from the request's block table. Logits are computed only at each request's last scheduled token, and C's sampled token is discarded because its prompt isn't finished.</figcaption></figure>
+
+<div class="formula" data-name="Flattened batch and slot mapping">
+  <div class="tex">$$\htmlClass{t1}{N} = \sum_{i} \htmlClass{t2}{q_i}, \qquad \htmlClass{t3}{\text{slot}}(i, \htmlClass{t4}{p}) = \htmlClass{t5}{\text{BT}_i}\!\left[\left\lfloor \frac{\htmlClass{t4}{p}}{\htmlClass{t6}{B_s}} \right\rfloor\right] \cdot \htmlClass{t6}{B_s} + \left(\htmlClass{t4}{p} \bmod \htmlClass{t6}{B_s}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(N\)</dt><dd>tokens in this step's flattened batch; must be at most the token budget</dd></div>
+    <div data-t="t2"><dt>\(q_i\)</dt><dd>tokens scheduled for request \(i\): 1 for a decode, up to thousands for a prefill chunk</dd></div>
+    <div data-t="t3"><dt>slot</dt><dd>physical index in the KV cache where this token's K and V are written</dd></div>
+    <div data-t="t4"><dt>\(p\)</dt><dd>the token's position within its own sequence</dd></div>
+    <div data-t="t5"><dt>\(\text{BT}_i\)</dt><dd>request \(i\)'s block table: logical block number → physical block id</dd></div>
+    <div data-t="t6"><dt>\(B_s\)</dt><dd>block size in tokens (16 by default in vLLM on CUDA)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Find which of the request's blocks the position falls in, look up where that block physically lives, and add the offset inside the block.</p>
+  <p class="why"><b>Why it matters</b>Request A at position 812 with block size 16 is in logical block 50 at offset 12. If \(\text{BT}_A[50] = 7\), its slot is \(7 \cdot 16 + 12 = 124\). The attention kernel never sees "sequences" as contiguous tensors, only slots and tables, which is what lets requests of any length share one batch.</p>
+</div>
+
+<details class="think"><summary>Think first: the step processed 8 tokens. Why compute the LM head on only 3 of them?</summary>
+<div>The LM head is a \(d \times V\) matmul: 4096 × 128,256 for Llama 3, about 1 GFLOP per token, and its output is a 128,256-wide row of logits. Only the last scheduled token of each request produces a token anyone will use. For a 2,000-token prefill chunk, computing every row would produce 1,999 × 128,256 extra logits, about 1 GB in fp32, only to throw them away. Engines gather the hidden states at <code>logits_idx</code> first, then apply the head. (Requests that ask for prompt log-probabilities are the exception.)</div>
+</details>
+
+<p>The flattened layout is the second idea from the Orca paper (Yu et al., 2022), called <strong>selective batching</strong>. The matmuls in QKV projections, the MLP, and the LM head don't care which request a row belongs to, so they run on all \(N\) rows together. Only attention needs to know request boundaries, and varlen attention kernels (FlashAttention's varlen API, FlashInfer) take <code>query_start_loc</code> and the block tables to handle that.</p>
+
+<!-- ================================================================== -->
+<h2 id="continuous">Continuous batching, mechanically</h2>
+
+<p><a href="08-inference.html#batching">Module 08</a> showed the picture: static batching holds every slot until the longest request in its batch ends, while continuous (iteration-level) batching refills a slot the moment it frees. Here's the arithmetic behind the picture, then a simulator with real arrivals.</p>
+
+<div class="formula" data-name="Static-batch slot utilization">
+  <div class="tex">$$\htmlClass{t1}{U_{\text{static}}} = \frac{\sum_{i=1}^{\htmlClass{t3}{B}} \htmlClass{t2}{L_i}}{\htmlClass{t3}{B} \cdot \max_i \htmlClass{t2}{L_i}}, \qquad \mathbb{E}\!\left[\max_i \htmlClass{t2}{L_i}\right] = \htmlClass{t4}{\mu} \cdot \htmlClass{t5}{H_B} \quad \text{(exponential lengths)}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(U_{\text{static}}\)</dt><dd>fraction of slot-steps that produce a useful token</dd></div>
+    <div data-t="t2"><dt>\(L_i\)</dt><dd>output length of request \(i\) in the batch</dd></div>
+    <div data-t="t3"><dt>\(B\)</dt><dd>batch size (slots)</dd></div>
+    <div data-t="t4"><dt>\(\mu\)</dt><dd>mean output length</dd></div>
+    <div data-t="t5"><dt>\(H_B\)</dt><dd>harmonic number \(1 + \tfrac12 + \dots + \tfrac1B\); \(H_8 \approx 2.72\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Every slot is held for as long as the longest request runs. Useful work is the sum of lengths; paid-for work is the batch size times the maximum.</p>
+  <p class="why"><b>Why it matters</b>With 8 slots and exponentially distributed output lengths, the longest is expected to be 2.72 times the mean, so utilization is about \(1/2.72 \approx 37\%\). The bigger the batch and the heavier the tail, the worse it gets. Continuous batching keeps utilization near 100% whenever requests are queued.</p>
+</div>
+
+<div id="w-cb"></div>
+
+<p>What the scheduler is really choosing each iteration is the <em>running set</em>. Its rules, in vLLM's V1 scheduler and most others: running requests are served first (in arrival or priority order), each gets its next token or prefill chunk if the budget and KV memory allow, and waiting requests are admitted only from what's left. A request is never admitted unless the KV manager can give it blocks for the tokens scheduled now. Blocks for future tokens are allocated as the sequence grows, which is exactly why <a href="#preempt">preemption</a> exists.</p>
+
+<div class="pitfall"><b>Pitfall · "more slots" isn't free</b>
+<p>Raising <code>--max-num-seqs</code> admits more concurrent requests, but every one of them keeps growing its KV cache. Admit too many and the engine runs out of blocks mid-generation and starts preempting, which is far worse for latency than queueing those requests would have been. The cap and the KV pool have to be sized together.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="chunked">Token budgets and chunked prefill</h2>
+
+<p>Continuous batching admits a new request by running its prefill in some step. A 16K-token prompt makes that step take hundreds of milliseconds, and every user streaming in the same batch sees their next token stall for that long. This <strong>prefill-decode interference</strong> is the main source of inter-token latency (ITL) spikes in a busy server.</p>
+
+<p><strong>Chunked prefill</strong> with <strong>stall-free scheduling</strong> (Sarathi-Serve, Agrawal et al., 2024) fixes it with a per-step token budget. Each step first schedules one token for every running decode, then fills the rest of the budget with a slice of a waiting prompt. Long prompts take several steps, and no step is much longer than any other. The idea works because decode steps are memory-bound (<a href="08-inference.html#roofline">roofline</a>): the GPU reads all the weights anyway, so a few hundred extra prefill tokens ride along almost free.</p>
+
+<div class="formula" data-name="Linear step-cost model">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{step}}} \approx \htmlClass{t2}{a} + \htmlClass{t3}{b} \cdot \htmlClass{t4}{N_{\text{tok}}} + \htmlClass{t5}{c} \cdot \htmlClass{t6}{C_{\text{KV}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{step}}\)</dt><dd>duration of one forward pass</dd></div>
+    <div data-t="t2"><dt>\(a\)</dt><dd>fixed cost: reading all weights once plus launch overhead (≈ 6 ms for an 8B bf16 model on an H100-class GPU)</dd></div>
+    <div data-t="t3"><dt>\(b\)</dt><dd>marginal compute per token, about \(2N_{\text{params}}\) FLOPs ÷ achieved FLOP/s (≈ 0.033 ms)</dd></div>
+    <div data-t="t4"><dt>\(N_{\text{tok}}\)</dt><dd>tokens in the step: decodes plus prefill-chunk tokens</dd></div>
+    <div data-t="t5"><dt>\(c\)</dt><dd>cost per cached token read by decode attention (128 KiB ÷ ~3 TB/s ≈ 0.044 µs for Llama-3-8B)</dd></div>
+    <div data-t="t6"><dt>\(C_{\text{KV}}\)</dt><dd>total context tokens the decodes attend over this step</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A step costs a fixed amount just to stream the weights, plus a bit per token computed, plus a bit per cached token read.</p>
+  <p class="why"><b>Why it matters</b>The true curve is flat and then rises (the roofline knee). A linear fit is a decent first-order planning tool, and it's what the widgets here use. The constants are illustrative; fit your own by timing steps at a few batch sizes. Prefill chunks also pay attention compute that grows with how far into the prompt they are, which the widget includes.</p>
+</div>
+
+<div class="formula" data-name="TTFT and ITL under a token budget">
+  <div class="tex">$$\htmlClass{t1}{\text{TTFT}} \approx \htmlClass{t2}{t_{\text{queue}}} + \left\lceil \frac{\htmlClass{t3}{P}}{\htmlClass{t4}{\beta} - \htmlClass{t5}{D}} \right\rceil \cdot \htmlClass{t6}{t_{\text{step}}}(\htmlClass{t4}{\beta}), \qquad \htmlClass{t7}{\text{ITL}_{\max}} \approx \htmlClass{t6}{t_{\text{step}}}(\htmlClass{t4}{\beta})$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>TTFT</dt><dd>time to first token of the long request</dd></div>
+    <div data-t="t2"><dt>\(t_{\text{queue}}\)</dt><dd>time before the scheduler admits it at all</dd></div>
+    <div data-t="t3"><dt>\(P\)</dt><dd>prompt tokens still to prefill (after any prefix-cache hit)</dd></div>
+    <div data-t="t4"><dt>\(\beta\)</dt><dd>token budget per step (<code>--max-num-batched-tokens</code>)</dd></div>
+    <div data-t="t5"><dt>\(D\)</dt><dd>running decodes, each taking one token of the budget</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{step}}(\beta)\)</dt><dd>duration of a full-budget step, from the linear model</dd></div>
+    <div data-t="t7"><dt>\(\text{ITL}_{\max}\)</dt><dd>worst gap a streaming user sees while the prefill runs</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>The prompt is eaten in chunks of whatever budget the decodes leave over. Every step is roughly full-budget, so the budget sets both how fast the prompt finishes and how long each streaming user waits per token.</p>
+  <p class="why"><b>Why it matters</b>\(\beta = 2048\), \(D = 48\), \(P = 16{,}000\): 8 chunks of 2,000 tokens, each step ≈ 6 + 0.033 × 2048 ≈ 74 ms, so TTFT ≈ 0.6 s and nobody's ITL exceeds about 74 ms. Unchunked, the same prompt runs in one ≈ 0.6 s step (more with attention), and all 48 users freeze for it. A bigger budget finishes prompts sooner but makes every step slower: that's the dial.</p>
+</div>
+
+<div id="w-chunk"></div>
+
+<details class="think"><summary>Think first: why not make the budget tiny, say 256 tokens, and get perfect ITL?</summary>
+<div>Three costs. TTFT for long prompts grows because each step contributes only \(\beta - D\) prompt tokens, and with 128 running decodes and a 256 budget, that's 128 tokens per step. Each chunk also re-reads the full weights (the fixed cost \(a\)) for little work, so prefill efficiency drops. And every chunk's attention has to read the K and V of all earlier chunks. Small budgets suit latency-critical chat; large ones suit throughput-heavy batch jobs. Typical values run from about 2K to 16K tokens, depending on the model and the SLO.</div>
+</details>
+
+<div class="flag"><b>Engine specifics</b>
+<p>vLLM's V1 engine enables chunked prefill by default and treats <code>--max-num-batched-tokens</code> as the per-step budget; its default depends on version and hardware, so read it from the startup log. SGLang exposes <code>--chunked-prefill-size</code>. llama.cpp's server splits prompts by <code>-b</code> (logical batch) and <code>-ub</code> (physical micro-batch). Older engines without chunking had to set the budget at least as large as the maximum model length, so one long prompt could fill a whole step.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="kvmem">The KV cache memory manager</h2>
+
+<p><a href="08-inference.html#paged">PagedAttention</a> made KV memory look like an operating system's virtual memory. The block manager is the code that plays the kernel: it hands out fixed-size blocks, keeps a block table per request, tracks reference counts, and keeps a free list.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 350" id="fig-blocks"></svg>
+<figcaption>A block manager mid-flight. A prompt was sampled twice (<code>n = 2</code>): samples S1 and S2 share the prompt's physical blocks 5, 9, and 14 with reference count 2. When S2 first wrote into the shared, partly filled last block, the manager copied it to block 21 (copy-on-write), so S1 kept block 2. Request Q owns blocks 7, 11, and 18. Freed blocks that still hold a hashed prefix (3, 25, 26) go to the tail of the free queue marked "cached": a future request with the same prefix can reclaim them, and since the allocator hands out blocks from the head, they survive until older free blocks run out. That ordering is the LRU eviction.</figcaption></figure>
+
+<h3>The data structures</h3>
+<ul>
+  <li><strong>Block pool.</strong> At startup the engine carves the KV region into \(N_{\text{blocks}}\) blocks of \(B_s\) tokens each, across all layers. Nothing is allocated per request beyond this.</li>
+  <li><strong>Block table</strong> per request, a list of physical block ids. It's what the attention kernel walks.</li>
+  <li><strong>Reference counts.</strong> A block shared by two sequences has count 2 and is freed only when both release it.</li>
+  <li><strong>Free queue.</strong> vLLM V1 keeps free blocks in a queue ordered so that blocks freed longest ago are reused first, and prefix-cache hash entries are dropped when their block is reused. That ordering is what makes eviction approximately LRU.</li>
+  <li><strong>Copy-on-write.</strong> Parallel samples and beam search share prompt blocks. When a sequence must write into a block someone else still references, the manager copies that block first. Only the partly filled last block ever needs copying.</li>
+</ul>
+
+<div class="formula" data-name="KV capacity">
+  <div class="tex">$$\htmlClass{t1}{T_{\max}} = \frac{\htmlClass{t2}{M_{\text{GPU}}} \cdot \htmlClass{t3}{u} - \htmlClass{t4}{W} - \htmlClass{t5}{A}}{\htmlClass{t6}{m_{\text{kv}}}}, \qquad \htmlClass{t6}{m_{\text{kv}}} = 2 \cdot \htmlClass{t7}{L \cdot n_{\text{kv}} \cdot d_h \cdot s}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(T_{\max}\)</dt><dd>total tokens of KV the engine can hold across all running requests</dd></div>
+    <div data-t="t2"><dt>\(M_{\text{GPU}}\)</dt><dd>GPU memory</dd></div>
+    <div data-t="t3"><dt>\(u\)</dt><dd>fraction the engine may use (<code>--gpu-memory-utilization</code>, e.g. 0.90)</dd></div>
+    <div data-t="t4"><dt>\(W\)</dt><dd>weight bytes (Module 09: parameters × bits ÷ 8)</dd></div>
+    <div data-t="t5"><dt>\(A\)</dt><dd>peak activations, CUDA graph pools, and other workspace, measured by a profiling run at startup</dd></div>
+    <div data-t="t6"><dt>\(m_{\text{kv}}\)</dt><dd>KV bytes per token: K and V, every layer</dd></div>
+    <div data-t="t7"><dt>\(L, n_{\text{kv}}, d_h, s\)</dt><dd>layers, KV heads, head dimension, bytes per element (bf16: 2, fp8: 1)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Whatever memory is left after weights and workspace becomes KV blocks. Divide by the per-token cost to get the token capacity.</p>
+  <p class="why"><b>Why it matters</b>An 80 GB GPU at \(u = 0.9\) running Llama-3.1-8B in bf16: 72 − 16 − ~4 ≈ 52 GB of KV at 128 KiB per token ≈ 397K tokens. That's about 190 concurrent 2K-token conversations, or 12 at 32K. Switch the KV cache to fp8 and both numbers double.</p>
+</div>
+
+<div class="formula" data-name="Internal fragmentation and concurrency">
+  <div class="tex">$$\mathbb{E}[\htmlClass{t1}{w}] \approx \frac{\htmlClass{t2}{B_s} - 1}{2}, \qquad \htmlClass{t3}{f_{\text{waste}}} \approx \frac{\htmlClass{t2}{B_s} - 1}{2\,\htmlClass{t4}{\bar{L}}}, \qquad \htmlClass{t5}{S_{\max}} = \left\lfloor \frac{\htmlClass{t6}{N_{\text{blocks}}}}{\lceil \htmlClass{t4}{\bar{L}} / \htmlClass{t2}{B_s} \rceil} \right\rfloor$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(w\)</dt><dd>empty token slots in a sequence's last, partly filled block</dd></div>
+    <div data-t="t2"><dt>\(B_s\)</dt><dd>block size in tokens</dd></div>
+    <div data-t="t3"><dt>\(f_{\text{waste}}\)</dt><dd>fraction of KV memory lost to partly filled blocks</dd></div>
+    <div data-t="t4"><dt>\(\bar{L}\)</dt><dd>average sequence length (prompt plus output so far)</dd></div>
+    <div data-t="t5"><dt>\(S_{\max}\)</dt><dd>maximum number of sequences that fit at once</dd></div>
+    <div data-t="t6"><dt>\(N_{\text{blocks}}\)</dt><dd>blocks in the pool, \(T_{\max} / B_s\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>If sequence lengths are spread evenly, the last block is half full on average. Waste is a fixed handful of tokens per sequence, so it matters only when sequences are short.</p>
+  <p class="why"><b>Why it matters</b>At \(B_s = 16\), waste is 7.5 tokens per sequence: 0.4% of a 2K-token conversation. At \(B_s = 128\) it's 63.5 tokens, about 3%. Bigger blocks mean fewer table entries and more efficient kernel memory access but coarser prefix-cache matching (only full blocks are hashed). That's the real tradeoff behind <code>--block-size</code>.</p>
+</div>
+
+<div id="w-kvcap"></div>
+
+<div class="mle"><b>MLE angle · read the startup log before anything else</b>
+<p>vLLM logs the KV cache size in tokens and the maximum concurrency at <code>--max-model-len</code>. SGLang logs <code>max_total_num_tokens</code>. Compare that to the widget's prediction: a big mismatch usually means a different activation reserve (raised by a large <code>--max-num-batched-tokens</code>), another process holding GPU memory, or a model whose layers don't all use full attention. Newer engines handle sliding-window and hybrid-attention models with separate KV groups, so capacity per token isn't one number for those.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="preempt">Preemption under memory pressure</h2>
+
+<p>The scheduler admits requests based on the blocks they need <em>now</em>. Their outputs keep growing, one block every \(B_s\) tokens. Eventually a running request needs a new block and the free queue is empty. Something has to give: the scheduler <strong>preempts</strong> a victim, usually the lowest-priority or most recently admitted running request, frees its blocks, and puts it back at the front of the waiting queue.</p>
+
+<p>There are two ways to bring a preempted request back:</p>
+<ul>
+  <li><strong>Swap.</strong> Copy its KV blocks to CPU memory over PCIe and copy them back when there's room. Costs link bandwidth and pinned host memory, no GPU compute.</li>
+  <li><strong>Recompute.</strong> Throw the KV away. On resume, treat prompt plus generated-so-far as a new prompt and prefill it again. Costs GPU compute, which other requests could have used. With prefix caching on, part of it may still be cached if those freed blocks haven't been reused yet.</li>
+</ul>
+
+<div class="formula" data-name="Swap vs recompute">
+  <div class="tex">$$\htmlClass{t1}{t_{\text{swap}}} = \frac{2\, \htmlClass{t2}{T}\, \htmlClass{t3}{m_{\text{kv}}}}{\htmlClass{t4}{BW_{\text{link}}}}, \qquad \htmlClass{t5}{t_{\text{recompute}}} \approx \frac{2\htmlClass{t6}{N}\htmlClass{t2}{T} + 2 L d\, \htmlClass{t2}{T}^2}{\htmlClass{t7}{F_{\text{eff}}}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(t_{\text{swap}}\)</dt><dd>time to move the KV out and back in (the 2 is the round trip)</dd></div>
+    <div data-t="t2"><dt>\(T\)</dt><dd>tokens in the preempted sequence</dd></div>
+    <div data-t="t3"><dt>\(m_{\text{kv}}\)</dt><dd>KV bytes per token</dd></div>
+    <div data-t="t4"><dt>\(BW_{\text{link}}\)</dt><dd>effective GPU↔CPU bandwidth; far below the PCIe peak when copying many small blocks</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{recompute}}\)</dt><dd>time to prefill the sequence again (matmuls plus causal attention, from Module 08)</dd></div>
+    <div data-t="t6"><dt>\(N\)</dt><dd>model parameters</dd></div>
+    <div data-t="t7"><dt>\(F_{\text{eff}}\)</dt><dd>achieved FLOP/s during prefill</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Swapping scales with the bytes of KV. Recomputing scales with the FLOPs to rebuild them, which grow faster than linearly for long sequences.</p>
+  <p class="why"><b>Why it matters</b>For a GQA model, KV is small relative to the compute that produced it: 8K tokens of Llama-3-8B is 1 GiB to move (≈ 86 ms round trip at 25 GB/s) versus ≈ 0.37 s to recompute at 400 TFLOP/s. On paper, swapping wins. The PagedAttention paper found the two comparable at typical block sizes because small-block copies use PCIe poorly, and vLLM's V1 engine preempts by recomputation: it's simpler, needs no pinned host memory, and works with prefix caching.</p>
+</div>
+
+<div id="w-preempt"></div>
+
+<h3>What preemption does to latency</h3>
+<p>The victim's user sees a long gap mid-stream: its tokens stop until it's readmitted and re-prefilled, often hundreds of milliseconds to seconds. Everyone else pays too, because the recompute prefill takes budget away from their decodes. And preemption tends to cascade: the readmitted request grows again and triggers the next one. A server that preempts regularly is overcommitted, and the fix is admission control (lower <code>--max-num-seqs</code>, a shorter <code>--max-model-len</code>, fp8 KV, or more GPUs), not a cleverer preemption mode.</p>
+
+<h3>Scheduling policies and fairness</h3>
+<ul>
+  <li><strong>FCFS</strong> (first come, first served) is the default nearly everywhere. Simple and predictable, but one client flooding the server delays everyone behind it.</li>
+  <li><strong>Priority.</strong> vLLM's <code>--scheduling-policy priority</code> lets each request carry a priority. Lower-priority requests wait and are preempted first. Useful for mixing interactive and batch traffic on one deployment.</li>
+  <li><strong>Cache-aware ordering.</strong> SGLang's <code>lpm</code> policy (longest prefix match, set with <code>--schedule-policy</code>; the default has differed between versions) admits the waiting requests with the most cached tokens first, which raises the hit rate but can starve requests with unique prompts under load.</li>
+  <li><strong>Fair share.</strong> Sheng et al. (2024) proposed the Virtual Token Counter: track tokens served per client and admit from whoever has received the least, a token-weighted version of fair queueing. Per-tenant fairness is often enforced one layer up, in the gateway (Module 21).</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2 id="radix">Prefix caching and RadixAttention</h2>
+
+<p><a href="08-inference.html#prefix">Module 08</a> covered what prefix caching buys. Here's how the two main designs find a match, and how their eviction behaves under a real workload.</p>
+
+<h3>Hashed full blocks (vLLM)</h3>
+<p>Each <em>full</em> block gets a hash of its tokens chained with the hash of the block before it, plus any extra keys that change the KV (a LoRA adapter id, a multimodal input's hash, a cache salt). Because the hash is chained, block \(k\)'s hash identifies the entire prefix up to and including block \(k\). A new request hashes its prompt block by block and walks the table until the first miss. Partly filled blocks are never shared.</p>
+
+<h3>A radix tree of token sequences (SGLang)</h3>
+<p>RadixAttention (Zheng et al., 2024) stores cached sequences in a radix tree: each edge is a run of tokens, each node points at the KV for that run. Matching is a walk from the root, at token granularity. Each node keeps a reference count (how many running requests use it) and a last-access time. Eviction removes the least recently used <em>leaf</em> with no references, so shared trunks like a system prompt survive while one-off branches go first.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 330" id="fig-radix"></svg>
+<figcaption>A radix tree of cached prompts. Two applications share the root: a chat assistant (system prompt, then a tool block, then per-user turns) and a few-shot classifier (a shared header, then one short question each). Each node shows its tokens, reference count, and last access time. The incoming request (green path) matches 2,290 tokens and prefills only its new message. Leaves with zero references, outlined in brick, are eviction candidates in LRU order.</figcaption></figure>
+
+<div class="formula" data-name="Cached tokens and hit rate">
+  <div class="tex">$$\htmlClass{t1}{h_r^{\text{radix}}} = \htmlClass{t2}{\ell_r}, \qquad \htmlClass{t3}{h_r^{\text{block}}} = \htmlClass{t4}{B_s} \left\lfloor \frac{\htmlClass{t2}{\ell_r}}{\htmlClass{t4}{B_s}} \right\rfloor, \qquad \htmlClass{t5}{H} = \frac{\sum_r \htmlClass{t1}{h_r}}{\sum_r \htmlClass{t6}{P_r}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(h_r\)</dt><dd>prompt tokens of request \(r\) served from cache</dd></div>
+    <div data-t="t2"><dt>\(\ell_r\)</dt><dd>length of the longest prefix of \(r\)'s prompt still resident in the cache</dd></div>
+    <div data-t="t3"><dt>\(h_r^{\text{block}}\)</dt><dd>same, when only full blocks can be matched</dd></div>
+    <div data-t="t4"><dt>\(B_s\)</dt><dd>block size</dd></div>
+    <div data-t="t5"><dt>\(H\)</dt><dd>token hit rate: the fraction of prompt tokens not prefilled</dd></div>
+    <div data-t="t6"><dt>\(P_r\)</dt><dd>prompt length of request \(r\)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>A radix tree reuses the exact shared length. Block hashing rounds it down to a whole number of blocks, losing at most \(B_s - 1\) tokens per request.</p>
+  <p class="why"><b>Why it matters</b>The rounding is small next to the thing that really decides \(H\): whether the prefix is still resident. Prefill time saved is \(H\) times the prompt tokens, so TTFT for a mostly cached 20K-token agent prompt drops by close to \(1/(1-H)\).</p>
+</div>
+
+<div id="w-prefix"></div>
+
+<details class="think"><summary>Think first: drop the cache to 16K tokens with users interleaved, then switch to one session at a time. Why does the hit rate recover with the same capacity?</summary>
+<div>Interleaved traffic cycles through all 16 users before any of them returns. Their combined histories exceed 16K tokens, so LRU evicts each user's history shortly before that user comes back, the textbook worst case for LRU on a cyclic access pattern. Only the system prompt, which every request touches, stays resident, and the hit rate falls toward the system prompt's share of each prompt (about 65% here, down from 94%). One session at a time keeps the active user's chain hot, so it recovers. What matters is capacity relative to the working set of conversations that are active at once, not total traffic.</div>
+</details>
+
+<div class="pitfall"><b>Pitfall · prompts that look identical but tokenize differently</b>
+<p>Multi-turn chat resends the previous assistant reply as text. If the chat template rewrites it (strips reasoning, normalizes whitespace) or the text re-tokenizes differently from the tokens originally generated, the match ends there and the rest of the history is prefilled again. Check the hit rate your engine reports (vLLM and SGLang both export prefix-cache metrics) instead of assuming a hit.</p>
+</div>
+
+<div class="mle"><b>MLE angle · the cache is per replica</b>
+<p>Prefix caching only helps if the follow-up request reaches the replica holding the prefix. Round-robin load balancing across 8 replicas gives each conversation about a 1-in-8 chance of returning to the right one. KV-aware or session-affinity routing (Module 21) is what turns an engine feature into a fleet-level hit rate.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="specdec">Speculative decoding inside engines</h2>
+
+<p><a href="08-inference.html#spec">Module 08</a> derived the acceptance rule and the expected speedup. Inside an engine, the question is different: where do drafts come from, how are they verified in the same ragged batch as everyone else, and what happens at batch 128 instead of batch 1?</p>
+
+<h3>Draft sources</h3>
+<ul>
+  <li><strong>Separate draft model.</strong> A small model from the same family (same tokenizer). It needs its own weights and its own KV cache, managed alongside the target's.</li>
+  <li><strong>EAGLE</strong> (Li et al., 2024). A light head, roughly one transformer layer, that drafts autoregressively from the target model's own hidden states instead of from tokens. Features are easier to predict than tokens, so acceptance is high for a tiny cost. EAGLE-2 builds draft trees dynamically from the head's confidence; EAGLE-3 uses features from several layers.</li>
+  <li><strong>Medusa</strong> (Cai et al., 2024). Several extra heads on the last hidden state, each predicting the token \(k\) steps ahead. Their top candidates combine into a tree of continuations.</li>
+  <li><strong>N-gram / prompt lookup.</strong> Find the last few generated tokens earlier in the context and propose whatever followed them there. No model at all. Very effective when outputs copy from inputs (code edits, RAG answers that quote, summaries), useless for open-ended writing.</li>
+</ul>
+
+<h3>Verification with tree attention</h3>
+<p>Tree-shaped drafts (Medusa, EAGLE-2) propose several branches at once. The target verifies all of them in one forward pass by flattening the tree into a sequence and using an attention mask in which each draft token sees the context plus its own ancestors only.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 300" id="fig-tree"></svg>
+<figcaption>Verifying a 7-token draft tree in one pass. Left: candidate continuations after "the cat". Right: the tree attention mask; row \(i\) may attend to the shared context and to column \(j\) only if \(j\) is \(i\) itself or one of its ancestors. The target model scores all 7 positions at once; the engine accepts the longest root-to-leaf path that matches what the target would have sampled (here "sat on the"), then adds one bonus token from the target. KV entries written for rejected branches are discarded, so their slots go back to the allocator.</figcaption></figure>
+
+<div class="formula" data-name="Speculative speedup at batch size B">
+  <div class="tex">$$\htmlClass{t1}{S(B)} = \frac{\htmlClass{t2}{\mathbb{E}[\tau]} \cdot \htmlClass{t3}{t}(B)}{\htmlClass{t3}{t}\big(B(\htmlClass{t4}{\gamma}+1)\big) + \htmlClass{t4}{\gamma}\, \htmlClass{t5}{t_{\text{draft}}}(B)}, \qquad \htmlClass{t2}{\mathbb{E}[\tau]} = \frac{1 - \htmlClass{t6}{\alpha}^{\htmlClass{t4}{\gamma}+1}}{1 - \htmlClass{t6}{\alpha}}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(S(B)\)</dt><dd>speedup in tokens per second over plain decoding at the same batch size</dd></div>
+    <div data-t="t2"><dt>\(\mathbb{E}[\tau]\)</dt><dd>expected tokens produced per sequence per verification step</dd></div>
+    <div data-t="t3"><dt>\(t(\cdot)\)</dt><dd>step time for that many tokens, from the linear cost model</dd></div>
+    <div data-t="t4"><dt>\(\gamma\)</dt><dd>draft tokens per sequence per step</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{draft}}\)</dt><dd>time for one drafting step across the batch</dd></div>
+    <div data-t="t6"><dt>\(\alpha\)</dt><dd>per-token acceptance rate</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>You get \(\mathbb{E}[\tau]\) tokens for the price of one step that is \(\gamma+1\) times wider, plus the drafting. At batch 1 the wide step costs almost the same as a narrow one. At large batch, widening it by 5× costs real compute.</p>
+  <p class="why"><b>Why it matters</b>With the illustrative cost model, \(\alpha = 0.75\), \(\gamma = 4\) and a cheap EAGLE-style draft: about 2.6× at batch 1, about 1.6× at batch 128 with 2K-token contexts. Shorter contexts make the break-even batch arrive sooner, because KV reads (shared across the \(\gamma+1\) verified tokens) are what keep large-batch decode memory-bound. The MagicDec paper (2024) made this long-context argument in detail.</p>
+</div>
+
+<div id="w-specb"></div>
+
+<div class="flag"><b>Engine bookkeeping you'll notice</b>
+<p>Draft tokens count toward the step's token budget, so speculation competes with prefill chunks. Each request needs KV slots for its drafts before verification. And acceptance is workload-specific: measure it (vLLM logs draft acceptance metrics) on your own traffic before keeping it on. For heavily loaded throughput-oriented deployments, the right setting is often "off".</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="grammar">Structured outputs in the engine</h2>
+
+<p>When a request asks for JSON matching a schema, the engine guarantees it by masking: before sampling, every token that would make the output invalid gets its logit set to \(-\infty\). <a href="12-agents.html#structured">Module 12</a> covers why agents depend on this. The engine's problem is speed: Llama 3 has 128,256 tokens, and the allowed set depends on the grammar state, which changes after every token.</p>
+
+<ul>
+  <li><strong>Compile once.</strong> The JSON schema or regex is compiled to an automaton (a finite-state machine for regular languages; a pushdown automaton when nesting needs a stack). Outlines (Willard &amp; Louf, 2023) precomputes, for each FSM state, which vocabulary tokens are valid, turning the per-step work into a lookup.</li>
+  <li><strong>Split the vocabulary.</strong> XGrammar (Dong et al., 2024) handles full context-free grammars by noting that most tokens' validity depends only on the current grammar position, so it can be precomputed; only a small set of "context-dependent" tokens needs checking at runtime against the automaton's stack.</li>
+  <li><strong>Overlap with the GPU.</strong> The mask for step \(t\) depends on the token sampled at step \(t-1\), not on step \(t\)'s logits. So the CPU can compute it while the GPU runs step \(t\)'s forward pass, and apply it just before sampling.</li>
+</ul>
+
+<figure class="fig wide"><svg viewBox="0 0 900 220" id="fig-overlap"></svg>
+<figcaption>Mask computation serialized with the forward pass versus overlapped with it. The mask is a bitmask over the vocabulary: 128,256 bits, about 16 KB per sequence per step, that must reach the GPU before sampling. When mask time stays below forward time, overlapping hides it completely.</figcaption></figure>
+
+<div class="formula" data-name="Masked logits and overlapped mask cost">
+  <div class="tex">$$\htmlClass{t1}{z'_i} = \htmlClass{t2}{z_i} + \log \htmlClass{t3}{m_i(s)}, \qquad \htmlClass{t4}{t^{\text{serial}}} = \htmlClass{t5}{t_{\text{fwd}}} + \htmlClass{t6}{t_{\text{mask}}}, \qquad \htmlClass{t7}{t^{\text{overlap}}} = \max\!\left(\htmlClass{t5}{t_{\text{fwd}}},\, \htmlClass{t6}{t_{\text{mask}}}\right)$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(z'_i\)</dt><dd>logit after masking</dd></div>
+    <div data-t="t2"><dt>\(z_i\)</dt><dd>the model's logit for token \(i\)</dd></div>
+    <div data-t="t3"><dt>\(m_i(s)\)</dt><dd>1 if token \(i\) is allowed in grammar state \(s\), else 0, so \(\log 0 = -\infty\) removes it</dd></div>
+    <div data-t="t4"><dt>\(t^{\text{serial}}\)</dt><dd>step time when the mask is computed after the forward pass</dd></div>
+    <div data-t="t5"><dt>\(t_{\text{fwd}}\)</dt><dd>forward-pass time</dd></div>
+    <div data-t="t6"><dt>\(t_{\text{mask}}\)</dt><dd>CPU time to compute the mask for the whole batch</dd></div>
+    <div data-t="t7"><dt>\(t^{\text{overlap}}\)</dt><dd>step time when the mask is computed during the forward pass</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Disallowed tokens get probability exactly zero. If the mask is ready by the time the logits are, it costs nothing.</p>
+  <p class="why"><b>Why it matters</b>A decode step for a mid-size model takes roughly 10–30 ms. A grammar engine that needs 5 ms per sequence on one CPU core can't keep up with a batch of 64 constrained requests, no matter how it's overlapped. Mask speed per sequence, and how many cores compute masks, decide whether structured output is free or a bottleneck.</p>
+</div>
+
+<div class="pitfall"><b>Pitfall · first-request compile time and forced tokenization</b>
+<p>Compiling a big schema can take noticeable time on first use; engines cache compiled grammars, so a schema that changes on every request never benefits. Masks can also force the model into token sequences it rarely produces (splitting a word it would normally emit as one token), which can lower quality. A common pattern is to let the model reason in free text first and constrain only the final answer. In vLLM the backend is selectable (XGrammar and llguidance among them); llama.cpp uses its own GBNF grammars.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="multilora">Multi-LoRA serving</h2>
+
+<p>A team with 50 fine-tuned variants of one base model (Module 10's <a href="10-finetuning.html#lora">LoRA</a>) doesn't want 50 deployments. Since a LoRA adapter is only a low-rank update \(\Delta W = BA\), one engine can keep the base weights once and apply a different adapter to each request in the same batch: \(y = xW + x A_i B_i\) for request \(i\)'s adapter.</p>
+
+<p>The hard part is the second term: a batch of 128 tokens might use 20 different adapters, which makes many tiny, mismatched matmuls. Punica (Chen et al., 2023) introduced the <strong>SGMV</strong> kernel (segmented gather matrix-vector multiplication): sort the batch's rows by adapter, then run one kernel that applies each segment's \(A_i\) (shrink, \(d \to r\)) and \(B_i\) (expand, \(r \to d\)). S-LoRA (Sheng et al., 2023) added a unified memory pool that pages adapter weights and KV cache together, so thousands of adapters can live in CPU memory with only the active ones loaded on the GPU.</p>
+
+<figure class="fig wide"><svg viewBox="0 0 900 300" id="fig-sgmv"></svg>
+<figcaption>Batched multi-LoRA. Rows of the flattened batch are grouped by adapter. The base projection \(xW\) runs once over all rows as one large GEMM. SGMV then applies each segment's own low-rank pair: shrink to rank \(r\), expand back to \(d\), and add. Rows with no adapter skip the second path. Adapter weights sit in a GPU pool sized by <code>--max-loras</code>; others wait in CPU memory.</figcaption></figure>
+
+<div class="formula" data-name="Adapter memory">
+  <div class="tex">$$\htmlClass{t1}{M_{\text{adapter}}} = \htmlClass{t2}{r} \cdot \htmlClass{t3}{L} \cdot \sum_{\htmlClass{t4}{m}} \left(\htmlClass{t5}{d_{\text{in}}^{(m)}} + \htmlClass{t6}{d_{\text{out}}^{(m)}}\right) \cdot \htmlClass{t7}{s}$$</div>
+  <dl class="legend">
+    <div data-t="t1"><dt>\(M_{\text{adapter}}\)</dt><dd>bytes for one adapter</dd></div>
+    <div data-t="t2"><dt>\(r\)</dt><dd>LoRA rank</dd></div>
+    <div data-t="t3"><dt>\(L\)</dt><dd>layers</dd></div>
+    <div data-t="t4"><dt>\(m\)</dt><dd>adapted modules per layer (q, k, v, o, gate, up, down)</dd></div>
+    <div data-t="t5"><dt>\(d_{\text{in}}^{(m)}\)</dt><dd>input width of module \(m\) (the \(A\) matrix is \(d_{\text{in}} \times r\))</dd></div>
+    <div data-t="t6"><dt>\(d_{\text{out}}^{(m)}\)</dt><dd>output width (the \(B\) matrix is \(r \times d_{\text{out}}\))</dd></div>
+    <div data-t="t7"><dt>\(s\)</dt><dd>bytes per element (2 for bf16)</dd></div>
+  </dl>
+  <p class="inwords"><b>In words</b>Each adapted matrix adds two thin matrices whose combined size is the rank times the sum of its two widths.</p>
+  <p class="why"><b>Why it matters</b>Llama-3-8B, rank 16, all seven projections: per layer \(16 \times (8192 + 5120 + 5120 + 8192 + 3 \times 18432) = 1{,}310{,}720\) parameters, times 32 layers ≈ 42M parameters ≈ 84 MB in bf16. About 1% of the base model, so dozens of adapters fit next to the KV cache. FLOPs are similarly small, but the skinny matmuls are memory-bound, so real overhead runs higher than the FLOP ratio suggests.</p>
+</div>
+
+<div class="code" data-lang="bash" data-title="vLLM multi-LoRA"><pre><code>
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --enable-lora \
+  --lora-modules sql=./adapters/sql-r16 support=./adapters/support-r16 \
+  --max-loras 8 \
+  --max-lora-rank 16 \
+  --max-cpu-loras 64
+# clients pick an adapter by model name:  {"model": "sql", "messages": [...]}
+</code></pre></div>
+
+<div class="flag"><b>When not to bother</b>
+<p>If one adapter carries nearly all traffic, merge it into the base weights (\(W' = W + BA\)) and serve that: zero overhead. Multi-LoRA pays off when traffic spreads across many adapters. Also note that the prefix cache is keyed by adapter: the same system prompt under two adapters produces different KV, so it's cached twice.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="compare">Engines compared</h2>
+
+<p>All of these do continuous batching and stream through an OpenAI-style HTTP API. They differ in hardware targets, how far they push scheduling and caching, and who they're built for. Features move fast; check each project's current docs before committing.</p>
+
+<table class="t">
+  <thead><tr><th>Engine</th><th>Distinctive pieces</th><th>Hardware</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>vLLM</td><td>PagedAttention, chunked prefill, hashed-block prefix caching, spec decoding (draft, EAGLE, n-gram), multi-LoRA, structured outputs; very broad model support</td><td>NVIDIA, AMD; TPU and other accelerators via backends and plugins</td><td>Default choice for general GPU serving and offline batch inference</td></tr>
+    <tr><td>SGLang</td><td>RadixAttention, cache-aware scheduling, overlap scheduler, fast constrained decoding, a frontend language for multi-call programs</td><td>NVIDIA, AMD</td><td>Prefix-heavy and agentic workloads; large MoE deployments</td></tr>
+    <tr><td>TensorRT-LLM</td><td>NVIDIA's optimized kernels, in-flight batching, paged KV with reuse, FP8/FP4 paths; served via <code>trtllm-serve</code> or Triton Inference Server</td><td>NVIDIA only</td><td>Squeezing maximum performance from NVIDIA datacenter GPUs</td></tr>
+    <tr><td>llama.cpp / llama-server</td><td>C/C++, GGUF quantization (Module 09), parallel slots with continuous batching, GBNF grammars, draft-model speculation</td><td>CPU, Apple Metal, CUDA, Vulkan, and more</td><td>Local and edge, single users or small teams, CPU-only boxes</td></tr>
+    <tr><td>MLX-LM server</td><td><code>mlx_lm.server</code> on Apple's MLX arrays, MLX-format quantized models</td><td>Apple silicon</td><td>Local development and personal use on Macs; check your version's batching support before load-testing it</td></tr>
+    <tr><td>Ollama</td><td>Model registry, one-line pulls, simple CLI and API; built on llama.cpp's GGML stack, with newer model families running on its own engine</td><td>CPU, Apple, NVIDIA, AMD</td><td>Easiest local setup; concurrency limited by settings like <code>OLLAMA_NUM_PARALLEL</code></td></tr>
+    <tr><td>LMDeploy</td><td>TurboMind (C++/CUDA) and PyTorch engines, persistent batching, blocked KV, AWQ int4 weights, int8/int4 KV quantization</td><td>Mainly NVIDIA</td><td>High-throughput serving, especially for the InternLM and Qwen families</td></tr>
+    <tr><td>TGI</td><td>Hugging Face's Rust router plus model servers; continuous batching, paged attention, tensor parallelism</td><td>NVIDIA, AMD, others</td><td>Existing deployments. Its docs now describe it as in maintenance mode (bug fixes only) and point to vLLM and SGLang; check the repo for current status</td></tr>
+  </tbody>
+</table>
+
+<div class="intuition"><b>How to choose</b>
+<p>Start from the hardware: Mac or CPU points to llama.cpp, Ollama, or MLX; NVIDIA or AMD datacenter GPUs point to vLLM or SGLang. Then the workload: many shared prefixes or multi-call agent programs favor SGLang's design; the widest model and feature coverage favors vLLM; a fixed model on NVIDIA where every percent counts justifies TensorRT-LLM's extra build complexity. Then benchmark two candidates on <em>your</em> prompt and output length distribution. Published engine-vs-engine numbers depend heavily on version, flags, and workload.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="tuning">Tuning knobs and how they trade off</h2>
+
+<p>Engine flags map directly onto the mechanisms above. The table uses vLLM's names; SGLang and llama.cpp have equivalents, noted where they differ.</p>
+
+<table class="t">
+  <thead><tr><th>Knob</th><th>What it controls</th><th>Raise it and…</th><th>Watch out for</th></tr></thead>
+  <tbody>
+    <tr><td><code>--gpu-memory-utilization</code></td><td>Fraction of GPU memory the engine claims (\(u\)); weights and workspace come out of it, the rest becomes KV</td><td>More KV blocks, more concurrency, fewer preemptions</td><td>OOM if another process shares the GPU or activation spikes exceed the profile. SGLang: <code>--mem-fraction-static</code></td></tr>
+    <tr><td><code>--max-num-seqs</code></td><td>Cap on running requests per step</td><td>Throughput up while memory-bound; per-user ITL up</td><td>Preemption when KV can't hold them all. SGLang: <code>--max-running-requests</code></td></tr>
+    <tr><td><code>--max-num-batched-tokens</code></td><td>Per-step token budget (\(\beta\)) for decodes plus prefill chunks</td><td>Long prompts finish sooner (TTFT down), prefill efficiency up</td><td>Every step gets longer (ITL up); larger activation reserve. SGLang: <code>--chunked-prefill-size</code></td></tr>
+    <tr><td><code>--max-model-len</code></td><td>Longest prompt plus output accepted</td><td>Longer requests allowed</td><td>Lower worst-case concurrency, and the engine refuses to start if one max-length sequence can't fit</td></tr>
+    <tr><td><code>--kv-cache-dtype fp8</code></td><td>KV element size (\(s\))</td><td>Roughly 2× KV capacity; less KV read per decode step</td><td>Small quality risk, larger on long-context retrieval; evaluate it (Module 09)</td></tr>
+    <tr><td><code>--enable-prefix-caching</code></td><td>Reuse of hashed full blocks across requests (on by default in vLLM V1)</td><td>TTFT and prefill compute drop with shared prefixes</td><td>Tiny overhead on fully unique traffic. SGLang: on by default, <code>--disable-radix-cache</code> to ablate</td></tr>
+    <tr><td><code>--block-size</code></td><td>Tokens per KV block (\(B_s\))</td><td>Fewer table entries, sometimes faster kernels</td><td>More waste per sequence, coarser prefix matching; allowed values depend on the attention backend</td></tr>
+    <tr><td><code>--speculative-config</code></td><td>Draft method, model, tokens per step (JSON)</td><td>Lower ITL at low batch when acceptance is high</td><td>Lower throughput at high batch; extra memory for draft weights and KV</td></tr>
+    <tr><td><code>--enforce-eager</code></td><td>Disables CUDA graph capture</td><td>(it's a switch) faster startup, less memory, easier debugging</td><td>Noticeably slower decode, most for small models where launch overhead dominates</td></tr>
+    <tr><td><code>--scheduling-policy</code></td><td><code>fcfs</code> or <code>priority</code></td><td>Interactive traffic protected from batch jobs</td><td>Low-priority requests can starve; set client priorities deliberately</td></tr>
+  </tbody>
+</table>
+
+<h3>A tuning playbook</h3>
+<ol>
+  <li><strong>Fix the workload and the target first.</strong> A recorded or synthetic request mix with realistic prompt and output lengths, a fixed arrival rate or concurrency, and a stated SLO such as "p95 TTFT under 1 s, p95 ITL under 50 ms". Without an SLO there's no "better", only "different".</li>
+  <li><strong>Measure the baseline</strong> with the engine defaults: throughput, p50/p95/p99 TTFT and ITL, and the engine's own metrics (queue length, KV usage, preemptions, prefix hit rate).</li>
+  <li><strong>Read the startup log</strong> and check KV capacity against the formula. If concurrency at your real sequence lengths is too low, fix memory first (fp8 KV, shorter max length, quantized weights, more GPUs).</li>
+  <li><strong>Change one knob at a time</strong> and re-run the identical workload. Sweep it across a range rather than trying one value.</li>
+  <li><strong>Locate the knee.</strong> Throughput rises with load until the GPU is compute-bound or KV is full; past that, latency climbs while throughput stays flat. Run just below the knee with headroom for bursts.</li>
+  <li><strong>Re-check after every model, engine-version, or traffic change.</strong> Defaults change between releases.</li>
+</ol>
+
+<div class="mle"><b>MLE angle · the three metrics that explain most incidents</b>
+<p>Requests waiting (the queue is growing: you're over capacity or KV-bound), KV cache usage near 100% (memory is the limit), and the preemption counter rising (you've overcommitted). vLLM exports these on <code>/metrics</code> as Prometheus gauges and counters; exact names vary by version, so grep for <code>num_requests_waiting</code>, <code>cache_usage</code>, and <code>preemptions</code>. Alert on the trend, not single spikes.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="build">Build a mini engine, then drive real ones</h2>
+
+<h3>1. A toy continuous-batching server</h3>
+<p>About 120 lines over a small Hugging Face model. It does the real thing at toy scale: requests arrive over HTTP at any time, the engine thread admits them between steps, decodes all running sequences in one batched forward pass, and retires finished ones immediately. Each sequence keeps its own KV tensors; every step they're left-padded into one batch and split back out afterwards. That copy is exactly the overhead PagedAttention removes, and seeing it makes the block-table design obvious.</p>
+
+<div class="code" data-lang="python" data-title="mini_engine.py"><pre><code>
+# Continuous batching over a small HF model. Run:  python mini_engine.py
+import json, queue, threading, time
+import torch
+import torch.nn.functional as F
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"   # plain Llama architecture, no sliding window
+MAX_RUNNING = 8                                  # like --max-num-seqs
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+tok = AutoTokenizer.from_pretrained(MODEL)
+model = AutoModelForCausalLM.from_pretrained(MODEL).to(dev).eval()
+EOS = tok.eos_token_id
+
+def to_layers(cache):
+    """Cache object -&gt; list of (K, V), each (batch, kv_heads, seq, head_dim)."""
+    if hasattr(cache, "layers"):                 # transformers &gt;= 4.56
+        return [(l.keys, l.values) for l in cache.layers]
+    if hasattr(cache, "key_cache"):              # older DynamicCache
+        return list(zip(cache.key_cache, cache.value_cache))
+    return list(cache)                           # legacy tuple of tuples
+
+def from_layers(layers):
+    cache = DynamicCache()
+    for i, (k, v) in enumerate(layers):
+        cache.update(k, v, i)
+    return cache
+
+class Seq:
+    def __init__(self, prompt, max_new):
+        text = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                       tokenize=False, add_generation_prompt=True)
+        self.ids = tok(text, add_special_tokens=False).input_ids
+        self.out, self.kv, self.max_new = [], None, max_new
+        self.done = threading.Event()
+        self.t_arrive, self.t_first, self.t_done = time.perf_counter(), None, None
+
+    @property
+    def cache_len(self):                         # tokens with stored K/V (newest token not yet)
+        return len(self.ids) + len(self.out) - 1
+
+    @property
+    def finished(self):
+        return bool(self.out) and (self.out[-1] == EOS or len(self.out) &gt;= self.max_new)
+
+    def append(self, token):
+        if not self.out:
+            self.t_first = time.perf_counter()
+        self.out.append(token)
+
+waiting, running = queue.Queue(), []
+
+@torch.inference_mode()
+def prefill(s):                                  # one request at a time; real engines chunk and batch this
+    out = model(input_ids=torch.tensor([s.ids], device=dev), use_cache=True)
+    s.kv = to_layers(out.past_key_values)
+    s.append(int(out.logits[0, -1].argmax()))
+    return s
+
+@torch.inference_mode()
+def decode(batch):                               # ONE forward pass for every running sequence
+    M = max(s.cache_len for s in batch)
+    layers = []
+    for li in range(len(batch[0].kv)):           # left-pad each sequence's K/V to length M
+        ks = [F.pad(s.kv[li][0], (0, 0, M - s.cache_len, 0)) for s in batch]
+        vs = [F.pad(s.kv[li][1], (0, 0, M - s.cache_len, 0)) for s in batch]
+        layers.append((torch.cat(ks), torch.cat(vs)))
+    mask = torch.zeros(len(batch), M + 1, dtype=torch.long, device=dev)
+    for i, s in enumerate(batch):
+        mask[i, M - s.cache_len:] = 1            # real past tokens + the new one
+    out = model(input_ids=torch.tensor([[s.out[-1]] for s in batch], device=dev),
+                attention_mask=mask,
+                position_ids=torch.tensor([[s.cache_len] for s in batch], device=dev),
+                past_key_values=from_layers(layers), use_cache=True)
+    new, nxt = to_layers(out.past_key_values), out.logits[:, -1].argmax(-1).tolist()
+    for i, s in enumerate(batch):                # split back out, dropping the padding
+        L = s.cache_len + 1
+        s.kv = [(k[i:i + 1, :, -L:], v[i:i + 1, :, -L:]) for k, v in new]
+        s.append(nxt[i])
+
+def engine_loop():
+    while True:
+        if not running:                          # idle: block until a request arrives
+            running.append(prefill(waiting.get()))
+        while len(running) &lt; MAX_RUNNING and not waiting.empty():
+            running.append(prefill(waiting.get()))   # iteration-level admission
+        live = [s for s in running if not s.finished]
+        if live:
+            decode(live)
+        for s in [s for s in running if s.finished]: # retire immediately, free the slot
+            running.remove(s)
+            s.kv, s.t_done = None, time.perf_counter()
+            s.done.set()
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        s = Seq(body["prompt"], int(body.get("max_tokens", 64)))
+        waiting.put(s)
+        s.done.wait()
+        data = json.dumps({"text": tok.decode(s.out, skip_special_tokens=True),
+                           "tokens": len(s.out),
+                           "ttft_s": round(s.t_first - s.t_arrive, 3),
+                           "e2e_s": round(s.t_done - s.t_arrive, 3)}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+if __name__ == "__main__":
+    threading.Thread(target=engine_loop, daemon=True).start()
+    print("listening on http://127.0.0.1:8001")
+    ThreadingHTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="drive it"><pre><code>
+python mini_engine.py &amp;
+# 12 concurrent requests with different output caps: short ones return early, new ones join mid-flight
+for i in $(seq 1 12); do
+  curl -s localhost:8001 -d "{\"prompt\": \"Write a haiku about block tables, number $i.\", \"max_tokens\": $((16 + i * 8))}" &amp;
+done; wait
+</code></pre></div>
+
+<p>Things to try: set <code>MAX_RUNNING = 1</code> and watch TTFT climb (that's serving with no batching); time <code>decode()</code> at batch 1 vs 8 and see that the step barely grows on a GPU; then add the token-budget idea by prefilling long prompts in chunks across steps. Greedy argmax keeps it short; swap in temperature and top-p sampling from <a href="08-inference.html#sampling">Module 08</a>.</p>
+
+<h3>2. vLLM, offline and online</h3>
+<div class="code" data-lang="python" data-title="vllm_offline.py"><pre><code>
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    gpu_memory_utilization=0.90,
+    max_model_len=8192,
+    max_num_seqs=128,
+    max_num_batched_tokens=4096,     # per-step token budget
+    enable_prefix_caching=True,
+)
+system = "You are a support assistant for a database product. " * 40   # long shared prefix
+prompts = [f"{system}\nQuestion {i}: how do I rotate credentials?" for i in range(256)]
+params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=200)
+
+outputs = llm.generate(prompts, params)      # the engine schedules all 256 with continuous batching
+print(outputs[0].outputs[0].text[:200])
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="vllm serve with explicit engine knobs"><pre><code>
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 16384 \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 8192 \
+  --kv-cache-dtype fp8 \
+  --enable-prefix-caching \
+  --speculative-config '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4}'
+# structured output through the OpenAI-compatible API:
+#   response_format={"type": "json_schema", "json_schema": {"name": "ticket", "schema": {...}}}
+</code></pre></div>
+
+<h3>3. SGLang and llama-server</h3>
+<div class="code" data-lang="bash" data-title="SGLang"><pre><code>
+pip install "sglang[all]"
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct \
+  --port 30000 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 4096 \
+  --max-running-requests 256 \
+  --schedule-policy lpm
+# ablation: add --disable-radix-cache and re-run the same benchmark
+# OpenAI-compatible endpoint at http://localhost:30000/v1
+</code></pre></div>
+
+<div class="code" data-lang="bash" data-title="llama-server"><pre><code>
+# -np      parallel slots (concurrent sequences); -c is split evenly across them
+# -b/-ub   logical and physical batch sizes in tokens (the prefill chunking knobs)
+# --cache-reuse  reuse cached KV chunks across requests via KV shifting (min chunk size in tokens)
+# -md, --draft-max   draft-model speculative decoding
+llama-server -m Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  -c 32768 -np 8 -ngl 99 -fa on \
+  -b 2048 -ub 512 \
+  --cache-reuse 256 \
+  -md Qwen2.5-0.5B-Instruct-Q8_0.gguf --draft-max 8 \
+  --metrics --port 8080
+</code></pre></div>
+
+<h3>4. Lab: find the knee</h3>
+<p>Fix a workload with a shared prefix, sweep the token budget with prefix caching on and off, and explain what you see. Run it on one GPU with a 7–8B model; scale the numbers down for smaller hardware.</p>
+
+<div class="code" data-lang="bash" data-title="sweep.sh"><pre><code>
+MODEL=Qwen/Qwen2.5-7B-Instruct
+for pc in enable no-enable; do
+  for mbt in 512 1024 2048 4096 8192 16384; do
+    vllm serve $MODEL --max-model-len 8192 --gpu-memory-utilization 0.90 \
+      --max-num-batched-tokens $mbt --$pc-prefix-caching --port 8000 &gt; "server_${mbt}_${pc}.log" 2&gt;&amp;1 &amp;
+    PID=$!
+    until curl -sf localhost:8000/health &gt; /dev/null; do sleep 2; done
+    # random prompts that share a 2048-token prefix; check how your version combines prefix and input length
+    vllm bench serve --model $MODEL --port 8000 \
+      --dataset-name random --random-prefix-len 2048 --random-input-len 1024 --random-output-len 256 \
+      --num-prompts 400 --request-rate 6 --seed 0 \
+      --percentile-metrics ttft,tpot,itl --metric-percentiles 50,95,99 \
+      --save-result --result-filename "mbt${mbt}_${pc}.json"
+    kill $PID; wait $PID 2&gt;/dev/null
+  done
+done
+</code></pre></div>
+
+<div class="mle"><b>Lab exit criteria</b>
+<p>You're done when you have one table with rows <em>budget × prefix caching</em> and columns <em>output tok/s · p95 TTFT · p95 ITL · prefix hit rate · preemptions</em>, plus a short write-up that: (1) identifies the budget where throughput stops rising while p95 ITL keeps climbing (the knee), and explains it with the linear step-cost model; (2) quantifies how much prefix caching cut p95 TTFT and checks it against the cached-token formula; (3) states which setting you'd ship for a "p95 ITL ≤ 50 ms" chat SLO and which for an offline batch job, and why they differ; (4) predicts, before running it, what doubling the request rate does at your chosen setting, then measures it.</p>
+</div>
+
+<!-- ================================================================== -->
+<div class="quiz" data-id="19-main" data-title="Check yourself · Inside an inference engine">
+  <div class="q" data-answer="2"><p>A static batch of 4 requests generates 50, 100, 150, and 400 tokens. What fraction of slot-steps produce useful tokens?</p>
+    <ol><li>25%</li><li>62.5%</li><li>≈ 44%</li><li>100%, since every request finishes</li></ol>
+    <div class="explain">Useful work is 50 + 100 + 150 + 400 = 700 tokens. Paid-for work is 4 slots × 400 steps = 1,600. 700 / 1,600 ≈ 43.75%. Continuous batching would refill the three short slots as they finish.</div></div>
+  <div class="q" data-answer="0"><p>Token budget 2,048, 48 running decodes, and a 16,000-token prompt arrives. Using the linear model with a = 6 ms and b = 0.033 ms/token and ignoring attention, roughly what is its TTFT once admitted?</p>
+    <ol><li>≈ 0.6 s: 8 chunks of 2,000 tokens, each in a ≈ 74 ms step</li><li>≈ 74 ms: one step</li><li>≈ 5 s</li><li>≈ 16 s: one token per step</li></ol>
+    <div class="explain">Each step gives 2,048 − 48 = 2,000 tokens to the prompt, so ⌈16,000 / 2,000⌉ = 8 steps. A full step costs 6 + 0.033 × 2,048 ≈ 73.6 ms. 8 × 73.6 ≈ 0.59 s. The running users' ITL stays near 74 ms throughout.</div></div>
+  <div class="q" data-answer="1"><p>80 GB GPU, gpu_memory_utilization 0.9, Llama-3.1-8B in bf16 (≈ 16 GB weights, 128 KiB KV per token), about 4 GB of activations and workspace. Roughly how many 8K-token sequences can run at once?</p>
+    <ol><li>~12</li><li>~48</li><li>~97</li><li>~390</li></ol>
+    <div class="explain">KV pool ≈ 72 − 16 − 4 = 52 GB. 52 × 10⁹ / 131,072 ≈ 397K tokens. 397K / 8,192 ≈ 48. With an fp8 KV cache it would be about 97; ~12 is the answer at 32K tokens.</div></div>
+  <div class="q" data-answer="3"><p>A 1,000-token prompt is sampled with n = 4 on a block manager with block size 16 and copy-on-write. After each sample has written its first generated token's KV, how many physical blocks hold this request's data?</p>
+    <ol><li>63</li><li>252</li><li>64</li><li>66</li></ol>
+    <div class="explain">The prompt fills 62 full blocks plus one block holding 8 tokens: 63 blocks, all shared with reference count 4. Each sample's first write lands in that partly filled block. The first three writers each get a private copy and the last one writes in place, so 63 + 3 = 66. Without sharing it would be 4 × 63 = 252.</div></div>
+  <div class="q" data-answer="2"><p>Your server runs 200 concurrent requests with short contexts and is already close to compute-bound. You enable EAGLE speculation with 4 draft tokens. What is the most likely result?</p>
+    <ol><li>Roughly the 2–3× speedup seen at batch 1</li><li>No change, because speculative decoding is lossless</li><li>Throughput falls and latency may rise: each step now computes about 5× the tokens, and rejected drafts waste that compute</li><li>Requests fail because the KV cache doubles</li></ol>
+    <div class="explain">Verification is nearly free only while the step is memory-bound. At high batch with short contexts, widening every sequence to γ + 1 tokens costs real FLOPs, and every rejected draft is compute other requests could have used. Lossless refers to the output distribution, not to speed.</div></div>
+  <div class="q" data-answer="1"><p>Every request starts with the same 1,000-token system prompt, and the next token differs between requests. With vLLM-style hashed blocks of 16 tokens, how many prompt tokens does a new request get from the cache?</p>
+    <ol><li>1,000</li><li>992</li><li>1,008</li><li>0, because the prompts differ</li></ol>
+    <div class="explain">Only full blocks are hashed and shared. 1,000 / 16 = 62.5, so 62 full blocks = 992 tokens match; the block containing tokens 992–1,007 mixes shared and unique tokens and is a miss. A radix tree would match all 1,000.</div></div>
+  <div class="q" data-answer="0"><p>Rank-16 LoRA on all seven projections of Llama-3-8B is about 42M parameters. In bf16, roughly how many such adapters fit in a 4 GB GPU pool?</p>
+    <ol><li>~47</li><li>~5</li><li>~470</li><li>~4,700</li></ol>
+    <div class="explain">42M × 2 bytes ≈ 84 MB per adapter. 4 × 10⁹ / 84 × 10⁶ ≈ 47. That's why multi-LoRA engines can keep dozens of adapters on the GPU and hundreds more in CPU memory.</div></div>
+</div>
+
+</main>
+</div>
+
+<script src="../assets/course.js"></script>
+<script>
+(function () {
+  const { el, svg, slider, select, seg, stats, plot, widget, fmtNum, rng, palette, clamp } = C;
+  const KiB = 1024, MiB = 1024 ** 2, GiB = 1024 ** 3;
+  const fmtB = b => b >= GiB ? fmtNum(b / GiB, b / GiB < 10 ? 2 : 1) + " GiB" : b >= MiB ? fmtNum(b / MiB, b / MiB < 10 ? 1 : 0) + " MiB" : fmtNum(b / KiB, 0) + " KiB";
+  const fmtGB = b => fmtNum(b / 1e9, Math.abs(b / 1e9) < 10 ? 1 : 0) + " GB";
+  const fmtMs = ms => !isFinite(ms) ? "never" : ms >= 1000 ? fmtNum(ms / 1000, ms < 10000 ? 2 : 1) + " s" : fmtNum(ms, ms < 10 ? 1 : 0) + " ms";
+  const fmtTok = t => t >= 1048576 ? fmtNum(t / 1048576, 0) + "M" : t >= 1024 ? fmtNum(t / 1024, t % 1024 ? 1 : 0) + "K" : String(Math.round(t));
+  const clear = s => { while (s.firstChild) s.removeChild(s.firstChild); };
+  const txt = (p, x, y, t, o) => p.appendChild(svg("text", Object.assign({ x, y, "font-size": 12, fill: palette.ink, text: t }, o || {})));
+  const rect = (p, x, y, w, h, o) => p.appendChild(svg("rect", Object.assign({ x, y, width: Math.max(0, w), height: Math.max(0, h) }, o || {})));
+  const line = (p, x1, y1, x2, y2, o) => p.appendChild(svg("line", Object.assign({ x1, y1, x2, y2, stroke: palette.ink, "stroke-width": 1 }, o || {})));
+  const path = (p, d, o) => p.appendChild(svg("path", Object.assign({ d, fill: "none", stroke: palette.ink, "stroke-width": 1.3 }, o || {})));
+  const arrowDef = (id, color) => { const d = svg("defs"); d.appendChild(svg("marker", { id, viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6.5, markerHeight: 6.5, orient: "auto-start-reverse" }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: color }))); return d; };
+  const niceStep = raw => { const m = 10 ** Math.floor(Math.log10(raw)), r = raw / m; return (r < 1.5 ? 1 : r < 3 ? 2 : r < 7 ? 5 : 10) * m; };
+  const TINT = { blue: ["rgba(47,93,138,.10)", "rgba(47,93,138,.55)"], green: ["rgba(26,122,82,.10)", "rgba(26,122,82,.55)"], gold: ["rgba(154,123,34,.13)", "rgba(154,123,34,.6)"], brick: ["rgba(176,67,46,.10)", "rgba(176,67,46,.6)"], plum: ["rgba(122,63,110,.10)", "rgba(122,63,110,.55)"], teal: ["rgba(43,122,120,.14)", "rgba(43,122,120,.6)"], ink: ["#fff", "rgba(28,27,25,.3)"] };
+  const segCtl = (parent, label, opts, val, cb) => { const c = el("div", { class: "ctl" }, el("label", null, el("span", { text: label }))); const sg = seg(c, { options: opts, value: val, onChange: cb }); parent.appendChild(c); return sg; };
+
+  // Illustrative step-cost model: ~8B bf16 model on one H100-class GPU (ms).
+  const COST = { a: 6.0, b: 0.033, c: 0.044e-3, e: 1.05e-6 };
+  const stepTime = (nTok, kvRead, prefAttn) => COST.a + COST.b * nTok + COST.c * kvRead + COST.e * (prefAttn || 0);
+  const MODELS = [
+    { v: "l8", l: "Llama-3.1-8B (GQA, 8 KV heads)", P: 8.03e9, L: 32, kv: 8, hd: 128, d: 4096 },
+    { v: "q14", l: "Qwen2.5-14B (GQA)", P: 14.7e9, L: 48, kv: 8, hd: 128, d: 5120 },
+    { v: "q32", l: "Qwen2.5-32B (GQA)", P: 32.8e9, L: 64, kv: 8, hd: 128, d: 5120 },
+    { v: "l70", l: "Llama-3.1-70B (GQA)", P: 70.6e9, L: 80, kv: 8, hd: 128, d: 8192 },
+    { v: "l2", l: "Llama-2-7B (full MHA, 32 KV heads)", P: 6.74e9, L: 32, kv: 32, hd: 128, d: 4096 }
+  ];
+  const kvPerTok = (m, bytes) => 2 * m.L * m.kv * m.hd * bytes;
+  const LENS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+
+  /* ---------------------------------------------------------- Fig: anatomy */
+  (function () {
+    const s = document.getElementById("fig-anatomy");
+    s.appendChild(arrowDef("an-a", palette.ink));
+    const lane = (x, y, w, h, title, sub) => {
+      rect(s, x, y, w, h, { rx: 14, fill: "rgba(239,237,230,.5)", stroke: "rgba(28,27,25,.3)", "stroke-dasharray": "5 4" });
+      txt(s, x + 12, y + 20, title, { "font-size": 13, "font-weight": 700 });
+      txt(s, x + 12, y + 35, sub, { "font-size": 10.5, fill: palette.muted, class: "mono" });
+    };
+    const box = (x, y, w, h, title, lines, tone) => {
+      const tn = TINT[tone || "ink"];
+      rect(s, x, y, w, h, { rx: 8, fill: tn[0], stroke: tn[1], "stroke-width": 1.2 });
+      txt(s, x + 9, y + 17, title, { "font-size": 12.3, "font-weight": 600 });
+      (lines || []).forEach((l, i) => txt(s, x + 9, y + 32 + i * 13, l, { "font-size": 10.5, fill: palette.muted }));
+    };
+    const arr = (d, extra) => path(s, d, Object.assign({ "marker-end": "url(#an-a)" }, extra || {}));
+    const lab = (x, y, t, anchor) => txt(s, x, y, t, { "font-size": 9.8, class: "mono", fill: palette.muted, "text-anchor": anchor || "middle" });
+
+    lane(100, 12, 238, 476, "API server process", "HTTP \u00b7 templates \u00b7 tokens");
+    lane(372, 12, 262, 476, "Engine core process", "busy loop: schedule \u2192 run \u2192 update");
+    lane(668, 12, 244, 476, "GPU worker(s)", "one per GPU (tensor-parallel rank)");
+    box(8, 196, 80, 64, "Client", ["HTTP request", "SSE stream"], "ink");
+
+    box(112, 56, 214, 60, "HTTP server", ["OpenAI-compatible endpoints", "validation, auth, streaming"], "blue");
+    box(112, 146, 214, 60, "Chat template + tokenizer", ["messages \u2192 prompt \u2192 token ids", "image / audio preprocessing"], "blue");
+    box(112, 330, 214, 74, "Detokenizer + streamer", ["ids \u2192 text, incrementally", "stop strings, logprobs", "SSE chunks to the client"], "blue");
+
+    box(384, 56, 238, 46, "Request queue", ["waiting: FCFS or priority"], "gold");
+    box(384, 124, 238, 74, "Scheduler", ["token budget per step", "running set and admission", "preemption on memory pressure"], "gold");
+    box(384, 222, 238, 74, "KV cache manager", ["block pool + free queue", "block table per request", "prefix hash \u2192 block"], "green");
+    box(384, 318, 238, 46, "Grammar matcher", ["JSON schema / regex \u2192 token bitmask"], "plum");
+    box(384, 388, 238, 60, "Update", ["append tokens, stop checks", "free finished requests' blocks"], "gold");
+
+    box(680, 56, 220, 74, "Model runner", ["flatten ids, positions", "slot mapping, block tables", "replay a captured CUDA graph"], "teal");
+    box(680, 152, 220, 74, "Forward pass", ["embed \u2192 L layers \u2192 norm \u2192 head", "attention backend reads and", "writes paged KV"], "teal");
+    box(680, 248, 220, 74, "Sampler", ["grammar masks, penalties", "temperature, top-k / top-p", "speculative verification"], "teal");
+    // GPU memory panel
+    rect(s, 680, 344, 220, 130, { rx: 8, fill: "#fff", stroke: "rgba(28,27,25,.3)", "stroke-width": 1.2 });
+    txt(s, 689, 361, "GPU memory (u \u00d7 total)", { "font-size": 12.3, "font-weight": 600 });
+    rect(s, 690, 372, 72, 24, { fill: "rgba(47,93,138,.55)", rx: 3 });
+    rect(s, 763, 372, 18, 24, { fill: "rgba(154,123,34,.55)", rx: 3 });
+    rect(s, 782, 372, 100, 24, { fill: "rgba(26,122,82,.18)", rx: 3 });
+    rect(s, 883, 372, 8, 24, { fill: "rgba(118,115,107,.25)", rx: 2 });
+    txt(s, 726, 410, "weights", { "font-size": 10, "text-anchor": "middle", fill: palette.muted });
+    txt(s, 772, 410, "act.", { "font-size": 10, "text-anchor": "middle", fill: palette.muted });
+    txt(s, 832, 410, "KV block pool", { "font-size": 10, "text-anchor": "middle", fill: palette.muted });
+    const own = ["#1a7a52", "#2f5d8a", "#9a7b22", "#7a3f6e", null];
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 16; c++) {
+      const k = (r * 16 + c) * 7 % 11, col = own[k % 5];
+      rect(s, 690 + c * 12.5, 420 + r * 15, 10, 12, { rx: 2, fill: col || "#fff", opacity: col ? 0.7 : 1, stroke: "rgba(28,27,25,.2)", "stroke-width": 0.6 });
+    }
+
+    arr("M88,214 C100,214 100,86 110,86");
+    lab(56, 186, "POST");
+    arr("M219,116 L219,144");
+    arr("M326,176 C352,176 356,79 382,79");
+    lab(355, 64, "IPC");
+    arr("M503,102 L503,122");
+    arr("M470,198 L470,220");
+    arr("M536,220 L536,200");
+    lab(462, 213, "allocate", "end");
+    lab(544, 213, "free / prefix hit", "start");
+    arr("M622,150 C648,150 652,93 678,93");
+    lab(651, 128, "plan");
+    arr("M790,130 L790,150");
+    arr("M790,226 L790,246");
+    lab(797, 240, "logits (last token per request)", "start");
+    arr("M622,341 C650,341 652,272 678,272");
+    lab(651, 316, "mask");
+    arr("M680,306 C648,306 652,418 624,418");
+    lab(651, 400, "ids");
+    arr("M384,418 C360,418 356,367 328,367");
+    lab(355, 432, "IPC");
+    arr("M112,392 C58,392 48,330 48,262");
+    lab(56, 300, "stream");
+    path(s, "M906,196 L906,352", { "stroke-dasharray": "4 3", "marker-end": "url(#an-a)", "marker-start": "url(#an-a)" });
+    txt(s, 898, 300, "KV reads / writes", { "font-size": 9.5, class: "mono", fill: palette.muted, "text-anchor": "middle", transform: "rotate(-90 898 300)" });
+  })();
+
+  /* ---------------------------------------------------------- Fig: one step's inputs */
+  (function () {
+    const s = document.getElementById("fig-step");
+    s.appendChild(arrowDef("st-a", palette.ink));
+    const COL = { A: palette.blue, B: palette.plum, C: palette.gold };
+    const FILL = { A: "rgba(47,93,138,.14)", B: "rgba(122,63,110,.14)", C: "rgba(154,123,34,.16)" };
+    const pill = (x, who, t) => { rect(s, x, 12, 210, 26, { rx: 13, fill: FILL[who], stroke: COL[who] }); txt(s, x + 105, 29, t, { "font-size": 11.2, "text-anchor": "middle" }); };
+    pill(160, "A", "A \u00b7 decode \u00b7 next pos 812");
+    pill(380, "B", "B \u00b7 decode \u00b7 next pos 40");
+    pill(600, "C", "C \u00b7 prefill chunk \u00b7 tokens 0\u20135 of 900");
+    const owner = ["A", "B", "C", "C", "C", "C", "C", "C"];
+    const rows = [
+      ["input_ids", ["tA", "tB", "c0", "c1", "c2", "c3", "c4", "c5"]],
+      ["positions", [812, 40, 0, 1, 2, 3, 4, 5]],
+      ["slot_mapping", [124, 56, 176, 177, 178, 179, 180, 181]]
+    ];
+    const x0 = 160, cw = 56;
+    rows.forEach(([name, vals], r) => {
+      const y = 62 + r * 40;
+      txt(s, x0 - 10, y + 18, name, { "font-size": 11.5, class: "mono", "text-anchor": "end" });
+      vals.forEach((v, i) => {
+        rect(s, x0 + i * cw + 1, y, cw - 2, 28, { rx: 4, fill: FILL[owner[i]], stroke: COL[owner[i]], "stroke-width": 1 });
+        txt(s, x0 + i * cw + cw / 2, y + 18, String(v), { "font-size": 11.5, class: "mono", "text-anchor": "middle" });
+      });
+    });
+    txt(s, x0, 200, "query_start_loc = [0, 1, 2, 8]     seq_lens = [813, 41, 6]     N = 8 tokens, no padding", { "font-size": 11.2, class: "mono", fill: palette.ink });
+    // block tables
+    const bx = 640;
+    txt(s, bx, 70, "block tables (B_s = 16)", { "font-size": 11.5, "font-weight": 600 });
+    [["A", "[31, 4, 22, \u2026, 7]   entry 50 = 7"], ["B", "[12, 9, 3]"], ["C", "[11]"]].forEach(([w, t], i) => {
+      rect(s, bx, 80 + i * 26, 14, 14, { rx: 3, fill: FILL[w], stroke: COL[w] });
+      txt(s, bx + 22, 92 + i * 26, w + ": " + t, { "font-size": 11, class: "mono" });
+    });
+    txt(s, bx, 172, "slot = BT[p // 16] \u00b7 16 + p % 16", { "font-size": 11, class: "mono", fill: palette.muted });
+    txt(s, bx, 188, "A: 7\u00b716 + 812 % 16 = 124", { "font-size": 11, class: "mono", fill: palette.muted });
+    // forward and heads
+    rect(s, x0, 222, 8 * cw, 34, { rx: 6, fill: "rgba(43,122,120,.12)", stroke: "rgba(43,122,120,.6)" });
+    txt(s, x0 + 4 * cw, 244, "forward pass over all 8 rows (attention uses query_start_loc + block tables)", { "font-size": 11.3, "text-anchor": "middle" });
+    [[0, "A"], [1, "B"], [7, "C"]].forEach(([i, w], k) => {
+      const cx = x0 + i * cw + cw / 2;
+      path(s, `M${cx},256 L${cx},290`, { "marker-end": "url(#st-a)" });
+      rect(s, cx - 34, 292, 68, 26, { rx: 5, fill: FILL[w], stroke: COL[w] });
+      txt(s, cx, 309, "logits " + w, { "font-size": 11, class: "mono", "text-anchor": "middle" });
+      path(s, `M${cx},318 L${cx},344`, { "marker-end": "url(#st-a)" });
+      const out = w === "C" ? "discarded" : "next token";
+      txt(s, cx, 360, out, { "font-size": 11, "text-anchor": "middle", fill: w === "C" ? palette.brick : palette.green, "font-weight": 600 });
+    });
+    txt(s, x0 + 4.5 * cw, 309, "logits_idx = [0, 1, 7]: LM head on 3 rows, not 8", { "font-size": 11, class: "mono", fill: palette.muted, "text-anchor": "middle" });
+    txt(s, x0 + 8 * cw + 2, 360, "\u2190 C's prompt isn't finished, so its sample is dropped", { "font-size": 11, fill: palette.muted });
+    txt(s, x0 + 8 * cw + 2, 300, "sampler runs on these rows only", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: block manager */
+  (function () {
+    const s = document.getElementById("fig-blocks");
+    s.appendChild(arrowDef("bk-a", palette.ink));
+    const owner = {}; const fillLvl = {};
+    [5, 9, 14].forEach(b => owner[b] = "shared");
+    owner[2] = "S1"; owner[21] = "S2"; [7, 11, 18].forEach(b => owner[b] = "Q"); [3, 25, 26].forEach(b => owner[b] = "cached");
+    fillLvl[2] = 0.56; fillLvl[21] = 0.62; fillLvl[18] = 0.31;
+    const C_ = { shared: palette.teal, S1: palette.green, S2: palette.blue, Q: palette.gold, cached: palette.green };
+    // tables
+    txt(s, 20, 30, "block tables", { "font-size": 12, "font-weight": 600 });
+    const tables = [["S1", [5, 9, 14, 2]], ["S2", [5, 9, 14, 21]], ["Q", [7, 11, 18]]];
+    tables.forEach(([name, ids], r) => {
+      const y = 48 + r * 52;
+      txt(s, 20, y + 19, name, { "font-size": 12, class: "mono", "font-weight": 600 });
+      ids.forEach((b, i) => {
+        const own = owner[b];
+        rect(s, 52 + i * 40, y, 36, 28, { rx: 4, fill: own === "shared" ? "rgba(43,122,120,.16)" : own === "S1" ? "rgba(26,122,82,.16)" : own === "S2" ? "rgba(47,93,138,.16)" : "rgba(154,123,34,.18)", stroke: C_[own] });
+        txt(s, 70 + i * 40, y + 18, String(b), { "font-size": 11.5, class: "mono", "text-anchor": "middle" });
+      });
+    });
+    txt(s, 20, 222, "logical block i \u2192 physical id", { "font-size": 10.5, fill: palette.muted });
+    // pool
+    const x0 = 290, y0 = 36, cw = 46, ch = 42;
+    txt(s, x0, 26, "physical block pool (32 blocks)", { "font-size": 12, "font-weight": 600 });
+    const pos = b => [x0 + (b % 8) * cw, y0 + Math.floor(b / 8) * ch];
+    for (let b = 0; b < 32; b++) {
+      const [x, y] = pos(b), own = owner[b];
+      const cached = own === "cached";
+      rect(s, x + 2, y + 2, cw - 4, ch - 4, { rx: 5, fill: "#fff", stroke: own ? C_[own] : "rgba(28,27,25,.22)", "stroke-width": own ? 1.4 : 0.8, "stroke-dasharray": cached ? "3 2" : null });
+      if (own) {
+        const lv = fillLvl[b] || 1, hgt = (ch - 6) * lv;
+        rect(s, x + 3, y + ch - 3 - hgt, cw - 6, hgt, { rx: 4, fill: C_[own], opacity: cached ? 0.16 : 0.32 });
+      }
+      txt(s, x + 7, y + 15, String(b), { "font-size": 10, class: "mono", fill: palette.muted });
+      if (own === "shared") txt(s, x + cw / 2, y + 31, "ref 2", { "font-size": 10, class: "mono", "text-anchor": "middle", "font-weight": 600 });
+      if (cached) txt(s, x + cw / 2, y + 31, "cached", { "font-size": 9, class: "mono", "text-anchor": "middle", fill: palette.green });
+    }
+    const [ax, ay] = pos(2), [bx, by] = pos(21);
+    path(s, `M${ax + cw / 2},${ay + ch - 2} C${ax + cw / 2},${by + 10} ${bx - 30},${by + ch / 2} ${bx + 2},${by + ch / 2}`, { stroke: palette.brick, "stroke-width": 1.5, "marker-end": "url(#bk-a)" });
+    txt(s, ax + 4, by + ch + 18, "copy-on-write: S2 wrote into the shared partial block", { "font-size": 10.5, fill: palette.brick });
+    // free queue
+    const fx = 690;
+    txt(s, fx, 26, "free block queue", { "font-size": 12, "font-weight": 600 });
+    txt(s, fx, 42, "head (reused first)", { "font-size": 10, fill: palette.muted, class: "mono" });
+    const q = [["0", 0], ["1", 0], ["4", 0], ["6", 0], ["8", 0], ["\u2026 never used", 0], ["3 \u00b7 cached", 1], ["25 \u00b7 cached", 1], ["26 \u00b7 cached", 1]];
+    q.forEach(([t, c], i) => {
+      rect(s, fx, 50 + i * 21, 150, 18, { rx: 4, fill: c ? "rgba(26,122,82,.10)" : "#fff", stroke: c ? "rgba(26,122,82,.5)" : "rgba(28,27,25,.22)", "stroke-dasharray": c ? "3 2" : null });
+      txt(s, fx + 8, 63 + i * 21, t, { "font-size": 10.5, class: "mono" });
+    });
+    txt(s, fx, 50 + q.length * 21 + 12, "tail (freed most recently)", { "font-size": 10, fill: palette.muted, class: "mono" });
+    // legend
+    const ly = 300;
+    [["shared prompt (ref 2)", palette.teal], ["S1 only", palette.green], ["S2 only (the copy)", palette.blue], ["request Q", palette.gold], ["cached, ref 0", "rgba(26,122,82,.35)"]].forEach(([t, c], i) => {
+      rect(s, 20 + i * 172, ly - 10, 12, 12, { rx: 2, fill: c, opacity: 0.6 });
+      txt(s, 38 + i * 172, ly, t, { "font-size": 11, fill: palette.muted });
+    });
+    txt(s, 20, 330, "Fill height = how full the block is. Only last blocks (2, 21, 18) are partial: that's the internal fragmentation.", { "font-size": 11, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: radix tree */
+  (function () {
+    const s = document.getElementById("fig-radix");
+    s.appendChild(arrowDef("rx-a", palette.muted));
+    s.appendChild(arrowDef("rx-g", palette.green));
+    const N = {
+      root: [16, 140, 64, "root", ""],
+      sys: [118, 70, 160, "System prompt", "1,200 tok \u00b7 ref 1 \u00b7 t=96"],
+      tools: [318, 70, 160, "Tools v2", "800 \u00b7 ref 1 \u00b7 t=96"],
+      a1: [518, 18, 160, "User A \u00b7 turn 1", "+340 \u00b7 ref 1 \u00b7 t=95"],
+      a2: [718, 18, 160, "User A \u00b7 turn 2", "+410 \u00b7 ref 1 \u00b7 t=95"],
+      b1: [518, 118, 160, "User B \u00b7 turn 1", "+290 \u00b7 ref 0\u21921 \u00b7 t=80"],
+      nw: [718, 118, 160, "B's new message", "+120 \u00b7 prefill only this"],
+      fs: [118, 220, 160, "Few-shot header", "600 \u00b7 ref 0 \u00b7 t=40"],
+      q17: [318, 196, 160, "Q17", "+40 \u00b7 ref 0 \u00b7 t=12"],
+      q18: [318, 258, 160, "Q18", "+35 \u00b7 ref 0 \u00b7 t=15"]
+    };
+    const H = 42, green = new Set(["root-sys", "sys-tools", "tools-b1", "b1-nw"]);
+    const edges = [["root", "sys"], ["sys", "tools"], ["tools", "a1"], ["a1", "a2"], ["tools", "b1"], ["b1", "nw"], ["root", "fs"], ["fs", "q17"], ["fs", "q18"]];
+    edges.forEach(([a, b]) => {
+      const A = N[a], B = N[b], g = green.has(a + "-" + b);
+      const x1 = A[0] + A[2], y1 = A[1] + H / 2, x2 = B[0], y2 = B[1] + H / 2;
+      path(s, `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2 - 3},${y2}`, { stroke: g ? palette.green : palette.muted, "stroke-width": g ? 2.4 : 1.2, "marker-end": g ? "url(#rx-g)" : "url(#rx-a)" });
+    });
+    Object.entries(N).forEach(([k, [x, y, w, t1, t2]]) => {
+      const evict = k === "q17" || k === "q18", isNew = k === "nw", onPath = ["root", "sys", "tools", "b1"].includes(k);
+      rect(s, x, y, w, H, { rx: 8, fill: isNew ? "rgba(26,122,82,.06)" : onPath ? "rgba(26,122,82,.12)" : "#fff", stroke: evict ? palette.brick : isNew || onPath ? palette.green : "rgba(28,27,25,.3)", "stroke-width": evict ? 1.8 : 1.2, "stroke-dasharray": isNew ? "4 3" : null });
+      txt(s, x + 9, y + (t2 ? 17 : 26), t1, { "font-size": 12, "font-weight": 600 });
+      if (t2) txt(s, x + 9, y + 33, t2, { "font-size": 10.3, class: "mono", fill: palette.muted });
+    });
+    txt(s, 486, 228, "\u2190 evict 1st (LRU leaf, ref 0)", { "font-size": 10.5, fill: palette.brick });
+    txt(s, 486, 290, "\u2190 evict 2nd", { "font-size": 10.5, fill: palette.brick });
+    txt(s, 560, 200, "incoming: system + tools + B turn 1 + new message", { "font-size": 11, fill: palette.green, "font-weight": 600 });
+    txt(s, 560, 217, "matched 1,200 + 800 + 290 = 2,290 tokens", { "font-size": 11, class: "mono", fill: palette.green });
+    txt(s, 560, 234, "prefilled: 120 tokens", { "font-size": 11, class: "mono", fill: palette.green });
+    txt(s, 560, 272, "The system node is never a leaf while users hang", { "font-size": 10.5, fill: palette.muted });
+    txt(s, 560, 287, "off it, so the shared trunk outlives one-off branches.", { "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: tree attention */
+  (function () {
+    const s = document.getElementById("fig-tree");
+    s.appendChild(arrowDef("tr-a", palette.muted));
+    s.appendChild(arrowDef("tr-g", palette.green));
+    const nodes = [null, ["sat", 170, 90, 0], ["is", 170, 210, 0], ["on", 290, 50, 1], ["down", 290, 130, 1], ["not", 290, 200, 2], ["very", 290, 262, 2], ["the", 410, 50, 3]];
+    const acc = new Set([1, 3, 7]);
+    rect(s, 10, 132, 84, 36, { rx: 8, fill: "rgba(239,237,230,.9)", stroke: "rgba(28,27,25,.3)" });
+    txt(s, 52, 155, "\u2026 the cat", { "font-size": 12, "text-anchor": "middle", class: "mono" });
+    const P = i => i === 0 ? [94, 150] : [nodes[i][1], nodes[i][2]];
+    for (let i = 1; i < nodes.length; i++) {
+      const par = nodes[i][3], [x1, y1] = par === 0 ? [94, 150] : [nodes[par][1] + 30, nodes[par][2]], x2 = nodes[i][1] - 30, y2 = nodes[i][2];
+      const g = acc.has(i) && (par === 0 || acc.has(par));
+      path(s, `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2 - 2},${y2}`, { stroke: g ? palette.green : palette.muted, "stroke-width": g ? 2.2 : 1.1, "marker-end": g ? "url(#tr-g)" : "url(#tr-a)" });
+    }
+    for (let i = 1; i < nodes.length; i++) {
+      const [t, x, y] = nodes[i], g = acc.has(i);
+      rect(s, x - 30, y - 15, 60, 30, { rx: 7, fill: g ? "rgba(26,122,82,.14)" : "#fff", stroke: g ? palette.green : "rgba(28,27,25,.3)" });
+      txt(s, x, y + 4, t, { "font-size": 12, "text-anchor": "middle", class: "mono" });
+      txt(s, x - 26, y - 19, String(i), { "font-size": 9.5, class: "mono", fill: palette.muted });
+    }
+    rect(s, 470, 35, 60, 30, { rx: 7, fill: "#fff", stroke: palette.green, "stroke-dasharray": "4 3" });
+    txt(s, 500, 54, "mat", { "font-size": 12, "text-anchor": "middle", class: "mono" });
+    path(s, "M440,50 L468,50", { stroke: palette.green, "stroke-dasharray": "3 2", "marker-end": "url(#tr-g)" });
+    txt(s, 500, 84, "bonus token", { "font-size": 10, "text-anchor": "middle", fill: palette.green });
+    txt(s, 500, 97, "from target", { "font-size": 10, "text-anchor": "middle", fill: palette.green });
+    // mask
+    const anc = { 1: [1], 2: [2], 3: [1, 3], 4: [1, 4], 5: [2, 5], 6: [2, 6], 7: [1, 3, 7] };
+    const x0 = 640, y0 = 56, c = 29;
+    txt(s, x0 - 30, 22, "tree attention mask (row attends to column)", { "font-size": 11.5, "font-weight": 600 });
+    txt(s, x0 - c / 2 - 2, y0 - 8, "ctx", { "font-size": 10, class: "mono", "text-anchor": "middle", fill: palette.muted });
+    for (let j = 1; j <= 7; j++) txt(s, x0 + (j - 1) * c + c / 2 + 14, y0 - 8, String(j), { "font-size": 10, class: "mono", "text-anchor": "middle", fill: palette.muted });
+    for (let i = 1; i <= 7; i++) {
+      const y = y0 + (i - 1) * c;
+      txt(s, x0 - c - 8, y + c / 2 + 4, i + " " + nodes[i][0], { "font-size": 10.5, class: "mono", "text-anchor": "end" });
+      rect(s, x0 - c - 2, y + 1, c - 2, c - 2, { rx: 3, fill: "rgba(43,122,120,.35)" });
+      for (let j = 1; j <= 7; j++) {
+        const on = anc[i].includes(j);
+        rect(s, x0 + 14 + (j - 1) * c + 1, y + 1, c - 2, c - 2, { rx: 3, fill: on ? (acc.has(i) && acc.has(j) ? "rgba(26,122,82,.65)" : "rgba(26,122,82,.3)") : "#f1efe8" });
+      }
+    }
+    txt(s, x0 - c - 2, y0 + 7 * c + 20, "Every draft sees the context; node 7 (\"the\") also sees 3 and 1, its ancestors.", { "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: grammar mask overlap */
+  (function () {
+    const s = document.getElementById("fig-overlap");
+    const x0 = 150, k = 11.5;
+    const X = ms => x0 + ms * k;
+    const blk = (y, a, b, label, fill, stroke) => { rect(s, X(a), y, (b - a) * k, 22, { rx: 4, fill, stroke, "stroke-width": 1 }); if ((b - a) * k > 34) txt(s, (X(a) + X(b)) / 2, y + 15, label, { "font-size": 10.5, "text-anchor": "middle", class: "mono" }); };
+    const FW = ["rgba(43,122,120,.18)", "rgba(43,122,120,.6)"], SM = ["rgba(26,122,82,.35)", "rgba(26,122,82,.7)"], MK = ["rgba(122,63,110,.18)", "rgba(122,63,110,.6)"], ID = ["rgba(176,67,46,.10)", "rgba(176,67,46,.5)"];
+    const group = (y, title, gpu, cpu, total) => {
+      txt(s, 10, y + 4, title, { "font-size": 12.5, "font-weight": 700 });
+      txt(s, x0 - 10, y + 30, "GPU", { "font-size": 11, class: "mono", "text-anchor": "end" });
+      txt(s, x0 - 10, y + 60, "CPU", { "font-size": 11, class: "mono", "text-anchor": "end" });
+      gpu.forEach(([a, b, l, c]) => blk(y + 15, a, b, l, c[0], c[1]));
+      cpu.forEach(([a, b, l, c]) => blk(y + 45, a, b, l, c[0], c[1]));
+      txt(s, X(total) + 8, y + 30, total + " ms for 2 steps", { "font-size": 11, class: "mono", fill: palette.muted });
+    };
+    group(14, "Serialized", [[0, 20, "forward t", FW], [20, 26, "idle", ID], [26, 28, "", SM], [28, 48, "forward t+1", FW], [48, 54, "idle", ID], [54, 56, "", SM]], [[20, 26, "mask t", MK], [48, 54, "mask t+1", MK]], 56);
+    group(110, "Overlapped", [[0, 20, "forward t", FW], [20, 22, "", SM], [22, 42, "forward t+1", FW], [42, 44, "", SM]], [[2, 8, "mask t", MK], [24, 30, "mask t+1", MK]], 44);
+    txt(s, x0, 206, "Illustrative: forward 20 ms, mask 6 ms, sample 2 ms (green). Mask t needs only the token sampled at t\u22121.", { "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Fig: SGMV multi-LoRA */
+  (function () {
+    const s = document.getElementById("fig-sgmv");
+    s.appendChild(arrowDef("sg-a", palette.ink));
+    const ad = ["A", "A", "A", "B", "C", "C", "C", null];
+    const AC = { A: palette.green, B: palette.blue, C: palette.plum };
+    const AF = { A: "rgba(26,122,82,.22)", B: "rgba(47,93,138,.22)", C: "rgba(122,63,110,.22)" };
+    const y0 = 52, rh = 24;
+    txt(s, 30, 36, "batch rows x (sorted by adapter)", { "font-size": 11.5, "font-weight": 600 });
+    ad.forEach((a, i) => {
+      rect(s, 50, y0 + i * rh + 1, 110, rh - 2, { rx: 3, fill: a ? AF[a] : "#f1efe8", stroke: a ? AC[a] : "rgba(28,27,25,.25)" });
+      txt(s, 40, y0 + i * rh + 16, a || "\u2013", { "font-size": 11, class: "mono", "text-anchor": "end", fill: a ? AC[a] : palette.muted });
+    });
+    // base GEMM
+    rect(s, 230, 44, 210, 74, { rx: 8, fill: "rgba(43,122,120,.12)", stroke: "rgba(43,122,120,.6)" });
+    txt(s, 335, 72, "x \u00b7 W   (base, shared)", { "font-size": 12, "text-anchor": "middle", "font-weight": 600 });
+    txt(s, 335, 90, "one large GEMM over all 8 rows", { "font-size": 10.5, "text-anchor": "middle", fill: palette.muted });
+    txt(s, 335, 104, "compute-efficient", { "font-size": 10.5, "text-anchor": "middle", fill: palette.muted });
+    // SGMV
+    txt(s, 230, 156, "SGMV: one kernel, per-segment weights", { "font-size": 11.5, "font-weight": 600 });
+    [["A", 0, 3], ["B", 3, 1], ["C", 4, 3]].forEach(([a, st, n], k) => {
+      const y = 168 + st * 13;
+      rect(s, 230, y, 70, n * 13 - 2, { rx: 3, fill: AF[a], stroke: AC[a] });
+      txt(s, 265, y + n * 6.5 + 3, "\u00b7 A_" + a, { "font-size": 10.5, class: "mono", "text-anchor": "middle" });
+      rect(s, 330, y, 24, n * 13 - 2, { rx: 3, fill: AF[a], stroke: AC[a] });
+      rect(s, 380, y, 70, n * 13 - 2, { rx: 3, fill: AF[a], stroke: AC[a] });
+      txt(s, 415, y + n * 6.5 + 3, "\u00b7 B_" + a, { "font-size": 10.5, class: "mono", "text-anchor": "middle" });
+    });
+    txt(s, 265, 284, "shrink d\u2192r", { "font-size": 10.5, "text-anchor": "middle", fill: palette.muted });
+    txt(s, 342, 284, "r", { "font-size": 10.5, "text-anchor": "middle", fill: palette.muted });
+    txt(s, 415, 284, "expand r\u2192d", { "font-size": 10.5, "text-anchor": "middle", fill: palette.muted });
+    path(s, "M300,200 L328,200", { "marker-end": "url(#sg-a)" });
+    path(s, "M354,200 L378,200", { "marker-end": "url(#sg-a)" });
+    path(s, "M160,100 L228,84", { "marker-end": "url(#sg-a)" });
+    path(s, "M160,170 L228,200", { "marker-end": "url(#sg-a)" });
+    // sum
+    s.appendChild(svg("circle", { cx: 510, cy: 150, r: 16, fill: "#fff", stroke: palette.ink }));
+    txt(s, 510, 156, "+", { "font-size": 18, "text-anchor": "middle" });
+    path(s, "M440,84 C480,84 500,110 506,132", { "marker-end": "url(#sg-a)" });
+    path(s, "M450,200 C485,200 500,186 506,168", { "marker-end": "url(#sg-a)" });
+    path(s, "M526,150 L560,150", { "marker-end": "url(#sg-a)" });
+    txt(s, 566, 146, "y = xW + (x A_i) B_i", { "font-size": 11.5, class: "mono" });
+    txt(s, 566, 162, "row without adapter: y = xW", { "font-size": 10.5, fill: palette.muted });
+    // pool
+    const px = 700;
+    txt(s, px, 36, "adapter memory", { "font-size": 11.5, "font-weight": 600 });
+    rect(s, px, 46, 180, 108, { rx: 8, fill: "#fff", stroke: "rgba(28,27,25,.3)" });
+    txt(s, px + 10, 64, "GPU pool (--max-loras)", { "font-size": 10.5, class: "mono", fill: palette.muted });
+    ["A", "B", "C"].forEach((a, i) => { rect(s, px + 12 + i * 56, 76, 48, 64, { rx: 4, fill: AF[a], stroke: AC[a] }); txt(s, px + 36 + i * 56, 112, a, { "font-size": 13, "text-anchor": "middle", class: "mono" }); });
+    rect(s, px, 172, 180, 76, { rx: 8, fill: "#f6f5f0", stroke: "rgba(28,27,25,.2)", "stroke-dasharray": "4 3" });
+    txt(s, px + 10, 190, "CPU memory (--max-cpu-loras)", { "font-size": 10.5, class: "mono", fill: palette.muted });
+    txt(s, px + 10, 214, "D, E, F, \u2026 loaded to the GPU", { "font-size": 10.5, fill: palette.muted });
+    txt(s, px + 10, 230, "pool on demand, LRU swapped", { "font-size": 10.5, fill: palette.muted });
+  })();
+
+  /* ---------------------------------------------------------- Widget: static vs continuous batching */
+  (function () {
+    const w = widget("w-cb", { title: "Static vs continuous batching on one request stream", kicker: "Simulation", note: "Each row is one request. Grey: waiting in the queue. Gold: prefill. Green: decoding. Brick: finished, but its slot is held until the whole static batch ends. Step times come from the illustrative cost model in the next section (an 8B model on one H100-class GPU). Prompts are 100\u20131,000 tokens; outputs are log-normal around 70 tokens. The static policy starts a batch with whatever is queued (up to the slot count), pads prompts to the longest, and returns results when the batch ends, like one plain <span class='mono'>generate()</span> call. Neither policy chunks prefills here." });
+    let seed = 3;
+    const sB = slider(w.controls, { label: "Batch slots", min: 2, max: 12, step: 1, value: 6, onInput: run });
+    const sRate = slider(w.controls, { label: "Arrival rate", min: 1, max: 40, step: 1, value: 10, fmt: v => v + " req/s", onInput: run });
+    const sSpread = slider(w.controls, { label: "Output-length spread", min: 0, max: 1, step: 0.05, value: 0.7, fmt: v => v < 0.2 ? "narrow" : v < 0.6 ? "moderate" : "heavy-tailed", onInput: run });
+    const br = el("div", { class: "btnrow" });
+    br.appendChild(el("button", { class: "btn", text: "New random requests", onclick: () => { seed++; run(); } }));
+    w.controls.appendChild(br);
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 590" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "thr", label: "Throughput" }, { key: "lat", label: "Mean latency" }, { key: "p95", label: "p95 latency" }, { key: "util", label: "Slot utilization" }]);
+    const N = 24;
+    function gen() {
+      const R = rng(seed * 7919 + 11);
+      let t = 0;
+      return Array.from({ length: N }, (_, i) => {
+        t += -Math.log(1 - R()) / sRate.value * 1000;
+        const prompt = Math.round(100 + R() * 900);
+        const out = clamp(Math.round(70 * Math.exp(R.normal() * (0.15 + sSpread.value * 0.95))), 6, 700);
+        return { id: i, arr: t, prompt, out };
+      });
+    }
+    function simStatic(reqs, B) {
+      const res = reqs.map(r => Object.assign({}, r));
+      let t = 0, idx = 0, slotSteps = 0, useful = 0;
+      while (idx < res.length) {
+        if (res[idx].arr > t) t = res[idx].arr;
+        const batch = [];
+        while (idx < res.length && res[idx].arr <= t && batch.length < B) batch.push(res[idx++]);
+        const n = batch.length, maxP = Math.max(...batch.map(r => r.prompt)), maxO = Math.max(...batch.map(r => r.out));
+        batch.forEach(r => { r.start = t; });
+        t += stepTime(n * maxP, 0, n * maxP * maxP / 2);
+        batch.forEach(r => { r.first = t; r.own = t; });
+        slotSteps += B; useful += n;
+        for (let k = 1; k < maxO; k++) {
+          t += stepTime(n, n * (maxP + k), 0);
+          slotSteps += B;
+          batch.forEach(r => { if (k < r.out) { useful++; r.own = t; } });
+        }
+        batch.forEach(r => { r.done = t; });
+      }
+      return { res, util: useful / slotSteps };
+    }
+    function simCont(reqs, B) {
+      const res = reqs.map(r => Object.assign({}, r, { gen: 0 }));
+      let t = 0, idx = 0, slotSteps = 0, useful = 0, guard = 0;
+      const waitQ = [], runQ = [];
+      while ((idx < res.length || waitQ.length || runQ.length) && guard++ < 200000) {
+        while (idx < res.length && res[idx].arr <= t) waitQ.push(res[idx++]);
+        if (!runQ.length && !waitQ.length) { t = res[idx].arr; continue; }
+        const adm = [];
+        while (runQ.length + adm.length < B && waitQ.length) adm.push(waitQ.shift());
+        let nTok = runQ.length, kv = 0, pa = 0;
+        runQ.forEach(r => { kv += r.prompt + r.gen; });
+        adm.forEach(r => { nTok += r.prompt; pa += r.prompt * r.prompt / 2; r.start = t; });
+        t += stepTime(nTok, kv, pa);
+        slotSteps += B; useful += runQ.length + adm.length;
+        runQ.forEach(r => { r.gen++; });
+        adm.forEach(r => { r.gen = 1; r.first = t; runQ.push(r); });
+        for (let j = runQ.length - 1; j >= 0; j--) if (runQ[j].gen >= runQ[j].out) { runQ[j].done = t; runQ[j].own = t; runQ.splice(j, 1); }
+      }
+      return { res, util: useful / slotSteps };
+    }
+    function metrics(res) {
+      const t0 = Math.min(...res.map(r => r.arr)), t1 = Math.max(...res.map(r => r.done));
+      const lat = res.map(r => r.done - r.arr).sort((a, b) => a - b);
+      const tok = res.reduce((a, r) => a + r.out, 0);
+      return { thr: tok / ((t1 - t0) / 1000), mean: lat.reduce((a, b) => a + b, 0) / lat.length, p95: lat[Math.min(lat.length - 1, Math.floor(0.95 * lat.length))] };
+    }
+    function draw(st, ct) {
+      clear(s);
+      const T = Math.max(...st.res.map(r => r.done), ...ct.res.map(r => r.done));
+      const x0 = 70, x1 = 748, X = t => x0 + t / T * (x1 - x0);
+      const rowH = 9.5, panelH = N * rowH;
+      [[st, "Static batching", 26], [ct, "Continuous batching", 26 + panelH + 50]].forEach(([sim, name, y0], pi) => {
+        txt(s, 10, y0 - 8, name, { "font-size": 12.5, "font-weight": 700 });
+        sim.res.forEach((r, i) => {
+          const y = y0 + i * rowH;
+          txt(s, x0 - 6, y + 7.5, "#" + (i + 1), { "font-size": 8.5, "text-anchor": "end", fill: palette.faint, class: "mono" });
+          rect(s, X(r.arr), y + 1, X(r.start) - X(r.arr), rowH - 2, { fill: "rgba(118,115,107,.25)" });
+          rect(s, X(r.start), y + 1, Math.max(1, X(r.first) - X(r.start)), rowH - 2, { fill: palette.gold });
+          rect(s, X(r.first), y + 1, X(r.own) - X(r.first), rowH - 2, { fill: palette.green, opacity: 0.8 });
+          if (pi === 0 && r.done > r.own) rect(s, X(r.own), y + 1, X(r.done) - X(r.own), rowH - 2, { fill: "rgba(176,67,46,.3)" });
+        });
+      });
+      const ya = 26 + 2 * panelH + 50 + 4;
+      line(s, x0, ya, x1, ya, { stroke: palette.ink });
+      const inSec = T > 2500, stp = niceStep(T / 7);
+      for (let v = 0; v <= T + 1e-9; v += stp) {
+        line(s, X(v), ya, X(v), ya + 5);
+        txt(s, X(v), ya + 17, inSec ? fmtNum(v / 1000, stp < 1000 ? 1 : 0) + " s" : fmtNum(v, 0) + " ms", { "font-size": 10.5, "text-anchor": "middle", class: "mono", fill: palette.muted });
+      }
+      txt(s, (x0 + x1) / 2, ya + 34, "wall-clock time (both panels on the same scale)", { "font-size": 11.5, "text-anchor": "middle" });
+    }
+    function run() {
+      const reqs = gen(), B = sB.value;
+      const st = simStatic(reqs, B), ct = simCont(reqs, B);
+      draw(st, ct);
+      const ms = metrics(st.res), mc = metrics(ct.res);
+      set("thr", fmtNum(mc.thr, 0) + " tok/s", mc.thr >= ms.thr ? "good" : "warn", "static: " + fmtNum(ms.thr, 0) + " tok/s");
+      set("lat", fmtMs(mc.mean), mc.mean <= ms.mean ? "good" : "warn", "static: " + fmtMs(ms.mean));
+      set("p95", fmtMs(mc.p95), mc.p95 <= ms.p95 ? "good" : "warn", "static: " + fmtMs(ms.p95));
+      set("util", fmtNum(ct.util * 100, 0) + "%", null, "static: " + fmtNum(st.util * 100, 0) + "% of slot-steps useful");
+    }
+    run();
+  })();
+
+  /* ---------------------------------------------------------- Widget: chunked prefill */
+  (function () {
+    const w = widget("w-chunk", { title: "A long prompt lands among running decodes", kicker: "Simulation", note: "Each bar is one engine step; its height is that step's duration, which is the gap every running user waits for their next token. Green: the decode part (weights plus one token per running request plus their KV reads). Gold: prefill-chunk tokens, including attention to earlier chunks. Grey: a prefill-only step where decodes made no progress. Running requests hold 1,500 tokens of context each. Cost model constants are illustrative (8B model, H100-class GPU). In whole-prompt mode the budget doesn't apply: engines without chunking need a budget at least as large as the longest prompt." });
+    const PL = [2048, 4096, 8192, 16384, 32768], BL = [256, 512, 1024, 2048, 4096, 8192, 16384];
+    let mode = "chunk";
+    const sD = slider(w.controls, { label: "Running decodes", min: 8, max: 128, step: 8, value: 32, onInput: draw });
+    const sP = slider(w.controls, { label: "Long prompt", min: 0, max: 4, step: 1, value: 2, fmt: i => fmtNum(PL[i], 0) + " tokens", onInput: draw });
+    const sBud = slider(w.controls, { label: "Token budget per step", min: 0, max: 6, step: 1, value: 3, fmt: i => fmtNum(BL[i], 0) + " tokens", onInput: draw });
+    segCtl(w.controls, "Prefill scheduling", [{ value: "chunk", label: "chunked" }, { value: "whole", label: "whole prompt in one step" }], "chunk", v => { mode = v; draw(); });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [0, 10], y: [0, 100], xlabel: "engine step", ylabel: "step time = ITL (ms)", margin: { l: 56, b: 42 } });
+    const set = stats(w.body, [{ key: "ttft", label: "TTFT of the long prompt" }, { key: "itl", label: "Worst ITL, running users" }, { key: "steady", label: "Normal ITL" }, { key: "steps", label: "Prefill steps" }]);
+    const CTX = 1500, PRE = 4, POST = 6, MAXS = 420;
+    function sim(D, Pn, budget, chunked) {
+      const steps = [];
+      let t = 0, rem = Pn, ctx = CTX, tArr = null, ttft = Infinity, after = 0;
+      for (let k = 0; k < MAXS; k++) {
+        let pre = 0, dec = D;
+        if (k >= PRE && rem > 0) {
+          if (tArr === null) tArr = t;
+          if (chunked) pre = Math.min(rem, Math.max(0, budget - D));
+          else { pre = rem; dec = 0; }
+        }
+        const off = Pn - rem;
+        const decMs = COST.a + COST.b * dec + COST.c * dec * ctx;
+        const preMs = COST.b * pre + COST.e * pre * (off + pre / 2);
+        steps.push({ dt: decMs + preMs, dec, pre, decMs, preMs });
+        t += decMs + preMs; rem -= pre;
+        if (dec) ctx++;
+        if (k >= PRE && rem === 0) { if (ttft === Infinity) ttft = t - tArr; if (++after > POST) break; }
+        if (k >= PRE + 60 && pre === 0 && rem > 0) break; // starved: stop early
+      }
+      const itl = []; let gap = 0;
+      steps.forEach(st => { gap += st.dt; if (st.dec) { itl.push(gap); gap = 0; } });
+      return { steps, ttft, itl, nPre: steps.filter(st => st.pre > 0).length };
+    }
+    function draw() {
+      const D = sD.value, Pn = PL[sP.value], bud = BL[sBud.value];
+      const A = sim(D, Pn, bud, true), Bw = sim(D, Pn, bud, false);
+      const cur = mode === "chunk" ? A : Bw, oth = mode === "chunk" ? Bw : A;
+      const maxDt = Math.max(...cur.steps.map(st => st.dt));
+      P.x[1] = Math.max(cur.steps.length, 10);
+      P.y[1] = niceStep(maxDt * 1.15 / 5) * Math.ceil(maxDt * 1.15 / niceStep(maxDt * 1.15 / 5));
+      const steady = A.itl[0];
+      const firstTokStep = cur.steps.reduce((acc, st, i) => st.pre > 0 ? i : acc, -1);
+      const layers = [{ hline: steady, color: palette.muted, label: "normal decode step" }, { vline: PRE, color: palette.brick, label: "prompt arrives" }];
+      if (firstTokStep >= 0 && isFinite(cur.ttft)) layers.push({ vline: firstTokStep + 1, color: palette.green, label: "its first token" });
+      P.draw(layers);
+      const bw = P.sx(1) - P.sx(0);
+      cur.steps.forEach((st, i) => {
+        const x = P.sx(i) + bw * 0.1, ww = Math.max(0.8, bw * 0.8);
+        rect(P.g, x, P.sy(st.decMs), ww, P.sy(0) - P.sy(st.decMs), { fill: st.dec ? palette.green : palette.faint, opacity: 0.8 });
+        if (st.pre) rect(P.g, x, P.sy(st.decMs + st.preMs), ww, P.sy(st.decMs) - P.sy(st.decMs + st.preMs), { fill: palette.gold, opacity: 0.9 });
+      });
+      const starved = mode === "chunk" && bud <= D;
+      set("ttft", starved ? "never" : fmtMs(cur.ttft), starved ? "bad" : null, (mode === "chunk" ? "whole-prompt: " : "chunked: ") + (mode !== "chunk" && bud <= D ? "never" : fmtMs(oth.ttft)));
+      const wc = Math.max(...cur.itl), wo = Math.max(...oth.itl);
+      set("itl", fmtMs(wc), wc > 3 * steady ? "bad" : wc > 1.6 * steady ? "warn" : "good", (mode === "chunk" ? "whole-prompt: " : "chunked: ") + fmtMs(wo));
+      set("steady", fmtMs(steady), null, D + " decodes \u00d7 1 token");
+      set("steps", starved ? "\u2014" : String(cur.nPre), starved ? "bad" : null, mode === "chunk" ? (starved ? "budget \u2264 decodes: prompt starves" : "chunk = " + fmtNum(Math.min(Pn, bud - D), 0) + " tokens") : "one giant step");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: KV capacity */
+  (function () {
+    const w = widget("w-kvcap", { title: "KV capacity planner", kicker: "Calculator", note: "Memory in decimal GB. Weights = parameters \u00d7 bits \u00f7 8 (int4 with group-128 scales \u2248 4.25 bits). Activations + workspace is what the engine's profiling run reserves; it grows with the token budget and with CUDA graph capture. Max concurrent sequences assumes every sequence has the average length; real traffic is a mix, so leave headroom. Single GPU, no tensor parallelism (Module 20 covers splitting a model across GPUs)." });
+    const GPUS = [{ v: "24", l: "24 GB (RTX 4090 / L4 class)", m: 24 }, { v: "48", l: "48 GB (L40S class)", m: 48 }, { v: "80", l: "80 GB (A100 / H100)", m: 80 }, { v: "141", l: "141 GB (H200)", m: 141 }, { v: "192", l: "192 GB (MI300X class)", m: 192 }];
+    let gpu = GPUS[2], mdl = MODELS[0], wbits = 16, kvb = 2, bs = 16;
+    select(w.controls, { label: "GPU", options: GPUS.map(g => ({ value: g.v, label: g.l })), value: "80", onChange: v => { gpu = GPUS.find(g => g.v === v); draw(); } });
+    select(w.controls, { label: "Model", options: MODELS.map(m => ({ value: m.v, label: m.l })), value: "l8", onChange: v => { mdl = MODELS.find(m => m.v === v); draw(); } });
+    segCtl(w.controls, "Weights", [{ value: 16, label: "bf16" }, { value: 8, label: "fp8" }, { value: 4.25, label: "int4" }], 16, v => { wbits = v; draw(); });
+    segCtl(w.controls, "KV cache dtype", [{ value: 2, label: "bf16" }, { value: 1, label: "fp8" }], 2, v => { kvb = v; draw(); });
+    segCtl(w.controls, "Block size", [{ value: 16, label: "16" }, { value: 32, label: "32" }, { value: 128, label: "128" }], 16, v => { bs = v; draw(); });
+    const sU = slider(w.controls, { label: "gpu_memory_utilization", min: 0.5, max: 0.98, step: 0.01, value: 0.9, fmt: v => v.toFixed(2), onInput: draw });
+    const sA = slider(w.controls, { label: "Activations + workspace", min: 0.5, max: 8, step: 0.25, value: 4, fmt: v => v.toFixed(2) + " GB", onInput: draw });
+    const sL = slider(w.controls, { label: "Average sequence length", min: 0, max: LENS.length - 1, step: 1, value: 3, fmt: i => fmtTok(LENS[i]) + " tokens", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const barS = svg("svg", { viewBox: "0 0 760 74" }); wrap.appendChild(barS);
+    const wrap2 = el("div", { class: "canvas-wrap", style: { marginTop: "10px" } }); w.body.appendChild(wrap2);
+    const P = plot(wrap2, { width: 760, height: 250, x: [256, 131072], y: [1, 1e4], logx: true, logy: true, xticks: [256, 1024, 4096, 16384, 65536], xfmt: v => fmtTok(v), yfmt: v => fmtNum(v, 0), xlabel: "average tokens per sequence (prompt + output)", ylabel: "max concurrent sequences", margin: { l: 60 } });
+    const set = stats(w.body, [{ key: "per", label: "KV per token" }, { key: "pool", label: "KV pool" }, { key: "cap", label: "Token capacity" }, { key: "seqs", label: "Max concurrent seqs" }, { key: "waste", label: "Block waste" }]);
+    function draw() {
+      const tot = gpu.m * 1e9, wts = mdl.P * wbits / 8, act = sA.value * 1e9, cap = tot * sU.value;
+      const pool = cap - wts - act, perTok = kvPerTok(mdl, kvb);
+      const blocks = Math.max(0, Math.floor(pool / (perTok * bs))), tokCap = blocks * bs, len = LENS[sL.value];
+      const seqsAt = L => Math.floor(blocks / Math.ceil(L / bs));
+      clear(barS);
+      const X = v => 10 + clamp(v / tot, 0, 1) * 740;
+      const parts = [[0, wts, "rgba(47,93,138,.6)", "weights " + fmtGB(wts)], [wts, act, "rgba(154,123,34,.6)", "act."], [wts + act, Math.max(0, pool), "rgba(26,122,82,.45)", "KV pool " + fmtGB(Math.max(0, pool))], [cap, tot - cap, "rgba(118,115,107,.25)", "1 \u2212 u"]];
+      parts.forEach(([a, n, c, l]) => {
+        const x = X(a), ww = X(a + n) - X(a);
+        rect(barS, x, 10, ww, 30, { fill: c });
+        if (ww > 46) txt(barS, x + ww / 2, 30, l, { "font-size": 11, "text-anchor": "middle", fill: palette.ink });
+      });
+      rect(barS, 10, 10, 740, 30, { fill: "none", stroke: palette.ink, "stroke-width": 1 });
+      txt(barS, 10, 60, "0", { "font-size": 10.5, class: "mono", fill: palette.muted });
+      txt(barS, 750, 60, gpu.m + " GB", { "font-size": 10.5, class: "mono", fill: palette.muted, "text-anchor": "end" });
+      if (pool <= 0) txt(barS, 380, 60, "weights + workspace exceed u \u00d7 memory: the engine won't start", { "font-size": 11, fill: palette.brick, "text-anchor": "middle" });
+      const pts = LENS.map(L => [L, Math.max(seqsAt(L), 0.5)]);
+      const ymax = Math.max(10, 10 ** Math.ceil(Math.log10(Math.max(1, seqsAt(256)) * 1.3)));
+      P.y[1] = ymax;
+      const cur = seqsAt(len);
+      P.draw([{ points: pts, color: palette.green, dots: true, label: "max concurrent sequences" }, { vline: len, color: palette.muted }, { marker: [len, Math.max(cur, 1)], color: cur >= 1 ? palette.green : palette.brick, label: cur >= 1 ? fmtNum(cur, 0) + " seqs" : "0" }]);
+      set("per", fmtB(perTok), null, mdl.L + " layers \u00d7 " + mdl.kv + " KV heads \u00d7 " + mdl.hd + " \u00d7 2 \u00d7 " + kvb + " B");
+      set("pool", pool > 0 ? fmtGB(pool) : "none", pool > 0 ? null : "bad", fmtNum(blocks, 0) + " blocks of " + bs + " tokens");
+      set("cap", fmtNum(tokCap, 0), tokCap > 0 ? null : "bad", "tokens across all requests");
+      set("seqs", fmtNum(cur, 0), cur >= 32 ? "good" : cur >= 4 ? "warn" : "bad", "at " + fmtNum(len, 0) + " tokens each");
+      const wst = (bs - 1) / 2;
+      set("waste", fmtNum(wst, 1) + " tok/seq", null, fmtNum(100 * wst / len, wst / len < 0.01 ? 2 : 1) + "% of a " + fmtTok(len) + " sequence");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: swap vs recompute */
+  (function () {
+    const w = widget("w-preempt", { title: "Bringing a preempted request back: swap or recompute?", kicker: "Calculator", note: "Swap = KV bytes out to CPU memory and back, bf16 KV. Recompute = prefill FLOPs \u2248 2NT + 2LdT\u00b2 at the achieved FLOP/s you set. Swap uses the PCIe or host link and pinned host memory; recompute uses GPU compute that other requests wanted. Many small block copies run well below the link's peak, which is why the slider goes down to 4 GB/s." });
+    const BWS = [[4, "4 GB/s (scattered small blocks)"], [12, "12 GB/s"], [25, "25 GB/s (PCIe 4.0 x16, good case)"], [50, "50 GB/s (PCIe 5.0 x16, good case)"], [200, "200 GB/s"], [450, "450 GB/s (NVLink-C2C class)"]];
+    let mdl = MODELS[0];
+    select(w.controls, { label: "Model", options: MODELS.map(m => ({ value: m.v, label: m.l })), value: "l8", onChange: v => { mdl = MODELS.find(m => m.v === v); draw(); } });
+    const sBW = slider(w.controls, { label: "Effective link bandwidth", min: 0, max: BWS.length - 1, step: 1, value: 2, fmt: i => BWS[i][1], onInput: draw });
+    const sF = slider(w.controls, { label: "Achieved prefill compute", min: 100, max: 1500, step: 50, value: 400, fmt: v => v + " TFLOP/s", onInput: draw });
+    const sT = slider(w.controls, { label: "Preempted sequence length", min: 0, max: LENS.length - 1, step: 1, value: 5, fmt: i => fmtNum(LENS[i], 0) + " tokens", onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 290, x: [256, 131072], y: [0.1, 1e6], logx: true, logy: true, xticks: [256, 1024, 4096, 16384, 65536], xfmt: v => fmtTok(v), yfmt: v => v >= 1000 ? fmtNum(v / 1000, 0) + " s" : (v < 1 ? String(v) : fmtNum(v, 0)) + " ms", xlabel: "tokens in the preempted sequence", ylabel: "time to restore (log)", margin: { l: 64 } });
+    const set = stats(w.body, [{ key: "kv", label: "KV of this sequence" }, { key: "swap", label: "Swap out + in" }, { key: "rec", label: "Recompute" }, { key: "win", label: "Cheaper here" }]);
+    function draw() {
+      const per = kvPerTok(mdl, 2), bw = BWS[sBW.value][0] * 1e9, F = sF.value * 1e12, T = LENS[sT.value];
+      const swap = t => 2 * t * per / bw * 1000;
+      const rec = t => (2 * mdl.P * t + 2 * mdl.L * mdl.d * t * t) / F * 1000;
+      P.draw([{ fn: swap, color: palette.blue, label: "swap out + in" }, { fn: rec, color: palette.brick, label: "recompute (prefill again)" }, { vline: T, color: palette.muted }, { marker: [T, swap(T)], color: palette.blue }, { marker: [T, rec(T)], color: palette.brick }]);
+      const sw = swap(T), rc = rec(T);
+      set("kv", fmtB(T * per), null, fmtB(per) + " per token");
+      set("swap", fmtMs(sw), sw <= rc ? "good" : null, "link busy, GPU free");
+      set("rec", fmtMs(rc), rc < sw ? "good" : null, "GPU busy, link free");
+      set("win", sw <= rc ? "swap" : "recompute", null, fmtNum(Math.max(sw, rc) / Math.min(sw, rc), 1) + "\u00d7 faster on raw time");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: prefix cache simulator */
+  (function () {
+    const w = widget("w-prefix", { title: "Prefix cache on a multi-turn chat workload", kicker: "Simulation", note: "Every user's request = shared system prompt + that user's whole history + a new message (50\u2013300 tokens); replies are 100\u2013500 tokens and are cached with the prompt. LRU eviction trims the least recently used user's history from the tail, the way a radix tree drops leaves. Cache capacity stands for KV blocks not held by running requests. TTFT estimate = one step of the illustrative cost model over the uncached tokens, ignoring queueing and chunking." });
+    const SYS = [0, 500, 1000, 2000, 4000, 8000], CAPS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+    let gran = "radix", order = "mix";
+    const sU = slider(w.controls, { label: "Users", min: 1, max: 64, step: 1, value: 16, onInput: draw });
+    const sT = slider(w.controls, { label: "Turns per user", min: 1, max: 10, step: 1, value: 6, onInput: draw });
+    const sS = slider(w.controls, { label: "Shared system prompt", min: 0, max: SYS.length - 1, step: 1, value: 3, fmt: i => fmtNum(SYS[i], 0) + " tokens", onInput: draw });
+    const sC = slider(w.controls, { label: "Cache capacity", min: 0, max: CAPS.length - 1, step: 1, value: 3, fmt: i => fmtTok(CAPS[i]) + " tokens", onInput: draw });
+    segCtl(w.controls, "Matching", [{ value: "radix", label: "radix (token)" }, { value: "block", label: "hashed blocks of 16" }], "radix", v => { gran = v; draw(); });
+    segCtl(w.controls, "Traffic", [{ value: "mix", label: "users interleaved" }, { value: "seq", label: "one session at a time" }], "mix", v => { order = v; draw(); });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const s = svg("svg", { viewBox: "0 0 760 240" }); wrap.appendChild(s);
+    const set = stats(w.body, [{ key: "hit", label: "Token hit rate" }, { key: "prompt", label: "Mean prompt" }, { key: "miss", label: "Mean prefilled" }, { key: "ttft", label: "Mean TTFT estimate" }, { key: "ev", label: "Tokens evicted" }]);
+    function shuffle(a, R) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+    function sim() {
+      const R = rng(21);
+      const U = sU.value, Tn = sT.value, S = SYS[sS.value], cap = CAPS[sC.value];
+      const users = Array.from({ length: U }, () => ({ hist: 0, cached: 0, last: -1 }));
+      const msg = users.map(() => Array.from({ length: Tn }, () => [50 + Math.floor(R() * 250), 100 + Math.floor(R() * 400)]));
+      const seqq = [];
+      if (order === "mix") { for (let t = 0; t < Tn; t++) shuffle(Array.from({ length: U }, (_, i) => i), R).forEach(u => seqq.push([u, t])); }
+      else for (let u = 0; u < U; u++) for (let t = 0; t < Tn; t++) seqq.push([u, t]);
+      const sysFits = S <= cap;
+      let sysCached = false, clock = 0, evicted = 0;
+      const out = [];
+      const used = () => (sysCached ? S : 0) + users.reduce((a, v) => a + v.cached, 0);
+      seqq.forEach(([u, t]) => {
+        const um = msg[u][t][0], rp = msg[u][t][1], usr = users[u];
+        const prompt = S + usr.hist + um;
+        let hit = S === 0 ? usr.cached : sysCached ? S + usr.cached : 0;
+        hit = Math.min(hit, prompt);
+        if (gran === "block") hit = Math.floor(hit / 16) * 16;
+        out.push({ prompt, hit });
+        usr.hist += um + rp;
+        if (sysFits) { sysCached = S > 0; usr.cached = usr.hist; usr.last = clock; }
+        let over = used() - cap;
+        while (over > 0) {
+          let v = null;
+          users.forEach(x => { if (x !== usr && x.cached > 0 && (!v || x.last < v.last)) v = x; });
+          if (!v) { const take = Math.min(over, usr.cached); usr.cached -= take; evicted += take; break; }
+          const take = Math.min(over, v.cached); v.cached -= take; evicted += take; over -= take;
+        }
+        clock++;
+      });
+      return { out, evicted };
+    }
+    function draw() {
+      const r = sim(), n = r.out.length;
+      clear(s);
+      const x0 = 56, x1 = 750, y0 = 14, y1 = 200;
+      const ymax = Math.max(...r.out.map(o => o.prompt)), stp = niceStep(ymax / 4), top = Math.ceil(ymax / stp) * stp;
+      const Y = v => y1 - v / top * (y1 - y0);
+      for (let v = 0; v <= top + 1e-9; v += stp) {
+        line(s, x0, Y(v), x1, Y(v), { stroke: palette.line, "stroke-dasharray": v ? "2 3" : null });
+        txt(s, x0 - 6, Y(v) + 4, fmtTok(v), { "font-size": 10.5, class: "mono", "text-anchor": "end", fill: palette.muted });
+      }
+      const bw = (x1 - x0) / n;
+      r.out.forEach((o, i) => {
+        const x = x0 + i * bw, ww = Math.max(0.6, bw * (n > 150 ? 1 : 0.8));
+        rect(s, x, Y(o.hit), ww, y1 - Y(o.hit), { fill: palette.green, opacity: 0.75 });
+        rect(s, x, Y(o.prompt), ww, Y(o.hit) - Y(o.prompt), { fill: palette.brick, opacity: 0.75 });
+      });
+      line(s, x0, y1, x1, y1);
+      txt(s, (x0 + x1) / 2, 226, "requests in arrival order (" + n + ")   \u00b7   green = served from cache, brick = prefilled", { "font-size": 11.5, "text-anchor": "middle" });
+      const P_ = r.out.reduce((a, o) => a + o.prompt, 0), H_ = r.out.reduce((a, o) => a + o.hit, 0);
+      const hr = P_ ? H_ / P_ : 0;
+      const ttftC = r.out.reduce((a, o) => a + COST.a + COST.b * (o.prompt - o.hit), 0) / n, ttftN = r.out.reduce((a, o) => a + COST.a + COST.b * o.prompt, 0) / n;
+      set("hit", fmtNum(hr * 100, 0) + "%", hr > 0.6 ? "good" : hr > 0.3 ? "warn" : "bad", "of all prompt tokens");
+      set("prompt", fmtNum(P_ / n, 0) + " tok", null, "grows with every turn");
+      set("miss", fmtNum((P_ - H_) / n, 0) + " tok", null, "per request");
+      set("ttft", fmtMs(ttftC), ttftC < 0.6 * ttftN ? "good" : null, "no cache: " + fmtMs(ttftN));
+      set("ev", fmtTok(r.evicted), r.evicted > 0 ? "warn" : "good", r.evicted > 0 ? "capacity pressure" : "everything fit");
+    }
+    draw();
+  })();
+
+  /* ---------------------------------------------------------- Widget: speculative decoding vs batch */
+  (function () {
+    const w = widget("w-specb", { title: "Does speculation still pay at this batch size?", kicker: "Interactive", note: "Step time t(N) = a + b\u00b7N + c\u00b7(KV tokens read) from the illustrative cost model. Verifying \u03b3+1 tokens per sequence multiplies N by \u03b3+1 but reads each sequence's KV once. Draft cost per drafting step is \u03ba \u00d7 the plain decode step at the same batch. Acceptance is assumed independent per token, as in Module 08's formula. Presets are rough starting points, not measurements." });
+    const BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512], CTXS = [512, 1024, 2048, 4096, 8192, 16384];
+    const PRESETS = { ngram: [0.5, 3, 0.0], eagle: [0.75, 4, 0.04], draft: [0.7, 4, 0.15] };
+    segCtl(w.controls, "Draft method preset", [{ value: "ngram", label: "n-gram lookup" }, { value: "eagle", label: "EAGLE-style head" }, { value: "draft", label: "small draft model" }], "eagle", v => { const p = PRESETS[v]; sAl.value = p[0]; sG.value = p[1]; sK.value = p[2]; draw(); });
+    const sAl = slider(w.controls, { label: "Acceptance rate \u03b1", min: 0.3, max: 0.95, step: 0.01, value: 0.75, fmt: v => v.toFixed(2), onInput: draw });
+    const sG = slider(w.controls, { label: "Draft tokens \u03b3", min: 1, max: 8, step: 1, value: 4, onInput: draw });
+    const sK = slider(w.controls, { label: "Draft cost \u03ba", min: 0, max: 0.3, step: 0.01, value: 0.04, fmt: v => v.toFixed(2) + " \u00d7 step", onInput: draw });
+    const sC = slider(w.controls, { label: "Context per sequence", min: 0, max: CTXS.length - 1, step: 1, value: 2, fmt: i => fmtTok(CTXS[i]) + " tokens", onInput: draw });
+    const sB = slider(w.controls, { label: "Your batch size", min: 0, max: BS.length - 1, step: 1, value: 5, fmt: i => String(BS[i]), onInput: draw });
+    const wrap = el("div", { class: "canvas-wrap" }); w.body.appendChild(wrap);
+    const P = plot(wrap, { width: 760, height: 280, x: [1, 512], y: [0, 4], logx: true, xticks: BS, xfmt: v => String(v), yfmt: v => v + "\u00d7", xlabel: "concurrent sequences (batch size)", ylabel: "speedup vs no speculation" });
+    const set = stats(w.body, [{ key: "tau", label: "Tokens per verify step" }, { key: "b1", label: "Speedup at batch 1" }, { key: "bx", label: "At your batch" }, { key: "be", label: "Break-even batch" }]);
+    const tS = (N, B, ctx) => COST.a + COST.b * N + COST.c * B * ctx;
+    function draw() {
+      const a = sAl.value, g = sG.value, k = sK.value, ctx = CTXS[sC.value], Bx = BS[sB.value];
+      const tau = (1 - a ** (g + 1)) / (1 - a);
+      const sp = B => { const base = tS(B, B, ctx); return tau * base / (tS(B * (g + 1), B, ctx) + g * k * base); };
+      let be = null;
+      for (let B = 1; B <= 4096; B *= 1.03) if (sp(B) < 1) { be = B; break; }
+      const ymax = Math.max(1.5, Math.ceil(sp(1) * 1.2 * 2) / 2);
+      P.y[1] = ymax;
+      const layers = [{ fn: sp, color: palette.green, width: 2.4, label: "speedup S(B)" }, { hline: 1, color: palette.brick, label: "break-even" }, { marker: [Bx, sp(Bx)], color: sp(Bx) >= 1 ? palette.green : palette.brick, label: fmtNum(sp(Bx), 2) + "\u00d7" }];
+      if (be && be <= 512) layers.push({ vline: be, color: palette.brick, label: "B \u2248 " + Math.round(be) });
+      P.draw(layers);
+      set("tau", fmtNum(tau, 2), null, "of at most " + (g + 1));
+      set("b1", fmtNum(sp(1), 2) + "\u00d7", sp(1) > 1.2 ? "good" : sp(1) >= 1 ? "warn" : "bad", "latency-bound regime");
+      set("bx", fmtNum(sp(Bx), 2) + "\u00d7", sp(Bx) > 1.2 ? "good" : sp(Bx) >= 1 ? "warn" : "bad", "batch " + Bx + ", " + fmtTok(ctx) + " context");
+      set("be", be ? "\u2248 " + fmtNum(be, 0) : "> 4,096", be && be <= 64 ? "bad" : null, be ? "turn it off above this" : "never in this model");
+    }
+    draw();
+  })();
+})();
+</script>
+</body>
+</html>
